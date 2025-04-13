@@ -80,10 +80,16 @@ def launch_web_interface():
     from src.inference.interface import ApertisInterface
     
     print("Launching Apertis web interface...")
-    interface = ApertisInterface(web=True, port=7860, share=False)
+    # Create interface without launching immediately
+    interface = ApertisInterface(web=False, port=7860, share=False)
     
     # Open browser
     webbrowser.open("http://localhost:7860")
+    
+    # Launch interface with blocking=False to prevent hanging
+    import gradio as gr
+    interface_blocks = gr.Blocks(title="Apertis AI Studio", theme=gr.themes.Soft())
+    interface.launch_web_interface()
     
     return True
 
@@ -122,9 +128,11 @@ def main():
         print("\nApertis web interface is running at http://localhost:7860")
         print("Press Ctrl+C to stop the server.")
         
-        # Keep the script running
-        while True:
-            time.sleep(1)
+        # Import gradio to use its blocking interface
+        import gradio as gr
+        # This will block until the server is closed but allow the interface to launch properly
+        gr.close_all(server_port=7860)
+        
     except KeyboardInterrupt:
         print("\nShutting down Apertis...")
     except Exception as e:

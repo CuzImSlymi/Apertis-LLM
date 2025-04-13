@@ -265,40 +265,27 @@ class SelectiveLinearAttention(nn.Module):
         batch_size, num_heads, seq_len, head_dim = query_states.shape
         
         # Apply chunking for better cache locality
-        chunk_size = min(128, seq_len)
-        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        # Use dynamic chunk size that matches the sequence length dimensions
+        # This ensures tensor dimensions are compatible during training
+        chunk_size = seq_len  # Use full sequence length to avoid dimension mismatch
         
         # Initialize output tensor
         attn_output = torch.zeros_like(query_states)
         
-        # Process in chunks for better efficiency
-        for i in range(num_chunks):
-            # Get current chunk
-            start_idx = i * chunk_size
-            end_idx = min(start_idx + chunk_size, seq_len)
-            q_chunk = query_states[:, :, start_idx:end_idx]
-            
-            # Compute query-key similarities for this chunk
-            attn_weights = torch.matmul(q_chunk, key_states.transpose(-1, -2))
-            
-            # Apply attention mask if provided
-            if attention_mask is not None:
-                # Extract the relevant part of the attention mask
-                if attention_mask.size(-1) == seq_len:
-                    chunk_mask = attention_mask[:, :, :, start_idx:end_idx]
-                    attn_weights = attn_weights + chunk_mask
-                else:
-                    attn_weights = attn_weights + attention_mask
-            
-            # Apply softmax to get attention probabilities
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            # Compute weighted sum of values
-            chunk_output = torch.matmul(attn_weights, value_states)
-            
-            # Store in output tensor
-            attn_output[:, :, start_idx:end_idx] = chunk_output
+        # Compute full attention in one go for compatibility
+        # Compute query-key similarities
+        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2))
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        
+        # Apply softmax to get attention probabilities
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Compute weighted sum of values
+        attn_output = torch.matmul(attn_weights, value_states)
         
         return attn_output
 
