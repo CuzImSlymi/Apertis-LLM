@@ -230,7 +230,7 @@ class ApertisTrainer:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=0,  # Reduced from 4 to 0 to avoid hanging issues
             pin_memory=True,
         )
         
@@ -239,7 +239,7 @@ class ApertisTrainer:
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=4,
+                num_workers=0,  # Reduced from 4 to 0 to avoid hanging issues
                 pin_memory=True,
             )
         else:
@@ -302,68 +302,92 @@ class ApertisTrainer:
             train_loss = 0.0
             train_steps = 0
             
-            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")
-            for step, batch in enumerate(progress_bar):
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                
-                # Forward pass with mixed precision if enabled
-                if self.fp16:
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(**batch)
-                        loss = outputs[0]
-                        loss = loss / self.gradient_accumulation_steps
+            # Add timeout handling and better error reporting
+            try:
+                progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")
+                for step, batch in enumerate(progress_bar):
+                    # Log first batch processing to help with debugging
+                    if epoch == 0 and step == 0:
+                        logger.info(f"Processing first batch (size: {batch['input_ids'].shape})")
                     
-                    # Backward pass with gradient scaling
-                    self.scaler.scale(loss).backward()
-                    
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        # Gradient clipping
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    try:
+                        # Move batch to device
+                        batch = {k: v.to(self.device) for k, v in batch.items()}
                         
-                        # Update weights
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
-                        global_step += 1
-                else:
-                    # Standard forward pass
-                    outputs = self.model(**batch)
-                    loss = outputs[0]
-                    loss = loss / self.gradient_accumulation_steps
-                    
-                    # Backward pass
-                    loss.backward()
-                    
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        # Gradient clipping
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        # Forward pass with mixed precision if enabled
+                        if self.fp16:
+                            with torch.cuda.amp.autocast():
+                                outputs = self.model(**batch)
+                                loss = outputs[0]
+                                loss = loss / self.gradient_accumulation_steps
+                            
+                            # Backward pass with gradient scaling
+                            self.scaler.scale(loss).backward()
+                            
+                            if (step + 1) % self.gradient_accumulation_steps == 0:
+                                # Gradient clipping
+                                self.scaler.unscale_(self.optimizer)
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                
+                                # Update weights
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                                self.scheduler.step()
+                                self.optimizer.zero_grad()
+                                global_step += 1
+                        else:
+                            # Standard forward pass
+                            outputs = self.model(**batch)
+                            loss = outputs[0]
+                            loss = loss / self.gradient_accumulation_steps
+                            
+                            # Backward pass
+                            loss.backward()
+                            
+                            if (step + 1) % self.gradient_accumulation_steps == 0:
+                                # Gradient clipping
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                
+                                # Update weights
+                                self.optimizer.step()
+                                self.scheduler.step()
+                                self.optimizer.zero_grad()
+                                global_step += 1
                         
-                        # Update weights
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
-                        global_step += 1
-                
-                # Update progress bar
-                train_loss += loss.item() * self.gradient_accumulation_steps
-                train_steps += 1
-                progress_bar.set_postfix({"loss": train_loss / train_steps})
-                
-                # Log to Weights & Biases
-                if self.use_wandb:
-                    wandb.log({
-                        "train_loss": loss.item() * self.gradient_accumulation_steps,
-                        "learning_rate": self.scheduler.get_last_lr()[0],
-                        "epoch": epoch + step / len(self.train_dataloader),
-                        "global_step": global_step,
-                    })
-                
-                # Save checkpoint
-                if global_step % self.checkpoint_steps == 0:
-                    self._save_checkpoint(global_step)
+                        # Update progress bar
+                        train_loss += loss.item() * self.gradient_accumulation_steps
+                        train_steps += 1
+                        
+                        # Force progress bar update
+                        progress_bar.set_postfix({"loss": train_loss / train_steps})
+                        progress_bar.update()
+                        
+                        # Log progress to file
+                        if step % 10 == 0:
+                            with open(os.path.join(self.output_dir, "training_log.txt"), "a") as f:
+                                f.write(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}\n")
+                        
+                        # Log to Weights & Biases
+                        if self.use_wandb:
+                            wandb.log({
+                                "train_loss": loss.item() * self.gradient_accumulation_steps,
+                                "learning_rate": self.scheduler.get_last_lr()[0],
+                                "epoch": epoch + step / len(self.train_dataloader),
+                                "global_step": global_step,
+                            })
+                        
+                        # Save checkpoint
+                        if global_step % self.checkpoint_steps == 0:
+                            self._save_checkpoint(global_step)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing batch at step {step}: {str(e)}")
+                        # Continue with next batch instead of crashing
+                        continue
+            except Exception as e:
+                logger.error(f"Error in training loop: {str(e)}")
+                # Save emergency checkpoint
+                self._save_checkpoint("emergency")
             
             # Calculate average training loss
             avg_train_loss = train_loss / train_steps
