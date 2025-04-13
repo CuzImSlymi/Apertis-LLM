@@ -38,4 +38,5 @@ RUN PYTHONPATH=/app python -c "import os; import torch; import sys; sys.path.ins
 EXPOSE 7860
 
 # Set the entrypoint to run the web interface with correct Python path
-CMD ["sh", "-c", "PYTHONPATH=/app python -m src.inference.interface --model-path models/test_model.pt --vocab-file data/vocab.json --web --multimodal --server-name 0.0.0.0"]
+# Using gradio's server_name parameter instead of --server-name
+CMD ["sh", "-c", "PYTHONPATH=/app python -m src.inference.interface --model-path models/test_model.pt --vocab-file data/vocab.json --web --multimodal"]

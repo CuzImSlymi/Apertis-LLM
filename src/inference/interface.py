@@ -621,17 +621,29 @@ class ApertisInterface:
                     # Save uploaded files
                     train_path = os.path.join(temp_dir, "train.jsonl")
                     with open(train_path, "wb") as f:
-                        f.write(train_file)
+                        if hasattr(train_file, 'name'):  # Handle NamedString objects from Gradio
+                            with open(train_file.name, "rb") as source_file:
+                                f.write(source_file.read())
+                        else:
+                            f.write(train_file)
                     
                     vocab_path = os.path.join(temp_dir, "vocab.json")
                     with open(vocab_path, "wb") as f:
-                        f.write(vocab_file)
+                        if hasattr(vocab_file, 'name'):  # Handle NamedString objects from Gradio
+                            with open(vocab_file.name, "rb") as source_file:
+                                f.write(source_file.read())
+                        else:
+                            f.write(vocab_file)
                     
                     val_path = None
                     if val_file is not None:
                         val_path = os.path.join(temp_dir, "val.jsonl")
                         with open(val_path, "wb") as f:
-                            f.write(val_file)
+                            if hasattr(val_file, 'name'):  # Handle NamedString objects from Gradio
+                                with open(val_file.name, "rb") as source_file:
+                                    f.write(source_file.read())
+                            else:
+                                f.write(val_file)
                     
                     # Create configuration
                     config = {
