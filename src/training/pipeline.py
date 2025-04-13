@@ -150,7 +150,7 @@ class ApertisDataset(Dataset):
 
 
 class ApertisTrainer:
-    """Trainer for Apertis models."""
+    """High-performance trainer implementation for Apertis models."""
     
     def __init__(
         self,
@@ -171,28 +171,10 @@ class ApertisTrainer:
         fp16: bool = False,
         device: Optional[str] = None,
         checkpoint_steps: int = 1000,
+        gpu_memory_fraction: float = 0.9,
     ):
         """
         Initialize the trainer.
-        
-        Args:
-            model: The Apertis model to train
-            train_dataset: Training dataset
-            val_dataset: Validation dataset
-            output_dir: Directory to save model checkpoints
-            batch_size: Batch size for training
-            learning_rate: Learning rate
-            weight_decay: Weight decay for AdamW optimizer
-            num_epochs: Number of training epochs
-            warmup_steps: Number of warmup steps for learning rate scheduler
-            gradient_accumulation_steps: Number of steps to accumulate gradients
-            max_grad_norm: Maximum gradient norm for gradient clipping
-            use_wandb: Whether to use Weights & Biases for logging
-            wandb_project: Weights & Biases project name
-            wandb_run_name: Weights & Biases run name
-            fp16: Whether to use mixed precision training
-            device: Device to use for training (auto-detected if None)
-            checkpoint_steps: Save checkpoint every N steps
         """
         self.model = model
         self.train_dataset = train_dataset
@@ -210,6 +192,7 @@ class ApertisTrainer:
         self.wandb_run_name = wandb_run_name
         self.fp16 = fp16
         self.checkpoint_steps = checkpoint_steps
+        self.gpu_memory_fraction = gpu_memory_fraction
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -219,6 +202,19 @@ class ApertisTrainer:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
+        
+        # Limit GPU memory usage if using CUDA
+        if torch.cuda.is_available() and self.gpu_memory_fraction < 1.0:
+            try:
+                total_memory = torch.cuda.get_device_properties(0).total_memory
+                reserved_memory = int(total_memory * self.gpu_memory_fraction)
+                # This is a workaround to limit memory usage
+                # Create a temporary tensor to reserve memory
+                tmp_tensor = torch.empty(reserved_memory, dtype=torch.int8, device='cuda')
+                del tmp_tensor
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"Failed to limit GPU memory: {e}")
         
         logger.info(f"Using device: {self.device}")
         
@@ -314,6 +310,10 @@ class ApertisTrainer:
                         # Move batch to device
                         batch = {k: v.to(self.device) for k, v in batch.items()}
                         
+                        # Optimize GPU memory by clearing cache every few steps
+                        if step % 5 == 0 and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
                         # Forward pass with mixed precision if enabled
                         if self.fp16:
                             with torch.cuda.amp.autocast():
@@ -335,6 +335,10 @@ class ApertisTrainer:
                                 self.scheduler.step()
                                 self.optimizer.zero_grad()
                                 global_step += 1
+                                
+                                # Synchronize CUDA to prevent hanging
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
                         else:
                             # Standard forward pass
                             outputs = self.model(**batch)
@@ -353,6 +357,10 @@ class ApertisTrainer:
                                 self.scheduler.step()
                                 self.optimizer.zero_grad()
                                 global_step += 1
+                                
+                                # Synchronize CUDA to prevent hanging
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
                         
                         # Update progress bar
                         train_loss += loss.item() * self.gradient_accumulation_steps

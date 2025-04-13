@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from src.multimodal.module import UnifiedMultimodalEncoder
 
 class ApertisConfig:
-    """Configuration class for Apertis model."""
+    """Core configuration for the Apertis architecture."""
     
     def __init__(
         self,
@@ -49,6 +49,8 @@ class ApertisConfig:
         vision_patch_size: int = 16,
         vision_layers: int = 12,
         vision_heads: int = 12,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -83,6 +85,8 @@ class ApertisConfig:
         self.vision_patch_size = vision_patch_size
         self.vision_layers = vision_layers
         self.vision_heads = vision_heads
+        self.output_attentions = output_attentions
+        self.output_hidden_states = output_hidden_states
 
     @classmethod
     def from_dict(cls, config_dict):
