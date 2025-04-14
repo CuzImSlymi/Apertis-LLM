@@ -110,9 +110,56 @@ class ApertisInterface:
                     self.model = create_apertis_model(model_size="small", multimodal=self.multimodal)
             else:
                 # Assume it's a state dict file
-                # Create a default model
-                self.model = create_apertis_model(model_size="small", multimodal=self.multimodal)
-                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                # First try to determine the model size from the state dict
+                try:
+                    # Load state dict to examine its structure
+                    state_dict = torch.load(model_path, map_location="cpu")
+                    
+                    # Determine model size from hidden dimensions
+                    if "model.token_embeddings.weight" in state_dict:
+                        hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                        
+                        # Count number of layers
+                        layer_count = 0
+                        i = 0
+                        # Check for different possible layer parameter names
+                        while (f"model.layers.{i}.input_layernorm.weight" in state_dict or 
+                               f"model.layers.{i}.attn_norm.weight" in state_dict):
+                            layer_count += 1
+                            i += 1
+                        
+                        # Determine model size based on hidden_size and layer_count
+                        if hidden_size == 512 and layer_count <= 8:
+                            model_size = "small"
+                        elif hidden_size == 768 and layer_count <= 12:
+                            model_size = "base"
+                        elif hidden_size == 1024 or layer_count > 12:
+                            model_size = "large"
+                        else:
+                            # Default to base if dimensions don't match standard sizes
+                            model_size = "base"
+                            
+                        logger.info(f"Detected model size: {model_size} (hidden_size={hidden_size}, layers={layer_count})")
+                    else:
+                        # If can't determine, default to base
+                        model_size = "base"
+                        logger.info(f"Could not determine model size, defaulting to {model_size}")
+                    
+                    # Create model with the appropriate size
+                    self.model = create_apertis_model(
+                        model_size=model_size, 
+                        multimodal=self.multimodal
+                    )
+                    
+                    # Load the state dict
+                    self.model.load_state_dict(state_dict)
+                except Exception as inner_e:
+                    logger.warning(f"Error determining model size: {inner_e}")
+                    logger.warning("Falling back to base model size")
+                    # Create a base model as fallback
+                    self.model = create_apertis_model(model_size="base", multimodal=self.multimodal)
+                    # Try loading the state dict again
+                    self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             
             # Move model to device
             self.model.to(self.device)
@@ -123,7 +170,7 @@ class ApertisInterface:
             logger.error(f"Error loading model: {e}")
             # Create a default model as fallback
             logger.info("Creating default model as fallback")
-            self.model = create_apertis_model(model_size="small", multimodal=self.multimodal)
+            self.model = create_apertis_model(model_size="base", multimodal=self.multimodal)
             self.model.to(self.device)
             self.model.eval()
     
