@@ -446,7 +446,7 @@ Apertis optimizes inference through:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/apertis.git
+git clone https://github.com/CuzImSlymi/Apertis-LLM.git
 cd apertis
 
 # Install dependencies
