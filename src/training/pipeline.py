@@ -37,6 +37,7 @@ class ApertisDataset(Dataset):
         multimodal: bool = False,
         image_dir: Optional[str] = None,
         image_size: int = 224,
+        model_vocab_size: int = 32000,
     ):
         """
         Initialize the dataset.
@@ -48,6 +49,7 @@ class ApertisDataset(Dataset):
             multimodal: Whether to include image data
             image_dir: Directory containing images (required if multimodal=True)
             image_size: Size of images (height and width)
+            model_vocab_size: The vocabulary size of the model (to ensure token IDs are in bounds)
         """
         self.data_path = data_path
         self.tokenizer_path = tokenizer_path
@@ -55,6 +57,7 @@ class ApertisDataset(Dataset):
         self.multimodal = multimodal
         self.image_dir = image_dir
         self.image_size = image_size
+        self.model_vocab_size = model_vocab_size
         
         # Load data
         self.data = self._load_data()
@@ -92,11 +95,35 @@ class ApertisDataset(Dataset):
         # This is a placeholder for a real tokenizer
         # In a production system, you would use a proper tokenizer
         tokens = []
+        vocab_size = 0
+        
+        # Find the maximum vocabulary index to determine actual vocab size
+        for _, idx in self.vocab.items():
+            if isinstance(idx, int) and idx > vocab_size:
+                vocab_size = idx
+        
+        # Add 1 to account for 0-indexing
+        vocab_size += 1
+        
+        # Get model's expected vocab size (default to a large number if not available)
+        model_vocab_size = getattr(self, "model_vocab_size", 200000)
+        
+        # Use the smaller of the two to ensure we don't exceed model's vocabulary size
+        effective_vocab_size = min(vocab_size, model_vocab_size)
+        
+        # Special token IDs
+        unk_token_id = self.vocab.get("<unk>", 3)
+        
         for word in text.split():
             if word in self.vocab:
-                tokens.append(self.vocab[word])
+                token_id = self.vocab[word]
+                # Ensure token ID is within vocabulary bounds
+                if token_id >= effective_vocab_size:
+                    token_id = unk_token_id
+                tokens.append(token_id)
             else:
-                tokens.append(self.vocab.get("<unk>", 3))  # Default to <unk> token
+                tokens.append(unk_token_id)  # Default to <unk> token
+        
         return tokens
     
     def _load_image(self, image_path: str) -> torch.Tensor:
@@ -305,10 +332,31 @@ class ApertisTrainer:
                     # Log first batch processing to help with debugging
                     if epoch == 0 and step == 0:
                         logger.info(f"Processing first batch (size: {batch['input_ids'].shape})")
+                        # Log max token ID for debugging
+                        max_id = torch.max(batch['input_ids']).item()
+                        logger.info(f"Maximum token ID in batch: {max_id}, Model vocab size: {self.model.config.vocab_size}")
                     
                     try:
-                        # Move batch to device
-                        batch = {k: v.to(self.device) for k, v in batch.items()}
+                        # Validate input IDs are within vocabulary bounds
+                        if torch.max(batch['input_ids']) >= self.model.config.vocab_size:
+                            logger.warning(f"Batch contains token IDs exceeding vocabulary size. Max ID: {torch.max(batch['input_ids']).item()}, Vocab size: {self.model.config.vocab_size}")
+                            # Clip token IDs to be within vocabulary bounds
+                            batch['input_ids'] = torch.clamp(batch['input_ids'], max=self.model.config.vocab_size-1)
+                            # Also clip labels if present
+                            if 'labels' in batch:
+                                batch['labels'] = torch.clamp(batch['labels'], max=self.model.config.vocab_size-1)
+                        
+                        # Move batch to device with error handling
+                        try:
+                            batch = {k: v.to(self.device) for k, v in batch.items()}
+                        except RuntimeError as e:
+                            if "CUDA out of memory" in str(e):
+                                logger.error("CUDA out of memory error. Trying to recover by clearing cache and reducing batch size.")
+                                torch.cuda.empty_cache()
+                                # Skip this batch and continue with next one
+                                continue
+                            else:
+                                raise
                         
                         # Optimize GPU memory by clearing cache every few steps
                         if step % 5 == 0 and torch.cuda.is_available():
@@ -534,6 +582,9 @@ class YoloStyleTrainingPipeline:
         """Prepare training and validation datasets."""
         logger.info("Preparing datasets")
         
+        # Get model's vocabulary size
+        vocab_size = self.model_config.get("vocab_size", 32000)
+        
         # Create training dataset
         train_dataset = ApertisDataset(
             data_path=self.data_config["train_data_path"],
@@ -542,6 +593,7 @@ class YoloStyleTrainingPipeline:
             multimodal=self.data_config.get("multimodal", False),
             image_dir=self.data_config.get("image_dir"),
             image_size=self.data_config.get("image_size", 224),
+            model_vocab_size=vocab_size,  # Pass model's vocab size to dataset
         )
         
         # Create validation dataset if specified
@@ -554,6 +606,7 @@ class YoloStyleTrainingPipeline:
                 multimodal=self.data_config.get("multimodal", False),
                 image_dir=self.data_config.get("image_dir"),
                 image_size=self.data_config.get("image_size", 224),
+                model_vocab_size=vocab_size,  # Pass model's vocab size to dataset
             )
         
         return train_dataset, val_dataset
@@ -561,6 +614,31 @@ class YoloStyleTrainingPipeline:
     def create_model(self) -> ApertisForCausalLM:
         """Create Apertis model based on configuration."""
         logger.info("Creating model")
+        
+        # Determine vocabulary size based on tokenizer
+        tokenizer_path = self.data_config["tokenizer_path"]
+        try:
+            with open(tokenizer_path, 'r', encoding='utf-8') as f:
+                vocab = json.load(f)
+            
+            # Find the maximum token ID to determine actual vocab size
+            max_token_id = 0
+            for _, idx in vocab.items():
+                if isinstance(idx, int) and idx > max_token_id:
+                    max_token_id = idx
+            
+            # Add 1 to account for 0-indexing and add padding for future tokens
+            actual_vocab_size = max_token_id + 1
+            # Add 10% padding for safety, but at least 100 tokens
+            vocab_size = min(actual_vocab_size + max(100, actual_vocab_size // 10), 250000)
+            
+            logger.info(f"Detected vocabulary size: {actual_vocab_size}, using padded size: {vocab_size}")
+            
+            # Update model config with the detected vocabulary size
+            self.model_config["vocab_size"] = vocab_size
+        except Exception as e:
+            logger.warning(f"Error detecting vocabulary size: {e}")
+            logger.warning("Using default vocabulary size from model config")
         
         # Create configuration
         config = ApertisConfig(
