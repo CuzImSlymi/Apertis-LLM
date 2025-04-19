@@ -458,7 +458,7 @@ class ApertisInterface:
                             batch_size = gr.Slider(
                                 minimum=1,
                                 maximum=64,
-                                value=4,  # Updated from 8 to 4 to match training pipeline
+                                value=4,
                                 step=1,
                                 label="Batch Size",
                             )
@@ -476,6 +476,28 @@ class ApertisInterface:
                                 step=1,
                                 label="Number of Epochs",
                             )
+                            
+                            # Add checkpoint frequency controls
+                            with gr.Accordion("Checkpoint Settings", open=True):
+                                checkpoint_steps = gr.Slider(
+                                    minimum=0,
+                                    maximum=5000,
+                                    value=1000,
+                                    step=100,
+                                    label="Global Step Checkpoint Frequency (0 to disable)",
+                                )
+                                iteration_checkpoint_steps = gr.Slider(
+                                    minimum=0,
+                                    maximum=1000,
+                                    value=100,
+                                    step=10,
+                                    label="Iteration Checkpoint Frequency (0 to disable)",
+                                )
+                                gr.Markdown("""
+                                * **Global Step Checkpoint**: Save checkpoint every N global steps (across epochs)
+                                * **Iteration Checkpoint**: Save checkpoint every N iterations within each epoch
+                                """)
+                            
                             output_dir = gr.Textbox(
                                 label="Output Directory",
                                 value="output",
@@ -658,7 +680,7 @@ class ApertisInterface:
             def start_training(
                 model_size, multimodal, expert_system,
                 train_file, val_file, vocab_file, img_dir,
-                batch, lr, epochs, out_dir, use_wb, wb_project,
+                batch, lr, epochs, checkpoint_freq, iter_checkpoint_freq, out_dir, use_wb, wb_project,
             ):
                 try:
                     # Create temporary directory for training files
@@ -714,11 +736,13 @@ class ApertisInterface:
                             "num_epochs": epochs,
                             "use_wandb": use_wb,
                             "wandb_project": wb_project,
-                            "gradient_accumulation_steps": 4,  # Added to match pipeline defaults
-                            "fp16": True,  # Added to match pipeline defaults
-                            "gpu_memory_fraction": 0.7,  # Added to match pipeline defaults
-                            "use_gradient_checkpointing": True,  # Added to match pipeline defaults
-                            "dynamic_batch_sizing": True,  # Added to match pipeline defaults
+                            "gradient_accumulation_steps": 4,
+                            "fp16": True,
+                            "gpu_memory_fraction": 0.7,
+                            "use_gradient_checkpointing": True,
+                            "dynamic_batch_sizing": True,
+                            "checkpoint_steps": checkpoint_freq,
+                            "iteration_checkpoint_steps": iter_checkpoint_freq,
                         },
                     }
                     
@@ -752,11 +776,23 @@ class ApertisInterface:
                     thread.daemon = True
                     thread.start()
                     
+                    checkpoint_info = ""
+                    if checkpoint_freq > 0:
+                        checkpoint_info += f"- Global step checkpoints: Every {checkpoint_freq} steps\n"
+                    else:
+                        checkpoint_info += "- Global step checkpoints: Disabled\n"
+                        
+                    if iter_checkpoint_freq > 0:
+                        checkpoint_info += f"- Iteration checkpoints: Every {iter_checkpoint_freq} iterations within each epoch\n"
+                    else:
+                        checkpoint_info += "- Iteration checkpoints: Disabled\n"
+                    
                     return f"Training started with configuration:\n" \
                            f"- Model: {model_size} {'(multimodal)' if multimodal else ''} {'(expert system)' if expert_system else ''}\n" \
                            f"- Batch size: {batch}\n" \
                            f"- Learning rate: {lr}\n" \
                            f"- Epochs: {epochs}\n" \
+                           f"{checkpoint_info}" \
                            f"- Output directory: {out_dir}\n\n" \
                            f"Training is running in the background. Check the console for progress."
                 except Exception as e:
@@ -767,7 +803,9 @@ class ApertisInterface:
                 inputs=[
                     model_size, multimodal_checkbox, use_expert_system,
                     train_data, val_data, vocab_data, image_dir,
-                    batch_size, learning_rate, num_epochs, output_dir, use_wandb, wandb_project,
+                    batch_size, learning_rate, num_epochs, 
+                    checkpoint_steps, iteration_checkpoint_steps,
+                    output_dir, use_wandb, wandb_project,
                 ],
                 outputs=[training_output],
             )

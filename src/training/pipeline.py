@@ -196,6 +196,7 @@ class ApertisTrainer:
         fp16: bool = True,
         device: Optional[str] = None,
         checkpoint_steps: int = 1000,
+        iteration_checkpoint_steps: int = 0,  # New parameter for iteration-based checkpoints
         gpu_memory_fraction: float = 0.7,
         use_gradient_checkpointing: bool = True,
         eval_steps: int = 500,
@@ -203,6 +204,30 @@ class ApertisTrainer:
     ):
         """
         Initialize the trainer.
+        
+        Args:
+            model: The model to train
+            train_dataset: Training dataset
+            val_dataset: Validation dataset (optional)
+            output_dir: Directory to save outputs
+            batch_size: Batch size for training
+            learning_rate: Learning rate
+            weight_decay: Weight decay for optimizer
+            num_epochs: Number of training epochs
+            warmup_steps: Number of warmup steps for learning rate scheduler
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            max_grad_norm: Maximum gradient norm for clipping
+            use_wandb: Whether to use Weights & Biases for logging
+            wandb_project: Weights & Biases project name
+            wandb_run_name: Weights & Biases run name
+            fp16: Whether to use mixed precision training
+            device: Device to use for training
+            checkpoint_steps: Save checkpoint every N global steps
+            iteration_checkpoint_steps: Save checkpoint every N iterations within an epoch (0 to disable)
+            gpu_memory_fraction: Fraction of GPU memory to use
+            use_gradient_checkpointing: Whether to use gradient checkpointing
+            eval_steps: Evaluate model every N global steps
+            dynamic_batch_sizing: Whether to dynamically adjust batch size
         """
         self.model = model
         self.train_dataset = train_dataset
@@ -220,6 +245,7 @@ class ApertisTrainer:
         self.wandb_run_name = wandb_run_name
         self.fp16 = fp16
         self.checkpoint_steps = checkpoint_steps
+        self.iteration_checkpoint_steps = iteration_checkpoint_steps
         self.gpu_memory_fraction = gpu_memory_fraction
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.eval_steps = eval_steps
@@ -299,7 +325,7 @@ class ApertisTrainer:
         )
         
         # Set up mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler() if fp16 else None
+        self.scaler = torch.amp.GradScaler() if fp16 else None
         
         # Initialize Weights & Biases
         if use_wandb:
@@ -320,6 +346,8 @@ class ApertisTrainer:
                     "max_grad_norm": max_grad_norm,
                     "fp16": fp16,
                     "gradient_checkpointing": use_gradient_checkpointing,
+                    "checkpoint_steps": checkpoint_steps,
+                    "iteration_checkpoint_steps": iteration_checkpoint_steps,
                 },
             )
     
@@ -493,8 +521,7 @@ class ApertisTrainer:
                                 "gpu_memory_reserved": torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0,
                             })
                         
-                        # Evaluate periodically
-                        # Fix: Only evaluate if global_step > 0 and is divisible by eval_steps
+                        # Evaluate periodically based on global steps
                         if self.val_dataloader is not None and global_step > 0 and global_step % self.eval_steps == 0:
                             val_metrics = self.evaluate()
                             val_loss = val_metrics["val_loss"]
@@ -507,9 +534,15 @@ class ApertisTrainer:
                                 self._save_checkpoint("best")
                                 logger.info(f"New best validation loss: {best_val_loss:.4f}")
                         
-                        # Save checkpoint
-                        if global_step % self.checkpoint_steps == 0:
-                            self._save_checkpoint(global_step)
+                        # Save checkpoint based on global steps
+                        if global_step > 0 and self.checkpoint_steps > 0 and global_step % self.checkpoint_steps == 0:
+                            self._save_checkpoint(f"step-{global_step}")
+                            logger.info(f"Saved checkpoint at global step {global_step}")
+                        
+                        # Save checkpoint based on iterations within epoch
+                        if self.iteration_checkpoint_steps > 0 and step > 0 and step % self.iteration_checkpoint_steps == 0:
+                            self._save_checkpoint(f"epoch{epoch+1}-iter{step}")
+                            logger.info(f"Saved checkpoint at epoch {epoch+1}, iteration {step}")
                             
                         # Try increasing batch size if things are going well
                         if self.dynamic_batch_sizing and step > 0 and step % 50 == 0:
@@ -526,7 +559,7 @@ class ApertisTrainer:
                 self._save_checkpoint("emergency")
             
             # Calculate average training loss
-            avg_train_loss = train_loss / train_steps
+            avg_train_loss = train_loss / train_steps if train_steps > 0 else float('inf')
             logger.info(f"Average training loss: {avg_train_loss:.4f}")
             
             # Validation
@@ -589,7 +622,7 @@ class ApertisTrainer:
                 progress_bar.set_postfix({"loss": val_loss / val_steps})
         
         # Calculate average validation loss
-        avg_val_loss = val_loss / val_steps
+        avg_val_loss = val_loss / val_steps if val_steps > 0 else float('inf')
         
         # Log to Weights & Biases
         if self.use_wandb:
@@ -798,6 +831,7 @@ class YoloStyleTrainingPipeline:
             fp16=self.training_config.get("fp16", True),
             device=self.training_config.get("device"),
             checkpoint_steps=self.training_config.get("checkpoint_steps", 1000),
+            iteration_checkpoint_steps=self.training_config.get("iteration_checkpoint_steps", 0),
             gpu_memory_fraction=self.training_config.get("gpu_memory_fraction", 0.7),
             use_gradient_checkpointing=self.training_config.get("use_gradient_checkpointing", True),
             eval_steps=self.training_config.get("eval_steps", 500),
@@ -883,6 +917,7 @@ def create_sample_config(output_path: str) -> None:
             "wandb_project": "apertis",
             "fp16": True,
             "checkpoint_steps": 1000,
+            "iteration_checkpoint_steps": 100,  # Added new parameter
             "gpu_memory_fraction": 0.7,
             "use_gradient_checkpointing": True,
             "dynamic_batch_sizing": True,
