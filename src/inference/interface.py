@@ -200,7 +200,6 @@ class ApertisInterface:
             return [3] * len(text.split())  # All tokens as <unk>
         
         # Simple tokenization by splitting on spaces
-        # In a production system, you would use a proper tokenizer
         tokens = []
         for word in text.split():
             if word in self.vocab:
@@ -459,7 +458,7 @@ class ApertisInterface:
                             batch_size = gr.Slider(
                                 minimum=1,
                                 maximum=64,
-                                value=8,
+                                value=4,  # Updated from 8 to 4 to match training pipeline
                                 step=1,
                                 label="Batch Size",
                             )
@@ -715,6 +714,11 @@ class ApertisInterface:
                             "num_epochs": epochs,
                             "use_wandb": use_wb,
                             "wandb_project": wb_project,
+                            "gradient_accumulation_steps": 4,  # Added to match pipeline defaults
+                            "fp16": True,  # Added to match pipeline defaults
+                            "gpu_memory_fraction": 0.7,  # Added to match pipeline defaults
+                            "use_gradient_checkpointing": True,  # Added to match pipeline defaults
+                            "dynamic_batch_sizing": True,  # Added to match pipeline defaults
                         },
                     }
                     
@@ -737,20 +741,24 @@ class ApertisInterface:
                     def train_thread():
                         try:
                             from src.training.pipeline import train_from_config
-                            
-                            # Train model
-                            metrics = train_from_config(config_path)
-                            
-                            # Clean up
-                            shutil.rmtree(temp_dir)
-                            
-                            return f"Training completed!\nMetrics: {json.dumps(metrics, indent=2)}"
+                            train_from_config(config_path)
                         except Exception as e:
-                            return f"Error during training: {str(e)}"
+                            logger.error(f"Error in training thread: {str(e)}")
+                        finally:
+                            # Clean up temporary directory
+                            shutil.rmtree(temp_dir)
                     
-                    threading.Thread(target=train_thread).start()
+                    thread = threading.Thread(target=train_thread)
+                    thread.daemon = True
+                    thread.start()
                     
-                    return f"Training started with configuration:\n{json.dumps(config, indent=2)}\n\nCheck the output directory for results."
+                    return f"Training started with configuration:\n" \
+                           f"- Model: {model_size} {'(multimodal)' if multimodal else ''} {'(expert system)' if expert_system else ''}\n" \
+                           f"- Batch size: {batch}\n" \
+                           f"- Learning rate: {lr}\n" \
+                           f"- Epochs: {epochs}\n" \
+                           f"- Output directory: {out_dir}\n\n" \
+                           f"Training is running in the background. Check the console for progress."
                 except Exception as e:
                     return f"Error starting training: {str(e)}"
             
@@ -759,60 +767,14 @@ class ApertisInterface:
                 inputs=[
                     model_size, multimodal_checkbox, use_expert_system,
                     train_data, val_data, vocab_data, image_dir,
-                    batch_size, learning_rate, num_epochs,
-                    output_dir, use_wandb, wandb_project,
+                    batch_size, learning_rate, num_epochs, output_dir, use_wandb, wandb_project,
                 ],
                 outputs=[training_output],
             )
         
         # Launch interface
-        interface.launch(server_name="0.0.0.0", server_port=self.port, share=self.share)
-
-
-def main():
-    """Main entry point."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Apertis Interface")
-    parser.add_argument("--model-path", type=str, help="Path to the model file")
-    parser.add_argument("--vocab-file", type=str, help="Path to the vocabulary file")
-    parser.add_argument("--multimodal", action="store_true", help="Enable multimodal capabilities")
-    parser.add_argument("--device", type=str, help="Device to use for inference")
-    parser.add_argument("--web", action="store_true", help="Launch web interface")
-    parser.add_argument("--port", type=int, default=7860, help="Port for web interface")
-    parser.add_argument("--share", action="store_true", help="Create a public link")
-    
-    args = parser.parse_args()
-    
-    # Create interface
-    interface = ApertisInterface(
-        model_path=args.model_path,
-        vocab_file=args.vocab_file,
-        multimodal=args.multimodal,
-        device=args.device,
-        web=args.web,
-        port=args.port,
-        share=args.share,
-    )
-    
-    # If not launching web interface, start interactive CLI
-    if not args.web:
-        print("Apertis CLI Interface")
-        print("Type 'exit' to quit, 'reset' to reset chat history")
-        
-        while True:
-            user_input = input("\nYou: ")
-            
-            if user_input.lower() == "exit":
-                break
-            elif user_input.lower() == "reset":
-                interface.reset_chat()
-                print("Chat history reset")
-                continue
-            
-            response = interface.chat(user_input)
-            print(f"\nApertis: {response}")
-
-
-if __name__ == "__main__":
-    main()
+        interface.launch(
+            server_name="0.0.0.0",
+            server_port=self.port,
+            share=self.share,
+        )

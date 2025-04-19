@@ -92,8 +92,6 @@ class ApertisDataset(Dataset):
     
     def _tokenize(self, text: str) -> List[int]:
         """Simple tokenization by splitting on spaces and mapping to vocabulary."""
-        # This is a placeholder for a real tokenizer
-        # In a production system, you would use a proper tokenizer
         tokens = []
         vocab_size = 0
         
@@ -256,8 +254,6 @@ class ApertisTrainer:
                     logger.info(f"Total GPU memory: {total_memory / 1024**3:.2f} GiB")
                     logger.info(f"Reserving {reserved_memory / 1024**3:.2f} GiB for system")
                     logger.info(f"Available for training: {(total_memory - reserved_memory) / 1024**3:.2f} GiB")
-                    
-                    # This approach doesn't actually reserve memory but helps with logging
                 except Exception as e:
                     logger.warning(f"Failed to get GPU memory info: {e}")
         
@@ -333,9 +329,9 @@ class ApertisTrainer:
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,  # Avoid multiprocessing overhead
-            pin_memory=True,  # Speed up data transfer to GPU
-            drop_last=True,  # Avoid issues with small last batch
+            num_workers=0,
+            pin_memory=True,
+            drop_last=True,
         )
         
         if self.val_dataset is not None:
@@ -426,7 +422,7 @@ class ApertisTrainer:
                         
                         # Forward pass with mixed precision if enabled
                         if self.fp16:
-                            with torch.cuda.amp.autocast():
+                            with torch.amp.autocast('cuda'):
                                 outputs = self.model(**batch)
                                 loss = outputs[0]
                                 loss = loss / self.gradient_accumulation_steps
@@ -498,7 +494,8 @@ class ApertisTrainer:
                             })
                         
                         # Evaluate periodically
-                        if self.val_dataloader is not None and global_step % self.eval_steps == 0:
+                        # Fix: Only evaluate if global_step > 0 and is divisible by eval_steps
+                        if self.val_dataloader is not None and global_step > 0 and global_step % self.eval_steps == 0:
                             val_metrics = self.evaluate()
                             val_loss = val_metrics["val_loss"]
                             
@@ -579,7 +576,7 @@ class ApertisTrainer:
                 
                 # Forward pass with mixed precision if enabled
                 if self.fp16:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs = self.model(**batch)
                         loss = outputs[0]
                 else:
@@ -690,7 +687,7 @@ class YoloStyleTrainingPipeline:
             multimodal=self.data_config.get("multimodal", False),
             image_dir=self.data_config.get("image_dir"),
             image_size=self.data_config.get("image_size", 224),
-            model_vocab_size=vocab_size,  # Pass model's vocab size to dataset
+            model_vocab_size=vocab_size,
         )
         
         # Create validation dataset if specified
@@ -703,7 +700,7 @@ class YoloStyleTrainingPipeline:
                 multimodal=self.data_config.get("multimodal", False),
                 image_dir=self.data_config.get("image_dir"),
                 image_size=self.data_config.get("image_size", 224),
-                model_vocab_size=vocab_size,  # Pass model's vocab size to dataset
+                model_vocab_size=vocab_size,
             )
         
         return train_dataset, val_dataset
@@ -788,23 +785,23 @@ class YoloStyleTrainingPipeline:
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             output_dir=self.training_config["output_dir"],
-            batch_size=self.training_config.get("batch_size", 4),  # Reduced default from 8 to 4
+            batch_size=self.training_config.get("batch_size", 4),
             learning_rate=self.training_config.get("learning_rate", 5e-5),
             weight_decay=self.training_config.get("weight_decay", 0.01),
             num_epochs=self.training_config.get("num_epochs", 3),
             warmup_steps=self.training_config.get("warmup_steps", 0),
-            gradient_accumulation_steps=self.training_config.get("gradient_accumulation_steps", 4),  # Increased default from 1 to 4
+            gradient_accumulation_steps=self.training_config.get("gradient_accumulation_steps", 4),
             max_grad_norm=self.training_config.get("max_grad_norm", 1.0),
             use_wandb=self.training_config.get("use_wandb", False),
             wandb_project=self.training_config.get("wandb_project", "apertis"),
             wandb_run_name=self.training_config.get("wandb_run_name"),
-            fp16=self.training_config.get("fp16", True),  # Default to True for mixed precision
+            fp16=self.training_config.get("fp16", True),
             device=self.training_config.get("device"),
             checkpoint_steps=self.training_config.get("checkpoint_steps", 1000),
-            gpu_memory_fraction=self.training_config.get("gpu_memory_fraction", 0.7),  # Reduced from 0.9 to 0.7
-            use_gradient_checkpointing=self.training_config.get("use_gradient_checkpointing", True),  # Enable by default
+            gpu_memory_fraction=self.training_config.get("gpu_memory_fraction", 0.7),
+            use_gradient_checkpointing=self.training_config.get("use_gradient_checkpointing", True),
             eval_steps=self.training_config.get("eval_steps", 500),
-            dynamic_batch_sizing=self.training_config.get("dynamic_batch_sizing", True),  # Enable by default
+            dynamic_batch_sizing=self.training_config.get("dynamic_batch_sizing", True),
         )
         
         # Train model
@@ -875,20 +872,20 @@ def create_sample_config(output_path: str) -> None:
         },
         "training_config": {
             "output_dir": "output",
-            "batch_size": 4,  # Reduced from 8 to 4
+            "batch_size": 4,
             "learning_rate": 5e-5,
             "weight_decay": 0.01,
             "num_epochs": 3,
             "warmup_steps": 0,
-            "gradient_accumulation_steps": 4,  # Increased from 1 to 4
+            "gradient_accumulation_steps": 4,
             "max_grad_norm": 1.0,
             "use_wandb": False,
             "wandb_project": "apertis",
-            "fp16": True,  # Enable mixed precision by default
+            "fp16": True,
             "checkpoint_steps": 1000,
-            "gpu_memory_fraction": 0.7,  # Reduced from 0.9 to 0.7
-            "use_gradient_checkpointing": True,  # Enable gradient checkpointing
-            "dynamic_batch_sizing": True,  # Enable dynamic batch sizing
+            "gpu_memory_fraction": 0.7,
+            "use_gradient_checkpointing": True,
+            "dynamic_batch_sizing": True,
         },
     }
     
