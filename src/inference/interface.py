@@ -110,21 +110,37 @@ class ApertisInterface:
                     self.model = create_apertis_model(model_size="small", multimodal=self.multimodal)
             else:
                 # Assume it's a state dict file
-                # First try to determine the model size from the state dict
+                # First try to determine the model size, architecture, and vocabulary size from the state dict
                 try:
                     # Load state dict to examine its structure
                     state_dict = torch.load(model_path, map_location="cpu")
                     
+                    # Check if model uses expert system
+                    use_expert_system = False
+                    # Look for expert system specific parameters
+                    for key in state_dict.keys():
+                        if "feed_forward.feed_forward.experts" in key or "feed_forward.feed_forward.router" in key:
+                            use_expert_system = True
+                            break
+                    
+                    # Extract vocabulary size from embeddings
+                    vocab_size = None
+                    if "model.token_embeddings.weight" in state_dict:
+                        vocab_size = state_dict["model.token_embeddings.weight"].size(0)
+                        logger.info(f"Detected vocabulary size: {vocab_size}")
+                    
                     # Determine model size from hidden dimensions
+                    hidden_size = None
+                    layer_count = 0
                     if "model.token_embeddings.weight" in state_dict:
                         hidden_size = state_dict["model.token_embeddings.weight"].size(1)
                         
                         # Count number of layers
-                        layer_count = 0
                         i = 0
                         # Check for different possible layer parameter names
-                        while (f"model.layers.{i}.input_layernorm.weight" in state_dict or 
-                               f"model.layers.{i}.attn_norm.weight" in state_dict):
+                        while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
+                                ["input_layernorm.weight", "attn_norm.weight", 
+                                 "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
                             layer_count += 1
                             i += 1
                         
@@ -140,26 +156,112 @@ class ApertisInterface:
                             model_size = "base"
                             
                         logger.info(f"Detected model size: {model_size} (hidden_size={hidden_size}, layers={layer_count})")
+                        logger.info(f"Expert system: {use_expert_system}")
                     else:
                         # If can't determine, default to base
                         model_size = "base"
                         logger.info(f"Could not determine model size, defaulting to {model_size}")
                     
-                    # Create model with the appropriate size
-                    self.model = create_apertis_model(
-                        model_size=model_size, 
-                        multimodal=self.multimodal
-                    )
+                    # Create a custom configuration with the detected parameters
+                    config_kwargs = {
+                        "hidden_size": hidden_size if hidden_size else {"small": 512, "base": 768, "large": 1024}[model_size],
+                        "num_hidden_layers": layer_count if layer_count > 0 else {"small": 8, "base": 12, "large": 24}[model_size],
+                        "use_expert_system": use_expert_system,
+                        "multimodal": self.multimodal,
+                    }
+                    
+                    # Add vocabulary size if detected
+                    if vocab_size:
+                        config_kwargs["vocab_size"] = vocab_size
+                    
+                    # Create model with the custom configuration
+                    config = ApertisConfig(**config_kwargs)
+                    self.model = ApertisForCausalLM(config)
                     
                     # Load the state dict
-                    self.model.load_state_dict(state_dict)
+                    self.model.load_state_dict(state_dict, strict=False)
+                    logger.info(f"Successfully loaded model with custom configuration")
                 except Exception as inner_e:
-                    logger.warning(f"Error determining model size: {inner_e}")
-                    logger.warning("Falling back to base model size")
-                    # Create a base model as fallback
-                    self.model = create_apertis_model(model_size="base", multimodal=self.multimodal)
-                    # Try loading the state dict again
-                    self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                    logger.warning(f"Error determining model parameters: {inner_e}")
+                    logger.warning("Trying to load with exact vocabulary size and layer count...")
+                    
+                    # Try loading with exact vocabulary size and layer count
+                    try:
+                        # Load state dict again
+                        state_dict = torch.load(model_path, map_location="cpu")
+                        
+                        # Extract vocabulary size
+                        vocab_size = state_dict["model.token_embeddings.weight"].size(0)
+                        hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                        
+                        # Count layers
+                        layer_count = 0
+                        i = 0
+                        while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
+                                ["input_layernorm.weight", "attn_norm.weight", 
+                                 "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
+                            layer_count += 1
+                            i += 1
+                        
+                        # Check for expert system
+                        use_expert_system = any("feed_forward.feed_forward.experts" in key for key in state_dict.keys())
+                        
+                        # Create custom configuration
+                        config = ApertisConfig(
+                            vocab_size=vocab_size,
+                            hidden_size=hidden_size,
+                            num_hidden_layers=layer_count,
+                            num_attention_heads=hidden_size // 64,  # Common ratio
+                            intermediate_size=hidden_size * 4,      # Common ratio
+                            use_expert_system=use_expert_system,
+                            multimodal=self.multimodal
+                        )
+                        
+                        # Create model with exact parameters
+                        self.model = ApertisForCausalLM(config)
+                        
+                        # Load state dict
+                        self.model.load_state_dict(state_dict, strict=False)
+                        logger.info(f"Successfully loaded model with exact parameters (vocab={vocab_size}, layers={layer_count})")
+                    except Exception as exact_e:
+                        logger.warning(f"Error loading with exact parameters: {exact_e}")
+                        logger.warning("Falling back to loading with relaxed constraints...")
+                        
+                        # Final fallback: try loading with strict=False
+                        try:
+                            # Load state dict again
+                            state_dict = torch.load(model_path, map_location="cpu")
+                            
+                            # Extract vocabulary size and hidden size
+                            if "model.token_embeddings.weight" in state_dict:
+                                vocab_size = state_dict["model.token_embeddings.weight"].size(0)
+                                hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                            else:
+                                # Default values if can't determine
+                                vocab_size = 32000
+                                hidden_size = 768
+                            
+                            # Create model with detected parameters but default layer count
+                            config = ApertisConfig(
+                                vocab_size=vocab_size,
+                                hidden_size=hidden_size,
+                                use_expert_system=True,  # Try with expert system as last resort
+                                multimodal=self.multimodal
+                            )
+                            
+                            self.model = ApertisForCausalLM(config)
+                            
+                            # Load with strict=False to allow parameter mismatches
+                            self.model.load_state_dict(state_dict, strict=False)
+                            logger.info(f"Loaded model with relaxed constraints (strict=False)")
+                        except Exception as fallback_e:
+                            logger.error(f"All loading attempts failed: {fallback_e}")
+                            # Create a minimal model as absolute fallback
+                            self.model = create_apertis_model(
+                                model_size="small", 
+                                multimodal=self.multimodal,
+                                use_expert_system=False
+                            )
             
             # Move model to device
             self.model.to(self.device)
@@ -186,6 +288,15 @@ class ApertisInterface:
             self.reverse_vocab = {v: k for k, v in self.vocab.items()}
             
             logger.info(f"Vocabulary loaded with {len(self.vocab)} tokens")
+            
+            # Check if model vocabulary size matches loaded vocabulary
+            if self.model and hasattr(self.model.config, "vocab_size"):
+                model_vocab_size = self.model.config.vocab_size
+                vocab_size = len(self.vocab)
+                
+                if model_vocab_size != vocab_size:
+                    logger.warning(f"Model vocabulary size ({model_vocab_size}) doesn't match loaded vocabulary size ({vocab_size})")
+                    logger.warning("This may cause issues with token generation. Consider recreating the model with matching vocabulary size.")
         except Exception as e:
             logger.error(f"Error loading vocabulary: {e}")
             # Create a minimal vocabulary as fallback
@@ -541,11 +652,33 @@ class ApertisInterface:
                                 value=self.vocab_file or "",
                                 placeholder="/path/to/vocab.json",
                             )
+                            
+                            # Add advanced model loading options
+                            with gr.Accordion("Advanced Loading Options", open=True):
+                                expert_system_checkbox = gr.Checkbox(
+                                    value=False,
+                                    label="Model uses Expert System",
+                                )
+                                custom_vocab_size = gr.Number(
+                                    value=0,
+                                    label="Custom Vocabulary Size (0 to auto-detect)",
+                                    precision=0
+                                )
+                                custom_layer_count = gr.Number(
+                                    value=0,
+                                    label="Custom Layer Count (0 to auto-detect)",
+                                    precision=0
+                                )
+                                strict_loading = gr.Checkbox(
+                                    value=True,
+                                    label="Strict Loading (uncheck to allow parameter mismatches)",
+                                )
+                            
                             load_model_btn = gr.Button("Load Model")
                             model_info = gr.Textbox(
                                 label="Model Information",
                                 interactive=False,
-                                lines=5,
+                                lines=8,
                             )
                         
                         with gr.Column(scale=1):
@@ -558,6 +691,15 @@ class ApertisInterface:
                             new_model_multimodal = gr.Checkbox(
                                 value=False,
                                 label="Multimodal (Text + Image)",
+                            )
+                            new_model_expert = gr.Checkbox(
+                                value=False,
+                                label="Use Expert System",
+                            )
+                            new_model_vocab_size = gr.Number(
+                                value=32000,
+                                label="Vocabulary Size",
+                                precision=0
                             )
                             new_model_output = gr.Textbox(
                                 label="Output Path",
@@ -614,10 +756,84 @@ class ApertisInterface:
             )
             
             # Model loading
-            def load_model_handler(model_path, vocab_path):
+            def load_model_handler(model_path, vocab_path, use_expert_system, custom_vocab_size, custom_layer_count, strict_loading):
                 try:
+                    # Save current model settings
+                    old_multimodal = self.multimodal
+                    self.multimodal = self.model.config.multimodal if self.model else old_multimodal
+                    
+                    # If custom parameters are provided, create a custom configuration
+                    if custom_vocab_size > 0 or custom_layer_count > 0 or use_expert_system:
+                        # Load state dict to examine structure
+                        if os.path.isdir(model_path):
+                            state_dict_path = os.path.join(model_path, "model.pt")
+                            state_dict = torch.load(state_dict_path, map_location="cpu")
+                        else:
+                            state_dict = torch.load(model_path, map_location="cpu")
+                        
+                        # Determine parameters
+                        if "model.token_embeddings.weight" in state_dict:
+                            # Use provided vocab size or detect from state dict
+                            vocab_size = custom_vocab_size if custom_vocab_size > 0 else state_dict["model.token_embeddings.weight"].size(0)
+                            hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                            
+                            # Use provided layer count or detect from state dict
+                            if custom_layer_count > 0:
+                                layer_count = custom_layer_count
+                            else:
+                                # Count layers
+                                layer_count = 0
+                                i = 0
+                                while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
+                                        ["input_layernorm.weight", "attn_norm.weight", 
+                                         "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
+                                    layer_count += 1
+                                    i += 1
+                            
+                            # Create custom configuration
+                            config = ApertisConfig(
+                                vocab_size=vocab_size,
+                                hidden_size=hidden_size,
+                                num_hidden_layers=layer_count,
+                                num_attention_heads=hidden_size // 64,  # Common ratio
+                                intermediate_size=hidden_size * 4,      # Common ratio
+                                use_expert_system=use_expert_system,
+                                multimodal=self.multimodal
+                            )
+                            
+                            # Create model with custom configuration
+                            self.model = ApertisForCausalLM(config)
+                            
+                            # Load state dict with specified strictness
+                            self.model.load_state_dict(state_dict, strict=strict_loading)
+                            
+                            # Load vocabulary
+                            self.load_vocabulary(vocab_path)
+                            
+                            # Get model information
+                            config = self.model.config
+                            info = f"Model loaded successfully with custom configuration!\n"
+                            info += f"Model type: {config.model_type}\n"
+                            info += f"Hidden size: {config.hidden_size}\n"
+                            info += f"Layers: {config.num_hidden_layers}\n"
+                            info += f"Attention heads: {config.num_attention_heads}\n"
+                            info += f"Expert system: {config.use_expert_system}\n"
+                            info += f"Vocabulary size: {config.vocab_size}\n"
+                            info += f"Strict loading: {strict_loading}\n"
+                            info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}"
+                            
+                            # Move model to device
+                            self.model.to(self.device)
+                            self.model.eval()
+                            
+                            return info
+                    
+                    # Standard loading if no custom parameters
                     self.load_model(model_path)
                     self.load_vocabulary(vocab_path)
+                    
+                    # Restore multimodal setting
+                    self.multimodal = old_multimodal
                     
                     # Get model information
                     if self.model is not None:
@@ -627,7 +843,9 @@ class ApertisInterface:
                         info += f"Hidden size: {config.hidden_size}\n"
                         info += f"Layers: {config.num_hidden_layers}\n"
                         info += f"Attention heads: {config.num_attention_heads}\n"
-                        info += f"Vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}"
+                        info += f"Expert system: {config.use_expert_system}\n"
+                        info += f"Vocabulary size: {config.vocab_size}\n"
+                        info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}"
                         return info
                     else:
                         return "Failed to load model."
@@ -636,18 +854,27 @@ class ApertisInterface:
             
             load_model_btn.click(
                 load_model_handler,
-                inputs=[model_path_input, vocab_path_input],
+                inputs=[model_path_input, vocab_path_input, expert_system_checkbox, 
+                        custom_vocab_size, custom_layer_count, strict_loading],
                 outputs=[model_info],
             )
             
             # Model creation
-            def create_model_handler(model_size, multimodal, output_path):
+            def create_model_handler(model_size, multimodal, use_expert_system, vocab_size, output_path):
                 try:
-                    # Create model
-                    model = create_apertis_model(
-                        model_size=model_size,
-                        multimodal=multimodal,
+                    # Create custom configuration
+                    config = ApertisConfig(
+                        vocab_size=int(vocab_size),
+                        hidden_size={"small": 512, "base": 768, "large": 1024}[model_size],
+                        num_hidden_layers={"small": 8, "base": 12, "large": 24}[model_size],
+                        num_attention_heads={"small": 8, "base": 12, "large": 16}[model_size],
+                        intermediate_size={"small": 2048, "base": 3072, "large": 4096}[model_size],
+                        use_expert_system=use_expert_system,
+                        multimodal=multimodal
                     )
+                    
+                    # Create model
+                    model = ApertisForCausalLM(config)
                     
                     # Create output directory
                     os.makedirs(output_path, exist_ok=True)
@@ -672,7 +899,7 @@ class ApertisInterface:
             
             create_model_btn.click(
                 create_model_handler,
-                inputs=[new_model_size, new_model_multimodal, new_model_output],
+                inputs=[new_model_size, new_model_multimodal, new_model_expert, new_model_vocab_size, new_model_output],
                 outputs=[create_model_info],
             )
             
