@@ -402,70 +402,68 @@ class StateTrackingRecurrentCell(nn.Module):
         
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        prev_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, hidden_size = hidden_states.shape
+        input_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Initialize hidden states if not provided
+        batch_size, seq_len, hidden_size = input_states.shape
+        if hidden_states is None:
+            hidden_states = torch.zeros(batch_size, hidden_size, device=input_states.device)
         
-        # Initialize previous state if not provided
-        if prev_state is None:
-            prev_state = torch.zeros(batch_size, hidden_size, device=hidden_states.device)
+        # Apply layer normalization
+        normalized_input = self.input_norm(input_states)
+        normalized_hidden = self.state_norm(hidden_states.unsqueeze(1))
         
-        # Apply input normalization
-        normalized_hidden = self.input_norm(hidden_states)
-        
-        # Process sequence step by step with optimized implementation
-        output_states = []
-        current_state = prev_state
-        
+        # Process sequence step by step
+        outputs = []
         for t in range(seq_len):
             # Get current input
-            x_t = normalized_hidden[:, t]
+            x_t = normalized_input[:, t]
             
-            # Apply state normalization
-            normalized_state = self.state_norm(current_state)
+            # Concatenate input and hidden state
+            combined = torch.cat([x_t, normalized_hidden.squeeze(1)], dim=-1)
             
-            # Concatenate input with previous state
-            combined = torch.cat([x_t, normalized_state], dim=-1)
+            # Compute gates
+            update = torch.sigmoid(self.update_gate(combined))
+            reset = torch.sigmoid(self.reset_gate(combined))
             
-            # Compute gates with dropout for regularization
-            update = torch.sigmoid(self.dropout(self.update_gate(combined)))
-            reset = torch.sigmoid(self.dropout(self.reset_gate(combined)))
-            
-            # Compute candidate state
+            # Compute candidate hidden state
             candidate = torch.tanh(
                 self.output_gate(
-                    torch.cat([x_t, reset * normalized_state], dim=-1)
+                    torch.cat([x_t, reset * normalized_hidden.squeeze(1)], dim=-1)
                 )
             )
             
-            # Update state with residual connection
-            current_state = (1 - update) * current_state + update * candidate
+            # Update hidden state
+            hidden_states = (1 - update) * hidden_states + update * candidate
+            normalized_hidden = self.state_norm(hidden_states.unsqueeze(1))
             
-            # Apply layer normalization
-            normalized_output = self.layer_norm(current_state)
+            # Apply dropout
+            hidden_states = self.dropout(hidden_states)
             
-            output_states.append(normalized_output)
+            # Collect output
+            outputs.append(hidden_states)
         
         # Stack outputs
-        output_sequence = torch.stack(output_states, dim=1)
+        outputs = torch.stack(outputs, dim=1)
         
-        return output_sequence, current_state
+        # Apply layer normalization
+        outputs = self.layer_norm(outputs)
+        
+        return outputs
 
 
-class ApertisLayer(nn.Module):
-    """Apertis transformer layer."""
+class ApertisAttention(nn.Module):
+    """Attention module for Apertis architecture."""
     
     def __init__(self, config: ApertisConfig):
         super().__init__()
+        
         self.config = config
         self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
         
-        # Layer normalization for pre-norm architecture (more stable training)
-        self.attn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-        # Attention mechanism
+        # Choose attention implementation based on configuration
         if config.attention_type == "selective_linear":
             self.attention = SelectiveLinearAttention(
                 hidden_size=config.hidden_size,
@@ -474,11 +472,94 @@ class ApertisLayer(nn.Module):
                 sliding_window=config.sliding_window,
             )
         else:
-            raise ValueError(f"Unsupported attention type: {config.attention_type}")
+            # Default to standard attention
+            self.attention = nn.MultiheadAttention(
+                embed_dim=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                dropout=config.attention_probs_dropout_prob,
+                batch_first=True,
+            )
+            
+        # Rotary position embeddings
+        if config.position_embedding_type == "rotary":
+            self.rotary_embeddings = RotaryEmbedding(
+                dim=config.hidden_size // config.num_attention_heads,
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta,
+            )
+        else:
+            self.rotary_embeddings = None
         
-        # Feed-forward network
+        # Output projection and dropout
+        self.output_projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Apply layer normalization
+        residual = hidden_states
+        hidden_states = self.layer_norm(hidden_states)
+        
+        # Process with attention mechanism
+        if isinstance(self.attention, SelectiveLinearAttention):
+            # Use selective linear attention
+            hidden_states, attn_weights, past_key_value = self.attention(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+        else:
+            # Use standard attention
+            # Prepare key padding mask from attention mask
+            key_padding_mask = None
+            if attention_mask is not None:
+                key_padding_mask = attention_mask == 0
+            
+            # Apply standard attention
+            hidden_states, attn_weights = self.attention(
+                query=hidden_states,
+                key=hidden_states,
+                value=hidden_states,
+                key_padding_mask=key_padding_mask,
+                need_weights=output_attentions,
+            )
+            
+            past_key_value = None
+        
+        # Apply output projection and dropout
+        hidden_states = self.output_projection(hidden_states)
+        hidden_states = self.output_dropout(hidden_states)
+        
+        # Add residual connection
+        hidden_states = hidden_states + residual
+        
+        return hidden_states, attn_weights, past_key_value
+
+
+class ApertisFeedForward(nn.Module):
+    """Feed-forward module for Apertis architecture."""
+    
+    def __init__(self, config: ApertisConfig):
+        super().__init__()
+        
+        self.config = config
+        
+        # Choose implementation based on configuration
         if config.use_expert_system:
-            self.mlp = AdaptiveExpertSystem(
+            self.feed_forward = AdaptiveExpertSystem(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 num_experts=config.num_experts,
@@ -486,22 +567,20 @@ class ApertisLayer(nn.Module):
                 activation_function=config.hidden_act,
             )
         else:
-            self.mlp = nn.Sequential(
+            # Standard feed-forward network
+            self.feed_forward = nn.Sequential(
+                nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
                 nn.Linear(config.hidden_size, config.intermediate_size),
                 self._get_activation_fn(config.hidden_act),
-                nn.Linear(config.intermediate_size, config.hidden_size),
                 nn.Dropout(config.hidden_dropout_prob),
+                nn.Linear(config.intermediate_size, config.hidden_size),
             )
         
+        # Output dropout
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        
         # Layer normalization
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-        # Dropout
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        
-        # State tracking for efficient inference
-        self.state_tracker = StateTrackingRecurrentCell(config.hidden_size)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
     def _get_activation_fn(self, activation_function: str):
         if activation_function == "gelu":
@@ -513,6 +592,47 @@ class ApertisLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported activation function: {activation_function}")
     
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Apply layer normalization
+        residual = hidden_states
+        
+        # Process with feed-forward network
+        if isinstance(self.feed_forward, AdaptiveExpertSystem):
+            # Use adaptive expert system
+            hidden_states = self.feed_forward(hidden_states)
+        else:
+            # Use standard feed-forward network
+            hidden_states = self.feed_forward(hidden_states)
+        
+        # Apply output dropout
+        hidden_states = self.output_dropout(hidden_states)
+        
+        # Add residual connection
+        hidden_states = hidden_states + residual
+        
+        return hidden_states
+
+
+class ApertisLayer(nn.Module):
+    """Transformer layer for Apertis architecture."""
+    
+    def __init__(self, config: ApertisConfig):
+        super().__init__()
+        
+        self.config = config
+        
+        # Attention module
+        self.attention = ApertisAttention(config)
+        
+        # Feed-forward module
+        self.feed_forward = ApertisFeedForward(config)
+        
+        # State tracking for efficient inference
+        if hasattr(config, "use_state_tracking") and config.use_state_tracking:
+            self.state_tracking = StateTrackingRecurrentCell(config.hidden_size)
+        else:
+            self.state_tracking = None
+        
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -521,13 +641,9 @@ class ApertisLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        prev_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
-        # Self-attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        
-        hidden_states, attn_weights, past_key_value = self.attention(
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Process with attention
+        attention_output, attn_weights, past_key_value = self.attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -536,148 +652,57 @@ class ApertisLayer(nn.Module):
             use_cache=use_cache,
         )
         
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = residual + hidden_states
+        # Process with feed-forward network
+        layer_output = self.feed_forward(attention_output)
         
-        # Feed-forward network
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Apply state tracking if enabled
+        if self.state_tracking is not None:
+            layer_output = self.state_tracking(layer_output)
         
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        # Apply state tracking for efficient inference
-        if use_cache:
-            hidden_states, new_state = self.state_tracker(hidden_states, prev_state)
-        else:
-            new_state = None
-        
-        return hidden_states, attn_weights, past_key_value, new_state
+        return layer_output, attn_weights, past_key_value
 
 
 class ApertisModel(nn.Module):
-    """Apertis model with innovative architecture components."""
+    """Base model for Apertis architecture."""
     
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        self.config = config
         
-        # Vision encoder
-        self.vision_embed_dim = config.vision_embed_dim
-        self.image_size = config.image_size
-        self.vision_patch_size = config.vision_patch_size
-        
-        # Calculate number of patches
-        self.num_patches = (self.image_size // self.vision_patch_size) ** 2
-        
-        # Patch embedding
-        self.patch_embed = nn.Conv2d(
-            in_channels=3,
-            out_channels=self.vision_embed_dim,
-            kernel_size=self.vision_patch_size,
-            stride=self.vision_patch_size,
-        )
-        
-        # Position embeddings for vision
-        self.vision_pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches + 1, self.vision_embed_dim)
-        )
-        
-        # Class token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.vision_embed_dim))
-        
-        # Vision transformer layers
-        self.vision_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.vision_embed_dim,
-                nhead=config.vision_heads,
-                dim_feedforward=self.vision_embed_dim * 4,
-                dropout=0.1,
-                activation="gelu",
-                batch_first=True,
-            )
-            for _ in range(config.vision_layers)
-        ])
-        
-        # Vision layer norm
-        self.vision_ln = nn.LayerNorm(self.vision_embed_dim)
-        
-        # Projection from vision to text space
-        self.vision_projection = nn.Linear(self.vision_embed_dim, config.hidden_size)
-        
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        batch_size = pixel_values.shape[0]
-        
-        # Create patch embeddings
-        patch_embeds = self.patch_embed(pixel_values)
-        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)  # [B, num_patches, vision_embed_dim]
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        embeddings = torch.cat([cls_tokens, patch_embeds], dim=1)
-        
-        # Add position embeddings
-        embeddings = embeddings + self.vision_pos_embed
-        
-        # Apply vision transformer layers
-        for layer in self.vision_layers:
-            embeddings = layer(embeddings)
-        
-        # Apply layer norm
-        embeddings = self.vision_ln(embeddings)
-        
-        # Project to text space
-        projected_embeddings = self.vision_projection(embeddings)
-        
-        return projected_embeddings
-
-
-class ApertisModel(nn.Module):
-    """Apertis model with innovative architecture components."""
-    
-    def __init__(self, config: ApertisConfig):
-        super().__init__()
         self.config = config
         
         # Token embeddings
         self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         
-        # Position embeddings
-        if config.position_embedding_type == "rotary":
-            self.rotary_emb = RotaryEmbedding(
-                config.hidden_size // config.num_attention_heads,
-                max_position_embeddings=config.max_position_embeddings,
-                base=config.rope_theta,
+        # Multimodal encoder if enabled
+        if config.multimodal:
+            self.multimodal_encoder = UnifiedMultimodalEncoder(
+                image_size=config.image_size,
+                patch_size=config.vision_patch_size,
+                embed_dim=config.vision_embed_dim,
+                depth=config.vision_layers,
+                num_heads=config.vision_heads,
+                output_dim=config.hidden_size,
             )
+        else:
+            self.multimodal_encoder = None
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            ApertisLayer(config) for _ in range(config.num_hidden_layers)
+            ApertisLayer(config)
+            for _ in range(config.num_hidden_layers)
         ])
         
-        # Final layer norm
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Final layer normalization
+        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
-        # Multimodal support
-        if config.multimodal:
-            self.multimodal_encoder = UnifiedMultimodalEncoder(config)
-            self.multimodal_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        # Dropout
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
         # Initialize weights
         self.apply(self._init_weights)
         
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        Overrides the default load_state_dict to handle model loading.
-        
-        Args:
-            state_dict: The state dictionary containing parameters
-            strict: Whether to strictly enforce that the keys in state_dict match the keys in this module's state_dict
-            
-        Returns:
-            A tuple of (missing_keys, unexpected_keys)
-        """
-        return super().load_state_dict(state_dict, strict=strict)
+        # Enable gradient checkpointing for memory efficiency
+        self.gradient_checkpointing_enable = self._gradient_checkpointing_enable
         
     def _init_weights(self, module):
         """Initialize the weights."""
@@ -693,6 +718,28 @@ class ApertisModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
     
+    def _gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing = True
+        
+        # Apply gradient checkpointing to transformer layers
+        for layer in self.layers:
+            if hasattr(layer, "attention") and hasattr(layer.attention, "attention"):
+                if hasattr(layer.attention.attention, "_checkpoint_activations"):
+                    layer.attention.attention._checkpoint_activations = True
+            
+            if hasattr(layer, "feed_forward") and hasattr(layer.feed_forward, "feed_forward"):
+                if hasattr(layer.feed_forward.feed_forward, "_checkpoint_activations"):
+                    layer.feed_forward.feed_forward._checkpoint_activations = True
+    
+    def get_input_embeddings(self):
+        """Get token embeddings."""
+        return self.token_embeddings
+    
+    def set_input_embeddings(self, embeddings):
+        """Set token embeddings."""
+        self.token_embeddings = embeddings
+    
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -706,91 +753,134 @@ class ApertisModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+        # Set default values
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else True
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         
-        # Get input embeddings
+        # Get sequence length and batch size
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        
+        # Initialize past length
+        past_length = 0
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+        
+        # Create position IDs if not provided
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_length, seq_length + past_length, dtype=torch.long, device=input_ids.device
+            ).unsqueeze(0).expand(batch_size, -1)
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
+        
+        # Prepare attention mask for attention
+        # [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        
+        # Convert attention mask to additive mask
+        # 0.0 for positions to attend, -10000.0 for positions to ignore
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = self.token_embeddings(input_ids)
         
-        # Process image if provided and model is multimodal
-        if pixel_values is not None and self.config.multimodal:
+        # Process multimodal input if provided
+        if self.multimodal_encoder is not None and pixel_values is not None:
+            # Encode images
             image_embeds = self.multimodal_encoder(pixel_values)
-            image_embeds = self.multimodal_projector(image_embeds)
             
-            # Concatenate text and image embeddings
-            # Assuming image comes first, then text
+            # Combine with text embeddings
+            # For simplicity, we prepend image embeddings to text embeddings
+            # In a more sophisticated implementation, you might use a fusion mechanism
             inputs_embeds = torch.cat([image_embeds, inputs_embeds], dim=1)
             
             # Update attention mask to include image tokens
-            if attention_mask is not None:
-                image_attention_mask = torch.ones(
-                    (attention_mask.shape[0], image_embeds.shape[1]),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-                attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
+            image_attention_mask = torch.ones(
+                (batch_size, image_embeds.shape[1]), device=attention_mask.device
+            )
+            attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
+            
+            # Update position IDs to include image tokens
+            image_position_ids = torch.zeros(
+                (batch_size, image_embeds.shape[1]), device=position_ids.device
+            )
+            position_ids = torch.cat([image_position_ids, position_ids], dim=1)
+            
+            # Update extended attention mask
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         
-        # Get sequence length
-        batch_size, seq_length = inputs_embeds.shape[:2]
+        # Apply dropout to embeddings
+        hidden_states = self.dropout(inputs_embeds)
         
-        # Prepare position IDs
-        if position_ids is None:
-            position_ids = torch.arange(
-                seq_length, dtype=torch.long, device=inputs_embeds.device
-            ).unsqueeze(0).expand(batch_size, -1)
-        
-        # Prepare attention mask
-        if attention_mask is not None:
-            # Convert mask from [0, 1] to [-inf, 0]
-            attention_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
-        
-        # Initialize past key values if not provided
-        if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
-        
-        # Initialize hidden states and attentions
+        # Initialize variables for outputs
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
+        all_past_key_values = () if use_cache else None
         
-        # Initialize state for recurrent processing
-        states = [None] * len(self.layers)
-        
-        # Process through layers
-        hidden_states = inputs_embeds
-        
-        for i, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+        # Process through transformer layers
+        for i, layer in enumerate(self.layers):
+            # Add hidden states to outputs if requested
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
-            layer_outputs = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                prev_state=states[i],
-            )
+            # Get past key values for this layer
+            layer_past = past_key_values[i] if past_key_values is not None else None
             
-            hidden_states = layer_outputs[0]
-            states[i] = layer_outputs[3]
+            # Apply gradient checkpointing if enabled
+            if getattr(self, "gradient_checkpointing", False) and self.training:
+                # Custom function for gradient checkpointing
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs[:4])[0]
+                    return custom_forward
+                
+                # Apply layer with gradient checkpointing
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states,
+                    extended_attention_mask,
+                    position_ids,
+                    layer_past,
+                )
+                hidden_states = layer_outputs
+            else:
+                # Apply layer normally
+                layer_outputs = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=extended_attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=layer_past,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = layer_outputs[0]
             
+            # Add attention outputs to outputs if requested
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
             
+            # Add past key values to outputs if requested
             if use_cache:
-                past_key_values[i] = layer_outputs[2]
+                all_past_key_values = all_past_key_values + (layer_outputs[2],)
         
-        # Apply final layer norm
-        hidden_states = self.norm(hidden_states)
+        # Apply final layer normalization
+        hidden_states = self.final_layer_norm(hidden_states)
         
+        # Add final hidden states to outputs if requested
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         
-        return (hidden_states, past_key_values, all_hidden_states, all_attentions)
+        return (hidden_states, all_hidden_states, all_attentions, all_past_key_values)
 
 
 class ApertisForCausalLM(nn.Module):
@@ -798,6 +888,7 @@ class ApertisForCausalLM(nn.Module):
     
     def __init__(self, config: ApertisConfig):
         super().__init__()
+        
         self.config = config
         
         # Base model
@@ -936,6 +1027,11 @@ class ApertisForCausalLM(nn.Module):
             "pixel_values": pixel_values,
         }
     
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+    
     def generate(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -986,7 +1082,7 @@ class ApertisForCausalLM(nn.Module):
             # Forward pass
             outputs = self(**model_inputs, use_cache=True)
             logits = outputs[1]
-            past_key_values = outputs[2]
+            past_key_values = outputs[3]
             
             # Get next token logits
             next_token_logits = logits[:, -1, :]

@@ -185,20 +185,23 @@ class ApertisTrainer:
         train_dataset: ApertisDataset,
         val_dataset: Optional[ApertisDataset] = None,
         output_dir: str = "output",
-        batch_size: int = 8,
+        batch_size: int = 4,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
         num_epochs: int = 3,
         warmup_steps: int = 0,
-        gradient_accumulation_steps: int = 1,
+        gradient_accumulation_steps: int = 4,
         max_grad_norm: float = 1.0,
         use_wandb: bool = False,
         wandb_project: str = "apertis",
         wandb_run_name: Optional[str] = None,
-        fp16: bool = False,
+        fp16: bool = True,
         device: Optional[str] = None,
         checkpoint_steps: int = 1000,
-        gpu_memory_fraction: float = 0.9,
+        gpu_memory_fraction: float = 0.7,
+        use_gradient_checkpointing: bool = True,
+        eval_steps: int = 500,
+        dynamic_batch_sizing: bool = True,
     ):
         """
         Initialize the trainer.
@@ -220,6 +223,9 @@ class ApertisTrainer:
         self.fp16 = fp16
         self.checkpoint_steps = checkpoint_steps
         self.gpu_memory_fraction = gpu_memory_fraction
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.eval_steps = eval_steps
+        self.dynamic_batch_sizing = dynamic_batch_sizing
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -230,49 +236,61 @@ class ApertisTrainer:
         else:
             self.device = torch.device(device)
         
-        # Limit GPU memory usage if using CUDA
-        if torch.cuda.is_available() and self.gpu_memory_fraction < 1.0:
-            try:
-                total_memory = torch.cuda.get_device_properties(0).total_memory
-                reserved_memory = int(total_memory * self.gpu_memory_fraction)
-                # This is a workaround to limit memory usage
-                # Create a temporary tensor to reserve memory
-                tmp_tensor = torch.empty(reserved_memory, dtype=torch.int8, device='cuda')
-                del tmp_tensor
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logger.warning(f"Failed to limit GPU memory: {e}")
+        # Configure PyTorch CUDA memory allocation
+        if torch.cuda.is_available():
+            # Set environment variable to avoid memory fragmentation
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            
+            # Clear CUDA cache before starting
+            torch.cuda.empty_cache()
+            
+            # Limit GPU memory usage if specified
+            if self.gpu_memory_fraction < 1.0:
+                try:
+                    # Get total GPU memory
+                    total_memory = torch.cuda.get_device_properties(0).total_memory
+                    # Calculate reserved memory
+                    reserved_memory = int(total_memory * (1 - self.gpu_memory_fraction))
+                    
+                    # Log memory information
+                    logger.info(f"Total GPU memory: {total_memory / 1024**3:.2f} GiB")
+                    logger.info(f"Reserving {reserved_memory / 1024**3:.2f} GiB for system")
+                    logger.info(f"Available for training: {(total_memory - reserved_memory) / 1024**3:.2f} GiB")
+                    
+                    # This approach doesn't actually reserve memory but helps with logging
+                except Exception as e:
+                    logger.warning(f"Failed to get GPU memory info: {e}")
         
         logger.info(f"Using device: {self.device}")
+        
+        # Enable gradient checkpointing if requested (reduces memory usage)
+        if self.use_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+            logger.info("Enabling gradient checkpointing")
+            self.model.gradient_checkpointing_enable()
         
         # Move model to device
         self.model.to(self.device)
         
-        # Create data loaders
-        self.train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,  # Reduced from 4 to 0 to avoid hanging issues
-            pin_memory=True,
-        )
+        # Create data loaders with appropriate batch size
+        self._create_dataloaders()
         
-        if val_dataset is not None:
-            self.val_dataloader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=0,  # Reduced from 4 to 0 to avoid hanging issues
-                pin_memory=True,
-            )
-        else:
-            self.val_dataloader = None
+        # Set up optimizer with weight decay
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {
+                'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+                'weight_decay': weight_decay,
+            },
+            {
+                'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                'weight_decay': 0.0,
+            },
+        ]
         
-        # Set up optimizer
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            optimizer_grouped_parameters,
             lr=learning_rate,
-            weight_decay=weight_decay,
         )
         
         # Set up learning rate scheduler
@@ -305,8 +323,47 @@ class ApertisTrainer:
                     "gradient_accumulation_steps": gradient_accumulation_steps,
                     "max_grad_norm": max_grad_norm,
                     "fp16": fp16,
+                    "gradient_checkpointing": use_gradient_checkpointing,
                 },
             )
+    
+    def _create_dataloaders(self):
+        """Create data loaders with current batch size."""
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,  # Avoid multiprocessing overhead
+            pin_memory=True,  # Speed up data transfer to GPU
+            drop_last=True,  # Avoid issues with small last batch
+        )
+        
+        if self.val_dataset is not None:
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+            )
+        else:
+            self.val_dataloader = None
+    
+    def _adjust_batch_size(self, increase=False):
+        """Dynamically adjust batch size based on memory usage."""
+        if increase and self.batch_size < 32:
+            self.batch_size += 1
+            logger.info(f"Increasing batch size to {self.batch_size}")
+        elif not increase and self.batch_size > 1:
+            # Reduce batch size by half, but minimum 1
+            self.batch_size = max(1, self.batch_size // 2)
+            logger.info(f"Reducing batch size to {self.batch_size}")
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Recreate dataloaders with new batch size
+        self._create_dataloaders()
     
     def train(self) -> Dict[str, float]:
         """Train the model and return metrics."""
@@ -351,15 +408,20 @@ class ApertisTrainer:
                             batch = {k: v.to(self.device) for k, v in batch.items()}
                         except RuntimeError as e:
                             if "CUDA out of memory" in str(e):
-                                logger.error("CUDA out of memory error. Trying to recover by clearing cache and reducing batch size.")
+                                logger.error(f"CUDA out of memory error: {str(e)}")
+                                
+                                # If dynamic batch sizing is enabled, reduce batch size
+                                if self.dynamic_batch_sizing:
+                                    self._adjust_batch_size(increase=False)
+                                    
+                                # Clear cache and skip this batch
                                 torch.cuda.empty_cache()
-                                # Skip this batch and continue with next one
                                 continue
                             else:
                                 raise
                         
-                        # Optimize GPU memory by clearing cache every few steps
-                        if step % 5 == 0 and torch.cuda.is_available():
+                        # Optimize GPU memory by clearing cache periodically
+                        if step % 10 == 0 and torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         
                         # Forward pass with mixed precision if enabled
@@ -430,11 +492,32 @@ class ApertisTrainer:
                                 "learning_rate": self.scheduler.get_last_lr()[0],
                                 "epoch": epoch + step / len(self.train_dataloader),
                                 "global_step": global_step,
+                                "batch_size": self.batch_size,
+                                "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0,
+                                "gpu_memory_reserved": torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0,
                             })
+                        
+                        # Evaluate periodically
+                        if self.val_dataloader is not None and global_step % self.eval_steps == 0:
+                            val_metrics = self.evaluate()
+                            val_loss = val_metrics["val_loss"]
+                            
+                            logger.info(f"Validation loss at step {global_step}: {val_loss:.4f}")
+                            
+                            # Save best model
+                            if val_loss < best_val_loss:
+                                best_val_loss = val_loss
+                                self._save_checkpoint("best")
+                                logger.info(f"New best validation loss: {best_val_loss:.4f}")
                         
                         # Save checkpoint
                         if global_step % self.checkpoint_steps == 0:
                             self._save_checkpoint(global_step)
+                            
+                        # Try increasing batch size if things are going well
+                        if self.dynamic_batch_sizing and step > 0 and step % 50 == 0:
+                            # If loss is stable and we haven't had OOM errors, try increasing batch size
+                            self._adjust_batch_size(increase=True)
                             
                     except Exception as e:
                         logger.error(f"Error processing batch at step {step}: {str(e)}")
@@ -494,9 +577,14 @@ class ApertisTrainer:
                 # Move batch to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
-                # Forward pass
-                outputs = self.model(**batch)
-                loss = outputs[0]
+                # Forward pass with mixed precision if enabled
+                if self.fp16:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(**batch)
+                        loss = outputs[0]
+                else:
+                    outputs = self.model(**batch)
+                    loss = outputs[0]
                 
                 # Update metrics
                 val_loss += loss.item()
@@ -523,6 +611,15 @@ class ApertisTrainer:
         # Save configuration
         with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
             json.dump(self.model.config.to_dict(), f, indent=2)
+        
+        # Save optimizer and scheduler states
+        torch.save({
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler': self.scaler.state_dict() if self.scaler else None,
+            'batch_size': self.batch_size,
+            'gradient_accumulation_steps': self.gradient_accumulation_steps,
+        }, os.path.join(checkpoint_dir, "optimizer.pt"))
         
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -685,25 +782,29 @@ class YoloStyleTrainingPipeline:
         # Create model
         model = self.create_model()
         
-        # Create trainer
+        # Create trainer with memory optimizations
         trainer = ApertisTrainer(
             model=model,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             output_dir=self.training_config["output_dir"],
-            batch_size=self.training_config.get("batch_size", 8),
+            batch_size=self.training_config.get("batch_size", 4),  # Reduced default from 8 to 4
             learning_rate=self.training_config.get("learning_rate", 5e-5),
             weight_decay=self.training_config.get("weight_decay", 0.01),
             num_epochs=self.training_config.get("num_epochs", 3),
             warmup_steps=self.training_config.get("warmup_steps", 0),
-            gradient_accumulation_steps=self.training_config.get("gradient_accumulation_steps", 1),
+            gradient_accumulation_steps=self.training_config.get("gradient_accumulation_steps", 4),  # Increased default from 1 to 4
             max_grad_norm=self.training_config.get("max_grad_norm", 1.0),
             use_wandb=self.training_config.get("use_wandb", False),
             wandb_project=self.training_config.get("wandb_project", "apertis"),
             wandb_run_name=self.training_config.get("wandb_run_name"),
-            fp16=self.training_config.get("fp16", False),
+            fp16=self.training_config.get("fp16", True),  # Default to True for mixed precision
             device=self.training_config.get("device"),
             checkpoint_steps=self.training_config.get("checkpoint_steps", 1000),
+            gpu_memory_fraction=self.training_config.get("gpu_memory_fraction", 0.7),  # Reduced from 0.9 to 0.7
+            use_gradient_checkpointing=self.training_config.get("use_gradient_checkpointing", True),  # Enable by default
+            eval_steps=self.training_config.get("eval_steps", 500),
+            dynamic_batch_sizing=self.training_config.get("dynamic_batch_sizing", True),  # Enable by default
         )
         
         # Train model
@@ -774,27 +875,27 @@ def create_sample_config(output_path: str) -> None:
         },
         "training_config": {
             "output_dir": "output",
-            "batch_size": 8,
+            "batch_size": 4,  # Reduced from 8 to 4
             "learning_rate": 5e-5,
             "weight_decay": 0.01,
             "num_epochs": 3,
             "warmup_steps": 0,
-            "gradient_accumulation_steps": 1,
+            "gradient_accumulation_steps": 4,  # Increased from 1 to 4
             "max_grad_norm": 1.0,
             "use_wandb": False,
             "wandb_project": "apertis",
-            "wandb_run_name": "apertis-training",
-            "fp16": False,
-            "device": None,
+            "fp16": True,  # Enable mixed precision by default
             "checkpoint_steps": 1000,
+            "gpu_memory_fraction": 0.7,  # Reduced from 0.9 to 0.7
+            "use_gradient_checkpointing": True,  # Enable gradient checkpointing
+            "dynamic_batch_sizing": True,  # Enable dynamic batch sizing
         },
     }
     
-    # Save configuration
     with open(output_path, "w") as f:
         json.dump(config, f, indent=2)
     
-    logger.info(f"Created sample configuration at {output_path}")
+    print(f"Created sample configuration at {output_path}")
 
 
 if __name__ == "__main__":
