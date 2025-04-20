@@ -70,6 +70,7 @@ class ApertisInterface:
         self.model = None
         self.vocab = None
         self.reverse_vocab = None
+        self.token_mapping = None  # For handling vocabulary mismatches
         
         if model_path is not None and vocab_file is not None:
             self.load_model(model_path)
@@ -113,7 +114,7 @@ class ApertisInterface:
                 # First try to determine the model size, architecture, and vocabulary size from the state dict
                 try:
                     # Load state dict to examine its structure
-                    state_dict = torch.load(model_path, map_location="cpu")
+                    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
                     
                     # Check if model uses expert system
                     use_expert_system = False
@@ -188,7 +189,7 @@ class ApertisInterface:
                     # Try loading with exact vocabulary size and layer count
                     try:
                         # Load state dict again
-                        state_dict = torch.load(model_path, map_location="cpu")
+                        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
                         
                         # Extract vocabulary size
                         vocab_size = state_dict["model.token_embeddings.weight"].size(0)
@@ -230,7 +231,7 @@ class ApertisInterface:
                         # Final fallback: try loading with strict=False
                         try:
                             # Load state dict again
-                            state_dict = torch.load(model_path, map_location="cpu")
+                            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
                             
                             # Extract vocabulary size and hidden size
                             if "model.token_embeddings.weight" in state_dict:
@@ -296,13 +297,58 @@ class ApertisInterface:
                 
                 if model_vocab_size != vocab_size:
                     logger.warning(f"Model vocabulary size ({model_vocab_size}) doesn't match loaded vocabulary size ({vocab_size})")
-                    logger.warning("This may cause issues with token generation. Consider recreating the model with matching vocabulary size.")
+                    
+                    # Create a token mapping to handle the mismatch
+                    self.create_token_mapping(model_vocab_size, vocab_size)
+                    
+                    # Inform user about the automatic adaptation
+                    logger.info("Created token mapping to handle vocabulary size mismatch")
         except Exception as e:
             logger.error(f"Error loading vocabulary: {e}")
             # Create a minimal vocabulary as fallback
             logger.info("Creating minimal vocabulary as fallback")
             self.vocab = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
             self.reverse_vocab = {v: k for k, v in self.vocab.items()}
+    
+    def create_token_mapping(self, model_vocab_size: int, loaded_vocab_size: int) -> None:
+        """Create a mapping between model tokens and loaded vocabulary tokens."""
+        try:
+            # Initialize token mapping dictionary
+            self.token_mapping = {}
+            
+            # Special tokens should map directly if they exist in both vocabularies
+            special_tokens = ["<pad>", "<bos>", "<eos>", "<unk>"]
+            for token in special_tokens:
+                if token in self.vocab:
+                    model_idx = min(self.vocab[token], model_vocab_size - 1)
+                    self.token_mapping[self.vocab[token]] = model_idx
+            
+            # For regular tokens, create a mapping strategy
+            if model_vocab_size > loaded_vocab_size:
+                # Model has more tokens than loaded vocabulary
+                # Map loaded vocab tokens to same indices in model vocab
+                for token_id in self.reverse_vocab:
+                    if token_id not in self.token_mapping:
+                        if token_id < model_vocab_size:
+                            self.token_mapping[token_id] = token_id
+                        else:
+                            # For tokens beyond model vocab size, map to <unk>
+                            self.token_mapping[token_id] = self.vocab.get("<unk>", 3)
+            else:
+                # Model has fewer tokens than loaded vocabulary
+                # Map loaded vocab tokens to model vocab, with overflow going to <unk>
+                for token_id in self.reverse_vocab:
+                    if token_id not in self.token_mapping:
+                        if token_id < model_vocab_size:
+                            self.token_mapping[token_id] = token_id
+                        else:
+                            # For tokens beyond model vocab size, map to <unk>
+                            self.token_mapping[token_id] = self.vocab.get("<unk>", 3)
+            
+            logger.info(f"Created token mapping between model vocabulary ({model_vocab_size} tokens) and loaded vocabulary ({loaded_vocab_size} tokens)")
+        except Exception as e:
+            logger.error(f"Error creating token mapping: {e}")
+            self.token_mapping = None
     
     def tokenize(self, text: str) -> List[int]:
         """Tokenize text using the loaded vocabulary."""
@@ -318,6 +364,17 @@ class ApertisInterface:
             else:
                 tokens.append(self.vocab.get("<unk>", 3))
         
+        # Apply token mapping if it exists and there's a vocabulary mismatch
+        if self.token_mapping is not None:
+            mapped_tokens = []
+            for token in tokens:
+                if token in self.token_mapping:
+                    mapped_tokens.append(self.token_mapping[token])
+                else:
+                    # If token not in mapping, use <unk>
+                    mapped_tokens.append(self.vocab.get("<unk>", 3))
+            return mapped_tokens
+        
         return tokens
     
     def detokenize(self, token_ids: List[int]) -> str:
@@ -325,6 +382,25 @@ class ApertisInterface:
         if self.reverse_vocab is None:
             logger.warning("Vocabulary not loaded, cannot detokenize")
             return "[Unable to detokenize without vocabulary]"
+        
+        # Apply reverse token mapping if it exists
+        if self.token_mapping is not None:
+            # Create reverse mapping (model token -> vocab token)
+            reverse_mapping = {}
+            for vocab_token, model_token in self.token_mapping.items():
+                if model_token not in reverse_mapping:
+                    reverse_mapping[model_token] = vocab_token
+            
+            # Apply reverse mapping
+            mapped_token_ids = []
+            for token_id in token_ids:
+                if token_id in reverse_mapping:
+                    mapped_token_ids.append(reverse_mapping[token_id])
+                else:
+                    # If no mapping exists, keep original token
+                    mapped_token_ids.append(token_id)
+            
+            token_ids = mapped_token_ids
         
         # Convert token IDs to words
         words = []
@@ -673,12 +749,16 @@ class ApertisInterface:
                                     value=True,
                                     label="Strict Loading (uncheck to allow parameter mismatches)",
                                 )
+                                adapt_vocab_checkbox = gr.Checkbox(
+                                    value=True,
+                                    label="Auto-adapt to vocabulary mismatches",
+                                )
                             
                             load_model_btn = gr.Button("Load Model")
                             model_info = gr.Textbox(
                                 label="Model Information",
                                 interactive=False,
-                                lines=8,
+                                lines=10,
                             )
                         
                         with gr.Column(scale=1):
@@ -756,7 +836,7 @@ class ApertisInterface:
             )
             
             # Model loading
-            def load_model_handler(model_path, vocab_path, use_expert_system, custom_vocab_size, custom_layer_count, strict_loading):
+            def load_model_handler(model_path, vocab_path, use_expert_system, custom_vocab_size, custom_layer_count, strict_loading, adapt_vocab):
                 try:
                     # Save current model settings
                     old_multimodal = self.multimodal
@@ -767,9 +847,9 @@ class ApertisInterface:
                         # Load state dict to examine structure
                         if os.path.isdir(model_path):
                             state_dict_path = os.path.join(model_path, "model.pt")
-                            state_dict = torch.load(state_dict_path, map_location="cpu")
+                            state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=True)
                         else:
-                            state_dict = torch.load(model_path, map_location="cpu")
+                            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
                         
                         # Determine parameters
                         if "model.token_embeddings.weight" in state_dict:
@@ -818,9 +898,14 @@ class ApertisInterface:
                             info += f"Layers: {config.num_hidden_layers}\n"
                             info += f"Attention heads: {config.num_attention_heads}\n"
                             info += f"Expert system: {config.use_expert_system}\n"
-                            info += f"Vocabulary size: {config.vocab_size}\n"
-                            info += f"Strict loading: {strict_loading}\n"
-                            info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}"
+                            info += f"Model vocabulary size: {config.vocab_size}\n"
+                            info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}\n"
+                            
+                            # Add information about vocabulary adaptation
+                            if self.token_mapping is not None and adapt_vocab:
+                                info += f"Vocabulary adaptation: Enabled (mapping between model and loaded vocabulary)\n"
+                            else:
+                                info += f"Vocabulary adaptation: Disabled\n"
                             
                             # Move model to device
                             self.model.to(self.device)
@@ -829,8 +914,21 @@ class ApertisInterface:
                             return info
                     
                     # Standard loading if no custom parameters
+                    self.model = None  # Reset model to ensure clean loading
+                    self.token_mapping = None  # Reset token mapping
+                    
+                    # Load model
                     self.load_model(model_path)
-                    self.load_vocabulary(vocab_path)
+                    
+                    # Load vocabulary with adaptation if enabled
+                    if not adapt_vocab:
+                        # Temporarily disable token mapping creation
+                        original_create_token_mapping = self.create_token_mapping
+                        self.create_token_mapping = lambda *args, **kwargs: None
+                        self.load_vocabulary(vocab_path)
+                        self.create_token_mapping = original_create_token_mapping
+                    else:
+                        self.load_vocabulary(vocab_path)
                     
                     # Restore multimodal setting
                     self.multimodal = old_multimodal
@@ -844,8 +942,15 @@ class ApertisInterface:
                         info += f"Layers: {config.num_hidden_layers}\n"
                         info += f"Attention heads: {config.num_attention_heads}\n"
                         info += f"Expert system: {config.use_expert_system}\n"
-                        info += f"Vocabulary size: {config.vocab_size}\n"
-                        info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}"
+                        info += f"Model vocabulary size: {config.vocab_size}\n"
+                        info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}\n"
+                        
+                        # Add information about vocabulary adaptation
+                        if self.token_mapping is not None and adapt_vocab:
+                            info += f"Vocabulary adaptation: Enabled (mapping between model and loaded vocabulary)\n"
+                        else:
+                            info += f"Vocabulary adaptation: Disabled\n"
+                        
                         return info
                     else:
                         return "Failed to load model."
@@ -855,7 +960,7 @@ class ApertisInterface:
             load_model_btn.click(
                 load_model_handler,
                 inputs=[model_path_input, vocab_path_input, expert_system_checkbox, 
-                        custom_vocab_size, custom_layer_count, strict_loading],
+                        custom_vocab_size, custom_layer_count, strict_loading, adapt_vocab_checkbox],
                 outputs=[model_info],
             )
             
