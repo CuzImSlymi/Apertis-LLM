@@ -90,7 +90,22 @@ class ApertisDataset(Dataset):
     def _load_vocabulary(self) -> Dict[str, int]:
         """Load vocabulary from json file."""
         with open(self.tokenizer_path, 'r', encoding='utf-8') as f:
-            vocab = json.load(f)
+            vocab_data = json.load(f)
+        
+        # Handle different vocabulary formats
+        if isinstance(vocab_data, dict):
+            if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
+                # Format: {"tokens": ["token1", "token2", ...]}
+                token_list = vocab_data["tokens"]
+                # Convert list to dictionary with indices as values
+                vocab = {token: idx for idx, token in enumerate(token_list)}
+                logger.info(f"Converted list-based vocabulary to dictionary format with {len(vocab)} tokens")
+            else:
+                # Standard format: {"token1": 0, "token2": 1, ...}
+                vocab = vocab_data
+        else:
+            raise ValueError(f"Unsupported vocabulary format: {type(vocab_data)}")
+            
         logger.info(f"Loaded vocabulary with {len(vocab)} tokens from {self.tokenizer_path}")
         return vocab
     
@@ -477,7 +492,11 @@ class ApertisTrainer:
                     # Forward pass with mixed precision
                     with torch.amp.autocast('cuda', enabled=self.fp16):
                         outputs = self.model(**batch)
-                        loss = outputs.loss
+                        # Fix for tuple output format - extract loss from first element of tuple
+                        if isinstance(outputs, tuple):
+                            loss = outputs[0]  # First element of the tuple is the loss
+                        else:
+                            loss = outputs.loss
                         
                         # Scale loss for gradient accumulation
                         loss = loss / self.gradient_accumulation_steps
@@ -626,7 +645,11 @@ class ApertisTrainer:
                 
                 # Forward pass
                 outputs = self.model(**batch)
-                loss = outputs.loss
+                # Fix for tuple output format - extract loss from first element of tuple
+                if isinstance(outputs, tuple):
+                    loss = outputs[0]  # First element of the tuple is the loss
+                else:
+                    loss = outputs.loss
                 
                 # Accumulate loss
                 val_loss += loss.item()

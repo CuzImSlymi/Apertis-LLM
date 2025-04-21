@@ -283,7 +283,21 @@ class ApertisInterface:
             logger.info(f"Loading vocabulary from {vocab_file}")
             
             with open(vocab_file, "r") as f:
-                self.vocab = json.load(f)
+                vocab_data = json.load(f)
+            
+            # Handle different vocabulary formats
+            if isinstance(vocab_data, dict):
+                if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
+                    # Format: {"tokens": ["token1", "token2", ...]}
+                    token_list = vocab_data["tokens"]
+                    # Convert list to dictionary with indices as values
+                    self.vocab = {token: idx for idx, token in enumerate(token_list)}
+                    logger.info(f"Converted list-based vocabulary to dictionary format with {len(self.vocab)} tokens")
+                else:
+                    # Standard format: {"token1": 0, "token2": 1, ...}
+                    self.vocab = vocab_data
+            else:
+                raise ValueError(f"Unsupported vocabulary format: {type(vocab_data)}")
             
             # Create reverse vocabulary for decoding
             self.reverse_vocab = {v: k for k, v in self.vocab.items()}
