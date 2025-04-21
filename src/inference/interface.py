@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 # Import Apertis modules
 from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model
-from src.training.pipeline import YoloStyleTrainingPipeline, ApertisDataset
+from src.training.pipeline import YoloStyleTrainingPipeline, ApertisDataset, get_available_gpus
 
 # Configure logging
 logging.basicConfig(
@@ -102,12 +102,12 @@ class ApertisInterface:
                     # Load state dict
                     state_dict_path = os.path.join(model_path, "model.pt")
                     if os.path.exists(state_dict_path):
-                        self.model.load_state_dict(torch.load(state_dict_path, map_location=self.device))
+                        self.model.load_state_dict(torch.load(state_dict_path, map_location=self.device, weights_only=True))
                     else:
                         logger.warning(f"Model state dict not found at {state_dict_path}")
                 else:
                     logger.warning(f"Model configuration not found at {config_path}")
-                    # Create a default model
+                    # Create a default model as fallback
                     self.model = create_apertis_model(model_size="small", multimodal=self.multimodal)
             else:
                 # Assume it's a state dict file
@@ -685,6 +685,69 @@ class ApertisInterface:
                                 * **Iteration Checkpoint**: Save checkpoint every N iterations within each epoch
                                 """)
                             
+                            # Add GPU management controls
+                            with gr.Accordion("GPU Settings", open=True):
+                                # Get available GPUs
+                                available_gpus = get_available_gpus()
+                                gpu_info_text = ""
+                                gpu_choices = []
+                                
+                                if available_gpus:
+                                    gpu_info_text = "### Available GPUs:\n"
+                                    for gpu in available_gpus:
+                                        gpu_info_text += f"- GPU {gpu['id']}: {gpu['name']} ({gpu['total_memory']:.1f} GB)\n"
+                                        gpu_choices.append(str(gpu['id']))
+                                else:
+                                    gpu_info_text = "No CUDA-capable GPUs detected."
+                                
+                                gr.Markdown(gpu_info_text)
+                                
+                                # GPU selection
+                                if gpu_choices:
+                                    gpu_selection = gr.CheckboxGroup(
+                                        choices=gpu_choices,
+                                        value=[gpu_choices[0]],  # Default to first GPU
+                                        label="Select GPUs for Training",
+                                    )
+                                    
+                                    distributed_training = gr.Checkbox(
+                                        value=False,
+                                        label="Use Distributed Training (recommended for multiple GPUs)",
+                                    )
+                                    
+                                    # Only show distributed training option if multiple GPUs are selected
+                                    def update_distributed_visibility(selected_gpus):
+                                        return gr.update(visible=len(selected_gpus) > 1)
+                                    
+                                    gpu_selection.change(
+                                        fn=update_distributed_visibility,
+                                        inputs=[gpu_selection],
+                                        outputs=[distributed_training],
+                                    )
+                                else:
+                                    # If no GPUs available, show a message
+                                    gr.Markdown("Training will use CPU as no GPUs are available.")
+                                    # Create hidden elements to avoid errors
+                                    gpu_selection = gr.CheckboxGroup(
+                                        choices=["0"],
+                                        value=[],
+                                        label="Select GPUs for Training",
+                                        visible=False,
+                                    )
+                                    distributed_training = gr.Checkbox(
+                                        value=False,
+                                        label="Use Distributed Training",
+                                        visible=False,
+                                    )
+                                
+                                gpu_memory_fraction = gr.Slider(
+                                    minimum=0.1,
+                                    maximum=1.0,
+                                    value=0.7,
+                                    step=0.05,
+                                    label="GPU Memory Fraction (per GPU)",
+                                )
+                            
                             output_dir = gr.Textbox(
                                 label="Output Directory",
                                 value="output",
@@ -1012,7 +1075,9 @@ class ApertisInterface:
             def start_training(
                 model_size, multimodal, expert_system,
                 train_file, val_file, vocab_file, img_dir,
-                batch, lr, epochs, checkpoint_freq, iter_checkpoint_freq, out_dir, use_wb, wb_project,
+                batch, lr, epochs, checkpoint_freq, iter_checkpoint_freq, 
+                gpu_ids, distributed, gpu_memory_fraction,
+                out_dir, use_wb, wb_project,
             ):
                 try:
                     # Create temporary directory for training files
@@ -1045,6 +1110,9 @@ class ApertisInterface:
                             else:
                                 f.write(val_file)
                     
+                    # Process GPU selection
+                    selected_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids] if gpu_ids else None
+                    
                     # Create configuration
                     config = {
                         "data_config": {
@@ -1070,11 +1138,13 @@ class ApertisInterface:
                             "wandb_project": wb_project,
                             "gradient_accumulation_steps": 4,
                             "fp16": True,
-                            "gpu_memory_fraction": 0.7,
+                            "gpu_memory_fraction": gpu_memory_fraction,
                             "use_gradient_checkpointing": True,
                             "dynamic_batch_sizing": True,
                             "checkpoint_steps": checkpoint_freq,
                             "iteration_checkpoint_steps": iter_checkpoint_freq,
+                            "gpu_ids": selected_gpu_ids,
+                            "distributed_training": distributed,
                         },
                     }
                     
@@ -1108,6 +1178,18 @@ class ApertisInterface:
                     thread.daemon = True
                     thread.start()
                     
+                    # Prepare GPU information for output
+                    gpu_info = ""
+                    if selected_gpu_ids:
+                        gpu_info = f"- GPUs: {selected_gpu_ids}\n"
+                        if distributed and len(selected_gpu_ids) > 1:
+                            gpu_info += f"- Distributed training: Enabled\n"
+                        elif len(selected_gpu_ids) > 1:
+                            gpu_info += f"- Using DataParallel across GPUs\n"
+                        gpu_info += f"- GPU memory fraction: {gpu_memory_fraction}\n"
+                    else:
+                        gpu_info = "- Using CPU for training\n"
+                    
                     checkpoint_info = ""
                     if checkpoint_freq > 0:
                         checkpoint_info += f"- Global step checkpoints: Every {checkpoint_freq} steps\n"
@@ -1124,6 +1206,7 @@ class ApertisInterface:
                            f"- Batch size: {batch}\n" \
                            f"- Learning rate: {lr}\n" \
                            f"- Epochs: {epochs}\n" \
+                           f"{gpu_info}" \
                            f"{checkpoint_info}" \
                            f"- Output directory: {out_dir}\n\n" \
                            f"Training is running in the background. Check the console for progress."
@@ -1137,6 +1220,7 @@ class ApertisInterface:
                     train_data, val_data, vocab_data, image_dir,
                     batch_size, learning_rate, num_epochs, 
                     checkpoint_steps, iteration_checkpoint_steps,
+                    gpu_selection, distributed_training, gpu_memory_fraction,
                     output_dir, use_wandb, wandb_project,
                 ],
                 outputs=[training_output],
