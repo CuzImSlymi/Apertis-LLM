@@ -1,4 +1,3 @@
-# /home/ubuntu/ApertisAI_Project/Apertis AI_/src/training/pipeline.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,14 +10,12 @@ import wandb
 from typing import Dict, List, Optional, Tuple, Union, Any
 from PIL import Image
 import torchvision.transforms as transforms
-import threading # Added for stop_event
-import gradio as gr # Added for progress_callback type hint
 
 import sys
 import os
 
 # Add the parent directory to the path so we can import the src modules
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src.model.core import ApertisConfig, ApertisForCausalLM
 
 # Import distributed training modules
@@ -29,13 +26,13 @@ from torch.utils.data.distributed import DistributedSampler
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 class ApertisDataset(Dataset):
     """Dataset for training Apertis models."""
-
+    
     def __init__(
         self,
         data_path: str,
@@ -44,11 +41,11 @@ class ApertisDataset(Dataset):
         multimodal: bool = False,
         image_dir: Optional[str] = None,
         image_size: int = 224,
-        model_vocab_size: int = 32000, # Added model_vocab_size
+        model_vocab_size: int = 32000,
     ):
         """
         Initialize the dataset.
-
+        
         Args:
             data_path: Path to the dataset file (jsonl format)
             tokenizer_path: Path to the tokenizer vocabulary file
@@ -64,202 +61,149 @@ class ApertisDataset(Dataset):
         self.multimodal = multimodal
         self.image_dir = image_dir
         self.image_size = image_size
-        self.model_vocab_size = model_vocab_size # Store model vocab size
-
+        self.model_vocab_size = model_vocab_size
+        
         # Load data
         self.data = self._load_data()
-
+        
         # Load vocabulary
         self.vocab = self._load_vocabulary()
-
+        
         # Set up image transformation if multimodal
         if self.multimodal:
-            if not image_dir or not os.path.isdir(image_dir):
-                 raise ValueError("Image directory must be provided and valid for multimodal dataset.")
             self.image_transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
-
+    
     def _load_data(self) -> List[Dict]:
         """Load data from jsonl file."""
         data = []
-        try:
-            with open(self.data_path, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    try:
-                        item = json.loads(line.strip())
-                        # Basic validation: check for \'text\' key
-                        if "text" not in item:
-                            logger.warning(f"Skipping line {i+1} in {self.data_path}: missing \'text\' key.")
-                            continue
-                        if self.multimodal and "image" not in item:
-                            logger.warning(f"Skipping line {i+1} in {self.data_path}: missing \'image\' key for multimodal data.")
-                            continue
-                        data.append(item)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Skipping line {i+1} in {self.data_path}: invalid JSON.")
-        except FileNotFoundError:
-            logger.error(f"Data file not found: {self.data_path}")
-            raise
+        with open(self.data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                item = json.loads(line.strip())
+                data.append(item)
         logger.info(f"Loaded {len(data)} examples from {self.data_path}")
         return data
-
+    
     def _load_vocabulary(self) -> Dict[str, int]:
         """Load vocabulary from json file."""
-        try:
-            with open(self.tokenizer_path, "r", encoding="utf-8") as f:
-                vocab_data = json.load(f)
-        except FileNotFoundError:
-             logger.error(f"Vocabulary file not found: {self.tokenizer_path}")
-             raise
-        except json.JSONDecodeError:
-             logger.error(f"Failed to decode JSON from vocabulary file: {self.tokenizer_path}")
-             raise
-
+        with open(self.tokenizer_path, 'r', encoding='utf-8') as f:
+            vocab_data = json.load(f)
+        
         # Handle different vocabulary formats
         if isinstance(vocab_data, dict):
             if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
-                vocab = {token: idx for idx, token in enumerate(vocab_data["tokens"])}
+                # Format: {"tokens": ["token1", "token2", ...]}
+                token_list = vocab_data["tokens"]
+                # Convert list to dictionary with indices as values
+                vocab = {token: idx for idx, token in enumerate(token_list)}
                 logger.info(f"Converted list-based vocabulary to dictionary format with {len(vocab)} tokens")
-            elif all(isinstance(k, str) and isinstance(v, int) for k, v in vocab_data.items()):
-                vocab = vocab_data
-            elif "model" in vocab_data and "vocab" in vocab_data["model"] and isinstance(vocab_data["model"]["vocab"], dict):
-                 logger.info("Extracting vocab dict from \'model.vocab\' structure in JSON")
-                 vocab = {k: int(v) for k, v in vocab_data["model"]["vocab"].items() if isinstance(v, (int, float, str)) and str(v).isdigit()}
             else:
-                # Attempt to handle simple {token: id} dict even if values aren\'t strictly int
-                try:
-                    vocab = {str(k): int(v) for k, v in vocab_data.items()}
-                    logger.info(f"Loaded vocabulary dictionary with {len(vocab)} tokens (converted values to int)." )
-                except (ValueError, TypeError):
-                     raise ValueError("Unsupported vocabulary dictionary format in JSON file.")
+                # Standard format: {"token1": 0, "token2": 1, ...}
+                vocab = vocab_data
         else:
             raise ValueError(f"Unsupported vocabulary format: {type(vocab_data)}")
-
-        # Add standard special tokens if missing (using high indices to avoid collision)
-        # This is a simple approach; a proper tokenizer build process is better.
-        next_id = max(vocab.values()) + 1 if vocab else 0
-        added_tokens = []
-        for token in ["<pad>", "<unk>", "<bos>", "<eos>"]:
-             if token not in vocab:
-                 vocab[token] = next_id
-                 added_tokens.append(token)
-                 next_id += 1
-        if added_tokens:
-             logger.warning(f"Added missing special tokens to vocab: {added_tokens}. Consider rebuilding vocab properly.")
-
+            
         logger.info(f"Loaded vocabulary with {len(vocab)} tokens from {self.tokenizer_path}")
         return vocab
-
+    
     def _tokenize(self, text: str) -> List[int]:
         """Simple tokenization by splitting on spaces and mapping to vocabulary."""
         tokens = []
-        unk_token_id = self.vocab.get("<unk>") # Get UNK id from vocab
-        if unk_token_id is None:
-            # Fallback if <unk> is somehow missing (should be added by pipeline init)
-            logger.error("'<unk>' token not found in loaded vocabulary! Falling back to PAD ID.")
-            unk_token_id = self.vocab.get("<pad>", 0) # Use PAD ID (default 0) as fallback
-        pad_token_id = self.vocab.get("<pad>", 0) # Default PAD id
-
-        # Use the model\'s expected vocab size for bounds checking
-        effective_vocab_size = len(self.vocab)
-
+        vocab_size = 0
+        
+        # Find the maximum vocabulary index to determine actual vocab size
+        for _, idx in self.vocab.items():
+            if isinstance(idx, int) and idx > vocab_size:
+                vocab_size = idx
+        
+        # Add 1 to account for 0-indexing
+        vocab_size += 1
+        
+        # Get model's expected vocab size (default to a large number if not available)
+        model_vocab_size = getattr(self, "model_vocab_size", 200000)
+        
+        # Use the smaller of the two to ensure we don't exceed model's vocabulary size
+        effective_vocab_size = min(vocab_size, model_vocab_size)
+        
+        # Special token IDs
+        unk_token_id = self.vocab.get("<unk>", 3)
+        
         for word in text.split():
-            token_id = self.vocab.get(word, unk_token_id)
-            # Ensure token ID is within the *model's* vocabulary bounds
-            if token_id >= self.model_vocab_size:
-                logger.warning(f"Token \t\"{word}\" (ID: {token_id}) is outside model vocab size ({self.model_vocab_size}). Mapping to UNK ({unk_token_id}).")
-                token_id = unk_token_id
-            tokens.append(token_id)
-
+            if word in self.vocab:
+                token_id = self.vocab[word]
+                # Ensure token ID is within vocabulary bounds
+                if token_id >= effective_vocab_size:
+                    token_id = unk_token_id
+                tokens.append(token_id)
+            else:
+                tokens.append(unk_token_id)  # Default to <unk> token
+        
         return tokens
-
+    
     def _load_image(self, image_path: str) -> torch.Tensor:
         """Load and preprocess an image."""
-        full_path = os.path.join(self.image_dir, image_path)
         try:
-            image = Image.open(full_path).convert("RGB")
+            image = Image.open(os.path.join(self.image_dir, image_path)).convert('RGB')
             return self.image_transform(image)
-        except FileNotFoundError:
-            logger.error(f"Image file not found: {full_path}")
-            # Return a dummy tensor or raise error? Raising error is safer.
-            raise
         except Exception as e:
-            logger.error(f"Error loading image {full_path}: {e}")
-            raise IOError(f"Failed to load image {image_path}: {e}")
-
+            logger.error(f"Error loading image {image_path}: {e}")
+            # Return a blank image as fallback
+            blank = torch.zeros(3, self.image_size, self.image_size)
+            return blank
+    
     def __len__(self) -> int:
         return len(self.data)
-
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a single example from the dataset."""
         item = self.data[idx]
-        pad_token_id = self.vocab.get("<pad>", 0)
-
+        
         # Tokenize text
         input_text = item["text"]
         input_ids = self._tokenize(input_text)
-
+        
         # Truncate or pad to max_length
-        seq_len = len(input_ids)
-        if seq_len > self.max_length:
+        if len(input_ids) > self.max_length:
             input_ids = input_ids[:self.max_length]
-            seq_len = self.max_length
         else:
-            padding = [pad_token_id] * (self.max_length - seq_len)
-            input_ids = input_ids + padding
-
+            input_ids = input_ids + [self.vocab.get("<pad>", 0)] * (self.max_length - len(input_ids))
+        
         # Convert to tensor
         input_ids = torch.tensor(input_ids, dtype=torch.long)
-
+        
         # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = torch.zeros(self.max_length, dtype=torch.long) # Use long for consistency
-        attention_mask[:seq_len] = 1
-
+        attention_mask = (input_ids != self.vocab.get("<pad>", 0)).float()
+        
         # Prepare output dictionary
         output = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": input_ids.clone(),  # For causal language modeling
         }
-        # For causal LM, labels should be shifted, and padding ignored
-        # Shift labels: label for token i is token i+1
-        output["labels"][:-1] = input_ids[1:].clone()
-        # Set label for the last token and padding tokens to -100 to be ignored by loss function
-        output["labels"][seq_len-1:] = -100
-
+        
         # Add image if multimodal
         if self.multimodal and "image" in item:
-            try:
-                image_path = item["image"]
-                pixel_values = self._load_image(image_path)
-                output["pixel_values"] = pixel_values
-            except Exception as e:
-                 # If image loading fails, we might skip this item or return a flag
-                 # For simplicity, let\'s log and potentially raise to skip the batch
-                 logger.error(f"Skipping item {idx} due to image loading error: {e}")
-                 # To make collate_fn skip this, we can return None or raise an error
-                 # Returning None might be problematic for DataLoader. Let\'s raise.
-                 raise RuntimeError(f"Failed to load image for item {idx}") from e
-
+            image_path = item["image"]
+            pixel_values = self._load_image(image_path)
+            output["pixel_values"] = pixel_values
+        
         return output
 
 
-class YoloStyleTrainingPipeline: # Renamed from ApertisTrainer for clarity
-    """High-performance training pipeline for Apertis models."""
-
+class ApertisTrainer:
+    """High-performance trainer implementation for Apertis models."""
+    
     def __init__(
         self,
-        config: ApertisConfig, # Pass config object directly
-        train_data_path: str,
-        vocab_path: str,
+        model: ApertisForCausalLM,
+        train_dataset: ApertisDataset,
+        val_dataset: Optional[ApertisDataset] = None,
         output_dir: str = "output",
-        val_data_path: Optional[str] = None,
-        image_dir: Optional[str] = None,
         batch_size: int = 4,
-        learning_rate: float = 1e-5, # Reduced default LR
+        learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
         num_epochs: int = 3,
         warmup_steps: int = 0,
@@ -269,54 +213,51 @@ class YoloStyleTrainingPipeline: # Renamed from ApertisTrainer for clarity
         wandb_project: str = "apertis",
         wandb_run_name: Optional[str] = None,
         fp16: bool = True,
-        device: Optional[str] = None, # Keep device option for non-distributed
+        device: Optional[str] = None,
         checkpoint_steps: int = 1000,
-        iteration_checkpoint_steps: int = 0,
-        gpu_memory_fraction: float = 0.7, # Keep for potential single GPU limit
+        iteration_checkpoint_steps: int = 0,  # New parameter for iteration-based checkpoints
+        gpu_memory_fraction: float = 0.7,
         use_gradient_checkpointing: bool = True,
         eval_steps: int = 500,
         dynamic_batch_sizing: bool = True,
-        gpu_ids: Optional[List[int]] = None,
-        use_distributed: bool = False,
-        local_rank: int = -1, # Keep for distributed setup
+        gpu_ids: Optional[List[int]] = None,  # New parameter for GPU selection
+        distributed_training: bool = False,   # New parameter for multi-GPU training
+        local_rank: int = -1,                 # For distributed training
     ):
         """
-        Initialize the training pipeline.
+        Initialize the trainer.
+        
         Args:
-            config: ApertisConfig object for the model.
-            train_data_path: Path to training data (jsonl).
-            vocab_path: Path to vocabulary file (json).
-            output_dir: Directory to save outputs.
-            val_data_path: Path to validation data (jsonl, optional).
-            image_dir: Directory containing images (required if config.multimodal=True).
-            batch_size: Batch size per GPU.
-            learning_rate: Peak learning rate.
-            weight_decay: Weight decay for optimizer.
-            num_epochs: Number of training epochs.
-            warmup_steps: Number of warmup steps for learning rate scheduler.
-            gradient_accumulation_steps: Accumulate gradients over N steps.
-            max_grad_norm: Maximum gradient norm for clipping.
-            use_wandb: Use Weights & Biases for logging.
-            wandb_project: W&B project name.
-            wandb_run_name: W&B run name.
-            fp16: Use mixed precision training (torch.amp).
-            device: Explicit device selection (e.g., \'cpu\', \'cuda:0\'), overrides distributed/gpu_ids if set.
-            checkpoint_steps: Save checkpoint every N global steps (0 to disable).
-            iteration_checkpoint_steps: Save checkpoint every N iterations within an epoch (0 to disable).
-            gpu_memory_fraction: (Not directly used for limiting, informational).
-            use_gradient_checkpointing: Enable gradient checkpointing in the model.
-            eval_steps: Evaluate model every N global steps (0 to disable).
-            dynamic_batch_sizing: Attempt to reduce batch size on OOM (experimental).
-            gpu_ids: List of GPU IDs for DataParallel (if use_distributed=False).
-            use_distributed: Use DistributedDataParallel.
-            local_rank: Local rank for distributed training (usually set by launcher).
+            model: The model to train
+            train_dataset: Training dataset
+            val_dataset: Validation dataset (optional)
+            output_dir: Directory to save outputs
+            batch_size: Batch size for training
+            learning_rate: Learning rate
+            weight_decay: Weight decay for optimizer
+            num_epochs: Number of training epochs
+            warmup_steps: Number of warmup steps for learning rate scheduler
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            max_grad_norm: Maximum gradient norm for clipping
+            use_wandb: Whether to use Weights & Biases for logging
+            wandb_project: Weights & Biases project name
+            wandb_run_name: Weights & Biases run name
+            fp16: Whether to use mixed precision training
+            device: Device to use for training
+            checkpoint_steps: Save checkpoint every N global steps
+            iteration_checkpoint_steps: Save checkpoint every N iterations within an epoch (0 to disable)
+            gpu_memory_fraction: Fraction of GPU memory to use
+            use_gradient_checkpointing: Whether to use gradient checkpointing
+            eval_steps: Evaluate model every N global steps
+            dynamic_batch_sizing: Whether to dynamically adjust batch size
+            gpu_ids: List of GPU IDs to use for training (e.g., [0, 1, 2])
+            distributed_training: Whether to use distributed training across multiple GPUs
+            local_rank: Local rank for distributed training
         """
-        self.config = config
-        self.train_data_path = train_data_path
-        self.vocab_path = vocab_path
+        self.model = model
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         self.output_dir = output_dir
-        self.val_data_path = val_data_path
-        self.image_dir = image_dir
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -327,497 +268,541 @@ class YoloStyleTrainingPipeline: # Renamed from ApertisTrainer for clarity
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
         self.wandb_run_name = wandb_run_name
-        self.fp16 = fp16 and torch.cuda.is_available() # Only enable if CUDA is available
+        self.fp16 = fp16
         self.checkpoint_steps = checkpoint_steps
         self.iteration_checkpoint_steps = iteration_checkpoint_steps
         self.gpu_memory_fraction = gpu_memory_fraction
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.eval_steps = eval_steps
-        self.dynamic_batch_sizing = dynamic_batch_sizing # Note: OOM handling is basic
+        self.dynamic_batch_sizing = dynamic_batch_sizing
         self.gpu_ids = gpu_ids
-        self.use_distributed = use_distributed and torch.cuda.is_available() and torch.cuda.device_count() > 1
+        self.distributed_training = distributed_training
         self.local_rank = local_rank
-
-        # --- Distributed Setup ---
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Set up distributed training if requested
         self.world_size = 1
-        self.global_rank = 0
         self.is_main_process = True
-
-        if self.use_distributed:
+        
+        if self.distributed_training:
             if self.local_rank == -1:
-                # Try to get rank from environment variables if not passed explicitly
-                self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                self.global_rank = int(os.environ.get("RANK", 0))
-                self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-            else:
-                # Assume setup is handled externally if local_rank is provided
-                self.global_rank = self.local_rank # Simple case if not using complex setup
-                # self.world_size needs to be set correctly based on the launch config
-                # For simplicity, assume world_size matches number of GPUs if gpu_ids provided
-                self.world_size = len(gpu_ids) if gpu_ids else torch.cuda.device_count()
-
-            if not dist.is_initialized():
-                # Setup the process group if not already done
-                backend = "nccl" if torch.cuda.is_available() else "gloo"
-                logger.info(f"Initializing distributed process group (backend: {backend}, rank: {self.global_rank}, world_size: {self.world_size})")
-                try:
-                    dist.init_process_group(backend=backend, rank=self.global_rank, world_size=self.world_size)
-                except Exception as e:
-                    logger.error(f"Failed to initialize distributed process group: {e}", exc_info=True)
-                    raise RuntimeError("Distributed training setup failed.") from e
-
-            self.device = torch.device("cuda", self.local_rank)
-            torch.cuda.set_device(self.device)
-            self.is_main_process = self.global_rank == 0
-            logger.info(f"Distributed training enabled. Rank: {self.global_rank}, Local Rank: {self.local_rank}, World Size: {self.world_size}, Device: {self.device}")
-        elif device: # Explicit device takes precedence over gpu_ids if not distributed
-            self.device = torch.device(device)
-            self.is_main_process = True
-            logger.info(f"Using explicit device: {self.device}")
-        elif torch.cuda.is_available():
-            if gpu_ids and len(gpu_ids) == 1:
-                self.device = torch.device(f"cuda:{gpu_ids[0]}")
-            else:
-                self.device = torch.device("cuda") # Default to cuda:0 if no specific single GPU ID
-            self.is_main_process = True
-            logger.info(f"Using single GPU device: {self.device}")
-        else:
-            self.device = torch.device("cpu")
-            self.is_main_process = True
-            logger.info("Using CPU device.")
-
-        # --- Initialize W&B (only on main process) ---
-        if self.use_wandb and self.is_main_process:
-            try:
-                wandb.init(
-                    project=self.wandb_project,
-                    name=self.wandb_run_name,
-                    config=self.config.to_dict() # Log model config
-                )
-                logger.info("Weights & Biases initialized.")
-            except Exception as e:
-                logger.error(f"Failed to initialize W&B: {e}")
-                self.use_wandb = False # Disable W&B if init fails
-
-        # --- Create Output Directory (only on main process) ---
-        if self.is_main_process:
-            os.makedirs(self.output_dir, exist_ok=True)
-            # Save config to output directory
-            config_save_path = os.path.join(self.output_dir, "config.json")
-            try:
-                 self.config.save_pretrained(self.output_dir)
-                 logger.info(f"Model configuration saved to {config_save_path}")
-            except Exception as e:
-                 logger.error(f"Failed to save config to {config_save_path}: {e}")
-
-        # --- Load Vocabulary (using dataset's logic to include special tokens) ---
-        logger.info("Loading vocabulary and ensuring special tokens...")
-        try:
-            # --- Start: Logic similar to ApertisDataset._load_vocabulary ---
-            with open(self.vocab_path, "r", encoding="utf-8") as f:
-                vocab_data = json.load(f)
-
-            if isinstance(vocab_data, dict):
-                if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
-                    vocab = {token: idx for idx, token in enumerate(vocab_data["tokens"])}
-                    logger.info(f"Converted list-based vocabulary to dictionary format with {len(vocab)} tokens")
-                elif all(isinstance(k, str) and isinstance(v, int) for k, v in vocab_data.items()):
-                    vocab = vocab_data
-                elif "model" in vocab_data and "vocab" in vocab_data["model"] and isinstance(vocab_data["model"]["vocab"], dict):
-                     logger.info("Extracting vocab dict from 'model.vocab' structure in JSON")
-                     vocab = {k: int(v) for k, v in vocab_data["model"]["vocab"].items() if isinstance(v, (int, float, str)) and str(v).isdigit()}
+                # Auto-detect local_rank if not provided
+                if 'LOCAL_RANK' in os.environ:
+                    self.local_rank = int(os.environ['LOCAL_RANK'])
                 else:
-                    try:
-                        vocab = {str(k): int(v) for k, v in vocab_data.items()}
-                        logger.info(f"Loaded vocabulary dictionary with {len(vocab)} tokens (converted values to int).")
-                    except (ValueError, TypeError):
-                         raise ValueError("Unsupported vocabulary dictionary format in JSON file.")
-            else:
-                raise ValueError(f"Unsupported vocabulary format: {type(vocab_data)}")
-
-            # Add standard special tokens if missing
-            next_id = max(vocab.values()) + 1 if vocab else 0
-            added_tokens = []
-            for token in ["<pad>", "<unk>", "<bos>", "<eos>"]:
-                 if token not in vocab:
-                     vocab[token] = next_id
-                     added_tokens.append(token)
-                     next_id += 1
-            if added_tokens:
-                 logger.warning(f"Added missing special tokens to vocab during pipeline init: {added_tokens}. Consider rebuilding vocab properly.")
-            # --- End: Logic similar to ApertisDataset._load_vocabulary ---
-
-            # Determine the effective vocabulary size based on the highest token ID
-            if not vocab:
-                 raise ValueError("Vocabulary is empty after loading and processing.")
-            max_token_id = max(vocab.values())
-            actual_vocab_size = max_token_id + 1 # Use max ID + 1 for embedding size
-            logger.info(f"Loaded and processed vocabulary with {len(vocab)} unique tokens from {self.vocab_path}. Max token ID: {max_token_id}. Effective vocab size for model: {actual_vocab_size}")
-
-            # Update config with actual vocab size *before* model initialization
-            if self.config.vocab_size != actual_vocab_size:
-                 logger.warning(f"Updating config.vocab_size from {self.config.vocab_size} to actual size {actual_vocab_size}")
-                 self.config.vocab_size = actual_vocab_size
-            else:
-                 logger.info(f"Config vocab_size ({self.config.vocab_size}) matches actual vocab size ({actual_vocab_size}).")
-
-        except Exception as e:
-             logger.error(f"Failed to load or process vocabulary from {self.vocab_path}: {e}", exc_info=True)
-             raise RuntimeError("Vocabulary loading failed.") from e
-
-        # --- Initialize Model ---
-        logger.info("Initializing model with updated config...")
-        self.model = ApertisForCausalLM(self.config)
-        if self.use_gradient_checkpointing:
+                    self.local_rank = 0
+                    
+            # Initialize the distributed process group
+            if not dist.is_initialized():
+                if torch.cuda.is_available():
+                    dist.init_process_group(backend='nccl')
+                else:
+                    dist.init_process_group(backend='gloo')
+            
+            self.world_size = dist.get_world_size()
+            self.is_main_process = self.local_rank == 0
+            
+            logger.info(f"Distributed training enabled. World size: {self.world_size}, Local rank: {self.local_rank}")
+        
+        # Set device based on configuration
+        if self.distributed_training:
+            # In distributed mode, use the local rank to determine device
+            self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        elif self.gpu_ids and len(self.gpu_ids) > 0 and torch.cuda.is_available():
+            # Use the first specified GPU if multiple are provided but distributed training is not enabled
+            self.device = torch.device(f"cuda:{self.gpu_ids[0]}")
+        elif device is not None:
+            # Use the specified device
+            self.device = torch.device(device)
+        else:
+            # Default to first available CUDA device or CPU
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+        # Configure PyTorch CUDA memory allocation
+        if torch.cuda.is_available():
+            # Set environment variable to avoid memory fragmentation
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            
+            # Clear CUDA cache before starting
+            torch.cuda.empty_cache()
+            
+            # Limit GPU memory usage if specified
+            if self.gpu_memory_fraction < 1.0:
+                try:
+                    # Get total GPU memory for the current device
+                    device_idx = self.device.index if self.device.type == 'cuda' else 0
+                    if device_idx is not None and torch.cuda.is_available():
+                        total_memory = torch.cuda.get_device_properties(device_idx).total_memory
+                        # Calculate reserved memory
+                        reserved_memory = int(total_memory * (1 - self.gpu_memory_fraction))
+                        
+                        # Log memory information
+                        logger.info(f"Total GPU memory (device {device_idx}): {total_memory / 1024**3:.2f} GiB")
+                        logger.info(f"Reserving {reserved_memory / 1024**3:.2f} GiB for system")
+                        logger.info(f"Available for training: {(total_memory - reserved_memory) / 1024**3:.2f} GiB")
+                except Exception as e:
+                    logger.warning(f"Failed to get GPU memory info: {e}")
+        
+        logger.info(f"Using device: {self.device}")
+        
+        # Enable gradient checkpointing if requested (reduces memory usage)
+        if self.use_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+            logger.info("Enabling gradient checkpointing")
             self.model.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled.")
+        
+        # Move model to device
         self.model.to(self.device)
-        logger.info(f"Model initialized with config: {self.config.to_dict()}")
-        logger.info(f"Model placed on device: {self.device}")
-
-        # --- Wrap Model for Distributed/DataParallel ---
-        if self.use_distributed:
-            self.model = DDP(self.model, device_ids=[self.local_rank], output_device=self.local_rank)
-            logger.info(f"Model wrapped with DistributedDataParallel on rank {self.global_rank}.")
-        elif torch.cuda.is_available() and torch.cuda.device_count() > 1 and gpu_ids and len(gpu_ids) > 1:
-            logger.warning("Using DataParallel. DistributedDataParallel (DDP) is generally recommended for multi-GPU training.")
-            self.model = nn.DataParallel(self.model, device_ids=gpu_ids)
-            logger.info(f"Model wrapped with DataParallel on GPUs: {gpu_ids}")
-
-        # --- Prepare Datasets and DataLoaders ---
-        logger.info("Preparing datasets...")
-        # Pass the model\'s actual vocab size to the dataset
-        train_dataset = ApertisDataset(
-            data_path=self.train_data_path,
-            tokenizer_path=self.vocab_path,
-            max_length=self.config.max_position_embeddings,
-            multimodal=self.config.multimodal,
-            image_dir=self.image_dir,
-            image_size=getattr(self.config, "image_size", 224),
-            model_vocab_size=self.config.vocab_size # Pass model vocab size
-        )
-        val_dataset = None
-        if self.val_data_path:
-            val_dataset = ApertisDataset(
-                data_path=self.val_data_path,
-                tokenizer_path=self.vocab_path,
-                max_length=self.config.max_position_embeddings,
-                multimodal=self.config.multimodal,
-                image_dir=self.image_dir,
-                image_size=getattr(self.config, "image_size", 224),
-                model_vocab_size=self.config.vocab_size # Pass model vocab size
+        
+        # Set up distributed model if using distributed training
+        if self.distributed_training:
+            self.model = DDP(
+                self.model, 
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                output_device=self.local_rank if torch.cuda.is_available() else None,
+                find_unused_parameters=False
             )
-
-        # Sampler for distributed training
-        train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.global_rank) if self.use_distributed else None
-        val_sampler = DistributedSampler(val_dataset, num_replicas=self.world_size, rank=self.global_rank, shuffle=False) if self.use_distributed and val_dataset else None
-
-        # DataLoaders
-        self.train_loader = DataLoader(
-            train_dataset,
+        # Set up DataParallel if using multiple GPUs without distributed training
+        elif self.gpu_ids and len(self.gpu_ids) > 1 and torch.cuda.is_available():
+            self.model = nn.DataParallel(self.model, device_ids=self.gpu_ids)
+            logger.info(f"Using DataParallel with GPUs: {self.gpu_ids}")
+        
+        # Create data loaders with appropriate batch size
+        self._create_dataloaders()
+        
+        # Set up optimizer with weight decay
+        param_optimizer = list(self.model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': self.weight_decay},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        self.optimizer = optim.AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
+        
+        # Set up learning rate scheduler
+        num_training_steps = len(self.train_dataloader) // self.gradient_accumulation_steps * self.num_epochs
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.learning_rate,
+            total_steps=num_training_steps,
+            pct_start=0.1,
+            anneal_strategy='cos',
+            div_factor=25.0,
+            final_div_factor=10000.0,
+        )
+        
+        # Set up mixed precision training
+        self.scaler = torch.amp.GradScaler(enabled=self.fp16)
+        
+        # Initialize Weights & Biases if requested
+        if self.use_wandb and self.is_main_process:
+            wandb.init(
+                project=self.wandb_project,
+                name=self.wandb_run_name,
+                config={
+                    "batch_size": self.batch_size,
+                    "learning_rate": self.learning_rate,
+                    "weight_decay": self.weight_decay,
+                    "num_epochs": self.num_epochs,
+                    "warmup_steps": self.warmup_steps,
+                    "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                    "max_grad_norm": self.max_grad_norm,
+                    "fp16": self.fp16,
+                    "device": str(self.device),
+                    "distributed_training": self.distributed_training,
+                    "world_size": self.world_size,
+                    "gpu_ids": self.gpu_ids,
+                }
+            )
+    
+    def _create_dataloaders(self):
+        """Create data loaders for training and validation."""
+        # Set up samplers for distributed training
+        train_sampler = None
+        val_sampler = None
+        
+        if self.distributed_training:
+            train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=True
+            )
+            if self.val_dataset is not None:
+                val_sampler = DistributedSampler(
+                    self.val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.local_rank,
+                    shuffle=False
+                )
+        
+        # Create data loaders
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
             batch_size=self.batch_size,
+            shuffle=(train_sampler is None),
             sampler=train_sampler,
-            shuffle=(train_sampler is None), # Shuffle only if not using distributed sampler
-            num_workers=4, # Adjust based on system capabilities
+            num_workers=4,
             pin_memory=True,
         )
-        self.val_loader = None
-        if val_dataset:
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.batch_size * 2, # Often use larger batch size for validation
-                sampler=val_sampler,
+        
+        if self.val_dataset is not None:
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
                 shuffle=False,
+                sampler=val_sampler,
                 num_workers=4,
                 pin_memory=True,
             )
-
-        # --- Optimizer and Scheduler ---
-        logger.info("Setting up optimizer and scheduler...")
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        self.optimizer = optim.AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
-
-        # Total training steps
-        self.num_training_steps = len(self.train_loader) // self.gradient_accumulation_steps * self.num_epochs
-
-        # Scheduler (simple linear decay with warmup)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_lambda=lambda step: min(1.0, step / self.warmup_steps) if step < self.warmup_steps else max(0.0, 1.0 - (step - self.warmup_steps) / (self.num_training_steps - self.warmup_steps))
-        )
-
-        # --- Mixed Precision Scaling ---
-        self.scaler = torch.amp.GradScaler(enabled=self.fp16)
-        if self.fp16:
-            logger.info("Mixed precision training (FP16) enabled.")
-
-        # --- Training State ---
-        self.global_step = 0
-        self.current_epoch = 0
-
-        logger.info("Training pipeline initialized.")
-
-    def _save_checkpoint(self, epoch: int, step: int, is_iteration_checkpoint: bool = False):
-        """Save model checkpoint (only on main process)."""
-        if not self.is_main_process:
-            return
-
-        if is_iteration_checkpoint:
-            checkpoint_dir = os.path.join(self.output_dir, f"checkpoint-epoch-{epoch}-iter-{step}")
         else:
-            checkpoint_dir = os.path.join(self.output_dir, f"checkpoint-step-{self.global_step}")
-
+            self.val_dataloader = None
+    
+    def train(self):
+        """Train the model."""
+        logger.info("Starting training")
+        
+        # Track best validation loss
+        best_val_loss = float('inf')
+        global_step = 0
+        
+        # Training loop
+        for epoch in range(self.num_epochs):
+            # Set epoch for distributed sampler
+            if self.distributed_training and hasattr(self.train_dataloader, 'sampler') and hasattr(self.train_dataloader.sampler, 'set_epoch'):
+                self.train_dataloader.sampler.set_epoch(epoch)
+            
+            # Training
+            self.model.train()
+            epoch_loss = 0.0
+            
+            # Progress bar for training
+            progress_bar = tqdm(
+                total=len(self.train_dataloader),
+                desc=f"Epoch {epoch+1}/{self.num_epochs}",
+                disable=not self.is_main_process
+            )
+            
+            for step, batch in enumerate(self.train_dataloader):
+                try:
+                    # Move batch to device
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    
+                    # Forward pass with mixed precision
+                    with torch.amp.autocast('cuda', enabled=self.fp16):
+                        outputs = self.model(**batch)
+                        # Fix for tuple output format - extract loss from first element of tuple
+                        if isinstance(outputs, tuple):
+                            loss = outputs[0]  # First element of the tuple is the loss
+                        else:
+                            loss = outputs.loss
+                        
+                        # Scale loss for gradient accumulation
+                        loss = loss / self.gradient_accumulation_steps
+                    
+                    # Backward pass with gradient scaling
+                    self.scaler.scale(loss).backward()
+                    
+                    # Update weights if gradient accumulation steps reached
+                    if (step + 1) % self.gradient_accumulation_steps == 0 or (step + 1) == len(self.train_dataloader):
+                        # Clip gradients
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        
+                        # Update weights
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                        
+                        # Increment global step
+                        global_step += 1
+                        
+                        # Log to Weights & Biases
+                        if self.use_wandb and self.is_main_process:
+                            wandb.log({
+                                "train_loss": loss.item() * self.gradient_accumulation_steps,
+                                "learning_rate": self.scheduler.get_last_lr()[0],
+                                "epoch": epoch + step / len(self.train_dataloader),
+                                "global_step": global_step,
+                            })
+                        
+                        # Evaluate if needed
+                        if self.val_dataloader is not None and global_step > 0 and global_step % self.eval_steps == 0:
+                            val_loss = self.evaluate()
+                            
+                            # Log validation loss
+                            if self.use_wandb and self.is_main_process:
+                                wandb.log({
+                                    "val_loss": val_loss,
+                                    "global_step": global_step,
+                                })
+                            
+                            # Save best model
+                            if val_loss < best_val_loss and self.is_main_process:
+                                best_val_loss = val_loss
+                                self.save_checkpoint(f"best_model")
+                                logger.info(f"New best model saved with validation loss: {val_loss:.4f}")
+                            
+                            # Switch back to training mode
+                            self.model.train()
+                        
+                        # Save checkpoint if needed (based on global steps)
+                        if self.checkpoint_steps > 0 and global_step % self.checkpoint_steps == 0 and self.is_main_process:
+                            self.save_checkpoint(f"step-{global_step}")
+                    
+                    # Save checkpoint if needed (based on iterations within epoch)
+                    if self.iteration_checkpoint_steps > 0 and (step + 1) % self.iteration_checkpoint_steps == 0 and self.is_main_process:
+                        self.save_checkpoint(f"epoch{epoch+1}-iter{step+1}")
+                    
+                    # Update progress bar
+                    progress_bar.update(1)
+                    progress_bar.set_postfix({"loss": loss.item() * self.gradient_accumulation_steps})
+                    
+                    # Accumulate loss for epoch average
+                    epoch_loss += loss.item() * self.gradient_accumulation_steps
+                    
+                except Exception as e:
+                    logger.error(f"Error processing batch: {e}")
+                    
+                    # Try to recover with dynamic batch sizing
+                    if self.dynamic_batch_sizing and "CUDA out of memory" in str(e) and self.batch_size > 1:
+                        # Reduce batch size
+                        self.batch_size = max(1, self.batch_size // 2)
+                        logger.warning(f"CUDA OOM detected. Reducing batch size to {self.batch_size}")
+                        
+                        # Clear CUDA cache
+                        torch.cuda.empty_cache()
+                        
+                        # Recreate data loaders with new batch size
+                        self._create_dataloaders()
+                        
+                        # Skip to next epoch
+                        break
+            
+            # Close progress bar
+            progress_bar.close()
+            
+            # Calculate epoch average loss
+            epoch_loss /= len(self.train_dataloader)
+            logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Average loss: {epoch_loss:.4f}")
+            
+            # Evaluate at the end of each epoch
+            if self.val_dataloader is not None:
+                val_loss = self.evaluate()
+                
+                # Log validation loss
+                if self.use_wandb and self.is_main_process:
+                    wandb.log({
+                        "val_loss": val_loss,
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                    })
+                
+                # Save best model
+                if val_loss < best_val_loss and self.is_main_process:
+                    best_val_loss = val_loss
+                    self.save_checkpoint(f"best_model")
+                    logger.info(f"New best model saved with validation loss: {val_loss:.4f}")
+            
+            # Save checkpoint at the end of each epoch
+            if self.is_main_process:
+                self.save_checkpoint(f"epoch-{epoch+1}")
+        
+        # Save final model
+        if self.is_main_process:
+            self.save_checkpoint("final")
+        
+        logger.info("Training completed")
+        
+        # Close Weights & Biases
+        if self.use_wandb and self.is_main_process:
+            wandb.finish()
+    
+    def evaluate(self):
+        """Evaluate the model on the validation set."""
+        logger.info("Evaluating model")
+        
+        # Set model to evaluation mode
+        self.model.eval()
+        
+        # Track validation loss
+        val_loss = 0.0
+        
+        # Progress bar for validation
+        progress_bar = tqdm(
+            total=len(self.val_dataloader),
+            desc="Validation",
+            disable=not self.is_main_process
+        )
+        
+        # Evaluation loop
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                # Move batch to device
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                # Forward pass
+                outputs = self.model(**batch)
+                # Fix for tuple output format - extract loss from first element of tuple
+                if isinstance(outputs, tuple):
+                    loss = outputs[0]  # First element of the tuple is the loss
+                else:
+                    loss = outputs.loss
+                
+                # Accumulate loss
+                val_loss += loss.item()
+                
+                # Update progress bar
+                progress_bar.update(1)
+        
+        # Close progress bar
+        progress_bar.close()
+        
+        # Calculate average loss
+        val_loss /= len(self.val_dataloader)
+        logger.info(f"Validation loss: {val_loss:.4f}")
+        
+        return val_loss
+    
+    def save_checkpoint(self, name: str):
+        """Save model checkpoint."""
+        # Create checkpoint directory
+        checkpoint_dir = os.path.join(self.output_dir, name)
         os.makedirs(checkpoint_dir, exist_ok=True)
-
-        # Get the underlying model state dict if wrapped (DDP/DataParallel)
-        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-
-        # Save model weights
-        model_save_path = os.path.join(checkpoint_dir, "model.pt")
-        torch.save(model_to_save.state_dict(), model_save_path)
-
-        # Save config (already saved at init, but good practice to save with checkpoint)
-        config_save_path = os.path.join(checkpoint_dir, "config.json")
-        try:
-             model_to_save.config.save_pretrained(checkpoint_dir)
-        except Exception as e:
-             logger.error(f"Failed to save config during checkpointing: {e}")
-
-        # Save optimizer and scheduler state (optional but recommended for resuming)
-        optimizer_save_path = os.path.join(checkpoint_dir, "optimizer.pt")
-        torch.save(self.optimizer.state_dict(), optimizer_save_path)
-        scheduler_save_path = os.path.join(checkpoint_dir, "scheduler.pt")
-        torch.save(self.scheduler.state_dict(), scheduler_save_path)
-
-        # Save training state (optional)
-        state_save_path = os.path.join(checkpoint_dir, "trainer_state.json")
-        with open(state_save_path, "w") as f:
-            json.dump({"epoch": epoch, "global_step": self.global_step}, f)
-
+        
+        # Get model to save (unwrap DDP or DataParallel if needed)
+        if isinstance(self.model, (nn.DataParallel, DDP)):
+            model_to_save = self.model.module
+        else:
+            model_to_save = self.model
+        
+        # Save model state dict
+        torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, "model.pt"))
+        
+        # Save configuration
+        with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
+            json.dump(model_to_save.config.to_dict(), f, indent=2)
+        
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
-    def _evaluate(self, progress: Optional[gr.Progress] = None):
-        """Evaluate the model on the validation set."""
-        if not self.val_loader:
-            return None
 
-        self.model.eval() # Set model to evaluation mode
-        total_eval_loss = 0
-        num_eval_steps = 0
-
-        if progress and self.is_main_process:
-             progress(0, desc="Starting evaluation...")
-
-        eval_iterator = tqdm(self.val_loader, desc="Evaluating", disable=not self.is_main_process)
-        with torch.no_grad():
-            for batch in eval_iterator:
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-
-                # Forward pass
-                with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
-                    outputs = self.model(**batch)
-                    loss = outputs.loss
-
-                # Handle potential reduction in distributed setting
-                if self.use_distributed and loss is not None:
-                    # Average loss across all processes
-                    dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-
-                if loss is not None:
-                    total_eval_loss += loss.item()
-                num_eval_steps += 1
-
-                if progress and self.is_main_process:
-                     progress(num_eval_steps / len(self.val_loader), desc=f"Evaluating... Loss: {loss.item():.4f}")
-
-        avg_eval_loss = total_eval_loss / num_eval_steps if num_eval_steps > 0 else 0
-        perplexity = torch.exp(torch.tensor(avg_eval_loss)).item() if avg_eval_loss > 0 else float("inf")
-
-        if self.is_main_process:
-            logger.info(f"Evaluation finished. Average Loss: {avg_eval_loss:.4f}, Perplexity: {perplexity:.4f}")
-            if self.use_wandb:
-                wandb.log({"eval/loss": avg_eval_loss, "eval/perplexity": perplexity, "global_step": self.global_step})
-            if progress:
-                 progress(1, desc=f"Evaluation Complete. Loss: {avg_eval_loss:.4f}, PPL: {perplexity:.4f}")
-
-        self.model.train() # Set model back to training mode
-        return avg_eval_loss
-
-    def train(self, stop_event: Optional[threading.Event] = None, progress_callback: Optional[gr.Progress] = None):
-        """
-        Run the training loop.
-
-        Args:
-            stop_event: A threading.Event object to signal training stop.
-            progress_callback: A Gradio Progress object to update UI.
-        """
-        logger.info("Starting training...")
-        self.model.train() # Ensure model is in training mode
-        total_batches = len(self.train_loader)
-        total_steps_per_epoch = total_batches // self.gradient_accumulation_steps
-
-        for epoch in range(self.num_epochs):
-            self.current_epoch = epoch
-            if self.is_main_process:
-                logger.info(f"Starting Epoch {epoch + 1}/{self.num_epochs}")
-            if self.use_distributed and self.train_loader.sampler:
-                self.train_loader.sampler.set_epoch(epoch) # Important for shuffling in DDP
-
-            epoch_iterator = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}", disable=not self.is_main_process)
-            train_loss = 0.0
-            steps_in_epoch = 0
-
-            for step, batch in enumerate(epoch_iterator):
-                # Check for stop signal
-                if stop_event and stop_event.is_set():
-                    logger.info(f"Stop signal received. Stopping training at Epoch {epoch+1}, Step {step}.")
-                    if self.is_main_process and self.use_wandb:
-                         wandb.finish()
-                    return # Exit the training loop
-
-                # Move batch to device
-                try:
-                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                except Exception as e:
-                     logger.error(f"Error moving batch to device at Epoch {epoch+1}, Step {step}: {e}")
-                     continue # Skip this batch
-
-                # Forward pass with mixed precision
-                with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
-                    outputs = self.model(**batch)
-                    loss = outputs.loss
-
-                if loss is None:
-                     logger.warning(f"Loss is None at Epoch {epoch+1}, Step {step}. Skipping backward pass.")
-                     continue
-
-                # Normalize loss for gradient accumulation
-                loss = loss / self.gradient_accumulation_steps
-
-                # Backward pass with scaler
-                self.scaler.scale(loss).backward()
-
-                train_loss += loss.item() * self.gradient_accumulation_steps # Accumulate un-normalized loss for logging
-
-                # Optimizer step (every gradient_accumulation_steps)
-                if (step + 1) % self.gradient_accumulation_steps == 0:
-                    # Unscale gradients before clipping
-                    self.scaler.unscale_(self.optimizer)
-
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                    # Optimizer step
-                    self.scaler.step(self.optimizer)
-
-                    # Update scaler
-                    self.scaler.update()
-
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-
-                    # Scheduler step
-                    self.scheduler.step()
-
-                    self.global_step += 1
-                    steps_in_epoch += 1
-
-                    # Logging (only on main process)
-                    if self.is_main_process:
-                        current_lr = self.scheduler.get_last_lr()[0]
-                        avg_loss_so_far = train_loss / (steps_in_epoch * self.gradient_accumulation_steps)
-                        log_msg = f"Epoch: {epoch+1}, Step: {steps_in_epoch}/{total_steps_per_epoch}, Global Step: {self.global_step}, LR: {current_lr:.6f}, Loss: {loss.item() * self.gradient_accumulation_steps:.4f}, Avg Loss: {avg_loss_so_far:.4f}"
-                        epoch_iterator.set_description(log_msg)
-                        # logger.info(log_msg) # Optional: log every step
-
-                        if self.use_wandb:
-                            wandb.log({
-                                "train/loss": loss.item() * self.gradient_accumulation_steps,
-                                "train/learning_rate": current_lr,
-                                "global_step": self.global_step,
-                                "epoch": epoch + (step / total_batches) # Log fractional epoch
-                            })
-
-                        # Update Gradio progress
-                        if progress_callback is not None and isinstance(progress_callback, gr.Progress): # Check type
-                            progress_val = (epoch * total_steps_per_epoch + steps_in_epoch) / (self.num_epochs * total_steps_per_epoch)
-                            progress_desc = f"Epoch {epoch+1}/{self.num_epochs}, Step {steps_in_epoch}/{total_steps_per_epoch}, Loss: {loss.item() * self.gradient_accumulation_steps:.4f}"
-                            try:
-                                progress_callback(progress_val, desc=progress_desc)
-                            except IndexError as ie:
-                                 logger.error(f"Caught IndexError updating Gradio progress (likely empty iterables): {ie}. Progress bar may not update.")
-                            except Exception as pe:
-                                 logger.error(f"Failed to update Gradio progress: {pe}")
-                        elif progress_callback is not None and callable(progress_callback): # Fallback if it's just a callable wrapper
-                            progress_val = (epoch * total_steps_per_epoch + steps_in_epoch) / (self.num_epochs * total_steps_per_epoch)
-                            progress_desc = f"Epoch {epoch+1}/{self.num_epochs}, Step {steps_in_epoch}/{total_steps_per_epoch}, Loss: {loss.item() * self.gradient_accumulation_steps:.4f}"
-                            try:
-                                progress_callback(progress_val, desc=progress_desc)
-                            except IndexError as ie:
-                                 logger.error(f"Caught IndexError updating Gradio progress (likely empty iterables): {ie}. Progress bar may not update.")
-                            except Exception as pe:
-                                 logger.error(f"Failed to update Gradio progress: {pe}")
-
-                    # Evaluation step
-                    if self.eval_steps > 0 and self.global_step % self.eval_steps == 0:
-                        self._evaluate(progress=progress_callback)
-                        self.model.train() # Ensure model is back in train mode after eval
-
-                    # Global step checkpointing
-                    if self.checkpoint_steps > 0 and self.global_step % self.checkpoint_steps == 0:
-                        self._save_checkpoint(epoch=epoch + 1, step=self.global_step)
-
-                # Iteration checkpointing (within epoch)
-                if self.iteration_checkpoint_steps > 0 and (step + 1) % self.iteration_checkpoint_steps == 0:
-                    self._save_checkpoint(epoch=epoch + 1, step=step + 1, is_iteration_checkpoint=True)
-
-            # End of epoch evaluation
-            if self.eval_steps == 0: # Evaluate at end of epoch if not evaluating periodically
-                 self._evaluate(progress=progress_callback)
-                 self.model.train()
-
-            # End of epoch checkpoint (optional, could save last checkpoint)
-            # self._save_checkpoint(epoch=epoch + 1, step=self.global_step)
-
-        logger.info("Training finished.")
-        if self.is_main_process and self.use_wandb:
-            wandb.finish()
-
-        # Final save (only on main process)
-        if self.is_main_process:
-             final_save_dir = os.path.join(self.output_dir, "final_model")
-             os.makedirs(final_save_dir, exist_ok=True)
-             model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-             torch.save(model_to_save.state_dict(), os.path.join(final_save_dir, "model.pt"))
-             model_to_save.config.save_pretrained(final_save_dir)
-             logger.info(f"Final model saved to {final_save_dir}")
-
-# --- Utility Functions ---
 def get_available_gpus() -> List[Dict[str, Any]]:
-    """Returns a list of available CUDA GPUs with their properties."""
-    gpus = []
+    """Get information about available GPUs."""
+    gpu_info = []
+    
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         for i in range(num_gpus):
-            try:
-                props = torch.cuda.get_device_properties(i)
-                gpus.append({
-                    "id": i,
-                    "name": props.name,
-                    "total_memory": props.total_memory / (1024**3), # Convert bytes to GB
-                })
-            except Exception as e:
-                logger.error(f"Could not get properties for GPU {i}: {e}")
-    return gpus
+            props = torch.cuda.get_device_properties(i)
+            gpu_info.append({
+                "id": i,
+                "name": props.name,
+                "total_memory": props.total_memory / (1024**3),  # Convert to GB
+                "compute_capability": f"{props.major}.{props.minor}"
+            })
+    
+    return gpu_info
 
+
+def train_from_config(config_path: str):
+    """Train a model from a configuration file."""
+    # Load configuration
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    
+    # Extract configuration sections
+    data_config = config.get("data_config", {})
+    model_config = config.get("model_config", {})
+    training_config = config.get("training_config", {})
+    
+    # Create datasets
+    train_dataset = ApertisDataset(
+        data_path=data_config.get("train_data_path"),
+        tokenizer_path=data_config.get("tokenizer_path"),
+        max_length=data_config.get("max_length", 512),
+        multimodal=data_config.get("multimodal", False),
+        image_dir=data_config.get("image_dir"),
+        image_size=data_config.get("image_size", 224),
+    )
+    
+    val_dataset = None
+    if "val_data_path" in data_config:
+        val_dataset = ApertisDataset(
+            data_path=data_config.get("val_data_path"),
+            tokenizer_path=data_config.get("tokenizer_path"),
+            max_length=data_config.get("max_length", 512),
+            multimodal=data_config.get("multimodal", False),
+            image_dir=data_config.get("image_dir"),
+            image_size=data_config.get("image_size", 224),
+        )
+    
+    # Create model
+    model_config_obj = ApertisConfig(
+        vocab_size=model_config.get("vocab_size", 32000),
+        hidden_size=model_config.get("hidden_size", 768),
+        num_hidden_layers=model_config.get("num_hidden_layers", 12),
+        num_attention_heads=model_config.get("num_attention_heads", 12),
+        intermediate_size=model_config.get("intermediate_size", 3072),
+        use_expert_system=model_config.get("use_expert_system", False),
+        multimodal=model_config.get("multimodal", False),
+    )
+    model = ApertisForCausalLM(model_config_obj)
+    
+    # Get GPU configuration
+    gpu_ids = training_config.get("gpu_ids", None)
+    distributed_training = training_config.get("distributed_training", False)
+    local_rank = training_config.get("local_rank", -1)
+    
+    # Create trainer
+    trainer = ApertisTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        output_dir=training_config.get("output_dir", "output"),
+        batch_size=training_config.get("batch_size", 4),
+        learning_rate=training_config.get("learning_rate", 5e-5),
+        weight_decay=training_config.get("weight_decay", 0.01),
+        num_epochs=training_config.get("num_epochs", 3),
+        warmup_steps=training_config.get("warmup_steps", 0),
+        gradient_accumulation_steps=training_config.get("gradient_accumulation_steps", 4),
+        max_grad_norm=training_config.get("max_grad_norm", 1.0),
+        use_wandb=training_config.get("use_wandb", False),
+        wandb_project=training_config.get("wandb_project", "apertis"),
+        wandb_run_name=training_config.get("wandb_run_name"),
+        fp16=training_config.get("fp16", True),
+        device=training_config.get("device"),
+        checkpoint_steps=training_config.get("checkpoint_steps", 1000),
+        iteration_checkpoint_steps=training_config.get("iteration_checkpoint_steps", 0),
+        gpu_memory_fraction=training_config.get("gpu_memory_fraction", 0.7),
+        use_gradient_checkpointing=training_config.get("use_gradient_checkpointing", True),
+        eval_steps=training_config.get("eval_steps", 500),
+        dynamic_batch_sizing=training_config.get("dynamic_batch_sizing", True),
+        gpu_ids=gpu_ids,
+        distributed_training=distributed_training,
+        local_rank=local_rank,
+    )
+    
+    # Train model
+    trainer.train()
+
+
+class YoloStyleTrainingPipeline:
+    """YOLO-style training pipeline for Apertis models."""
+    
+    def __init__(
+        self,
+        config_path: str,
+    ):
+        """
+        Initialize the training pipeline.
+        
+        Args:
+            config_path: Path to the configuration file
+        """
+        self.config_path = config_path
+    
+    def train(self):
+        """Train the model."""
+        train_from_config(self.config_path)

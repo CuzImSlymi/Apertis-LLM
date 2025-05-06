@@ -47,33 +47,16 @@ def chat_command(args):
     """Handle the chat command."""
     from src.inference.interface import ApertisInterface
     
-    # Determine vocab file path
-    vocab_file_path = args.vocab_file
-    if vocab_file_path is None and args.model_path and os.path.isdir(args.model_path):
-        potential_vocab_path = os.path.join(args.model_path, "vocab.json")
-        if os.path.exists(potential_vocab_path):
-            vocab_file_path = potential_vocab_path
-            logger.info(f"Vocabulary file not specified, found and using: {vocab_file_path}")
-        else:
-            logger.error("Vocabulary file not specified and vocab.json not found in model directory.")
-            logger.error("Please provide the vocabulary file using --vocab-file.")
-            sys.exit(1)
-    elif vocab_file_path is None:
-        logger.error("Vocabulary file not specified. Please provide the vocabulary file using --vocab-file.")
-        sys.exit(1)
-    elif not os.path.exists(vocab_file_path):
-        logger.error(f"Specified vocabulary file not found: {vocab_file_path}")
-        sys.exit(1)
-
     interface = ApertisInterface(
         model_path=args.model_path,
-        vocab_file=vocab_file_path, # Use the determined path
+        vocab_file=args.vocab_file,
         multimodal=args.multimodal,
         device=args.device,
         web=args.web,
         port=args.port,
         share=args.share,
-    )    
+    )
+    
     if args.web:
         # Web interface is launched in the ApertisInterface constructor
         pass
