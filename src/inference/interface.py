@@ -102,7 +102,8 @@ class ApertisInterface:
                     # Load state dict
                     state_dict_path = os.path.join(model_path, "model.pt")
                     if os.path.exists(state_dict_path):
-                        self.model.load_state_dict(torch.load(state_dict_path, map_location=self.device, weights_only=True))
+                        # When loading a model with its config, we can be strict.
+                        self.model.load_state_dict(torch.load(state_dict_path, map_location=self.device, weights_only=True), strict=True)
                     else:
                         logger.warning(f"Model state dict not found at {state_dict_path}")
                 else:
@@ -118,27 +119,23 @@ class ApertisInterface:
                     
                     # Check if model uses expert system
                     use_expert_system = False
-                    # Look for expert system specific parameters
                     for key in state_dict.keys():
                         if "feed_forward.feed_forward.experts" in key or "feed_forward.feed_forward.router" in key:
                             use_expert_system = True
                             break
                     
-                    # Extract vocabulary size from embeddings
                     vocab_size = None
                     if "model.token_embeddings.weight" in state_dict:
                         vocab_size = state_dict["model.token_embeddings.weight"].size(0)
                         logger.info(f"Detected vocabulary size: {vocab_size}")
                     
-                    # Determine model size from hidden dimensions
                     hidden_size = None
                     layer_count = 0
+                    model_size = "base" # Default model size
+
                     if "model.token_embeddings.weight" in state_dict:
                         hidden_size = state_dict["model.token_embeddings.weight"].size(1)
-                        
-                        # Count number of layers
                         i = 0
-                        # Check for different possible layer parameter names
                         while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
                                 ["input_layernorm.weight", "attn_norm.weight", 
                                  "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
@@ -150,128 +147,103 @@ class ApertisInterface:
                             model_size = "small"
                         elif hidden_size == 768 and layer_count <= 12:
                             model_size = "base"
-                        elif hidden_size == 1024 or layer_count > 12:
+                        elif hidden_size == 1024 or layer_count > 12: # Handles larger layer counts too
                             model_size = "large"
-                        else:
-                            # Default to base if dimensions don't match standard sizes
-                            model_size = "base"
+                        # else it remains "base" or could be an unknown config
                             
                         logger.info(f"Detected model size: {model_size} (hidden_size={hidden_size}, layers={layer_count})")
                         logger.info(f"Expert system: {use_expert_system}")
                     else:
-                        # If can't determine, default to base
-                        model_size = "base"
-                        logger.info(f"Could not determine model size, defaulting to {model_size}")
+                        logger.info(f"Could not determine model parameters from token_embeddings, defaulting to {model_size}")
+
+                    # Define model presets to ensure correct num_attention_heads and intermediate_size
+                    _model_presets = {
+                        "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+                        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+                        "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
+                    }
                     
-                    # Create a custom configuration with the detected parameters
+                    # Get the base configuration for the detected model_size
+                    preset_config = _model_presets.get(model_size, _model_presets["base"])
+
                     config_kwargs = {
-                        "hidden_size": hidden_size if hidden_size else {"small": 512, "base": 768, "large": 1024}[model_size],
-                        "num_hidden_layers": layer_count if layer_count > 0 else {"small": 8, "base": 12, "large": 24}[model_size],
+                        **preset_config, # Start with all params from the preset
+                        "vocab_size": vocab_size if vocab_size else preset_config.get("vocab_size", 32000),
                         "use_expert_system": use_expert_system,
                         "multimodal": self.multimodal,
                     }
+                    # Override with detected hidden_size and layer_count if they were found
+                    if hidden_size:
+                        config_kwargs["hidden_size"] = hidden_size
+                    if layer_count > 0:
+                        config_kwargs["num_hidden_layers"] = layer_count
                     
-                    # Add vocabulary size if detected
-                    if vocab_size:
-                        config_kwargs["vocab_size"] = vocab_size
-                    
-                    # Create model with the custom configuration
+                    # Create model with the best-guess configuration
                     config = ApertisConfig(**config_kwargs)
                     self.model = ApertisForCausalLM(config)
                     
-                    # Load the state dict
-                    self.model.load_state_dict(state_dict, strict=False)
-                    logger.info(f"Successfully loaded model with custom configuration")
-                except Exception as inner_e:
-                    logger.warning(f"Error determining model parameters: {inner_e}")
-                    logger.warning("Trying to load with exact vocabulary size and layer count...")
+                    # Try loading with strict=True first for this more accurate config
+                    missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False) # Keep strict=False for robustness with .pt files
                     
-                    # Try loading with exact vocabulary size and layer count
+                    if missing_keys or unexpected_keys:
+                        logger.warning(f"Loading with {model_size} preset config completed with:"
+                                       f" Missing keys: {missing_keys if missing_keys else 'None'}."
+                                       f" Unexpected keys: {unexpected_keys if unexpected_keys else 'None'}.")
+                    else:
+                        logger.info(f"Successfully loaded model using {model_size} preset configuration.")
+
+                except Exception as inner_e:
+                    logger.warning(f"Error determining model parameters with preset logic: {inner_e}")
+                    logger.warning("Falling back to trying to load with exact vocabulary size and layer count heuristics...")
+                    
                     try:
-                        # Load state dict again
-                        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+                        state_dict = torch.load(model_path, map_location="cpu", weights_only=True) # Reload state_dict
                         
-                        # Extract vocabulary size
-                        vocab_size = state_dict["model.token_embeddings.weight"].size(0)
-                        hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                        vocab_size_exact = state_dict["model.token_embeddings.weight"].size(0)
+                        hidden_size_exact = state_dict["model.token_embeddings.weight"].size(1)
                         
-                        # Count layers
-                        layer_count = 0
+                        layer_count_exact = 0
                         i = 0
                         while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
                                 ["input_layernorm.weight", "attn_norm.weight", 
                                  "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
-                            layer_count += 1
+                            layer_count_exact += 1
                             i += 1
                         
-                        # Check for expert system
-                        use_expert_system = any("feed_forward.feed_forward.experts" in key for key in state_dict.keys())
+                        use_expert_system_exact = any("feed_forward.feed_forward.experts" in key for key in state_dict.keys())
                         
-                        # Create custom configuration
-                        config = ApertisConfig(
-                            vocab_size=vocab_size,
-                            hidden_size=hidden_size,
-                            num_hidden_layers=layer_count,
-                            num_attention_heads=hidden_size // 64,  # Common ratio
-                            intermediate_size=hidden_size * 4,      # Common ratio
-                            use_expert_system=use_expert_system,
-                            multimodal=self.multimodal
-                        )
+                        config_exact_kwargs = {
+                            "vocab_size": vocab_size_exact,
+                            "hidden_size": hidden_size_exact,
+                            "num_hidden_layers": layer_count_exact,
+                            "num_attention_heads": hidden_size_exact // 64,  # Heuristic for head_dim=64
+                            "intermediate_size": hidden_size_exact * 4,      # Heuristic
+                            "use_expert_system": use_expert_system_exact,
+                            "multimodal": self.multimodal
+                        }
                         
-                        # Create model with exact parameters
-                        self.model = ApertisForCausalLM(config)
+                        config_exact = ApertisConfig(**config_exact_kwargs)
+                        self.model = ApertisForCausalLM(config_exact)
                         
-                        # Load state dict
-                        self.model.load_state_dict(state_dict, strict=False)
-                        logger.info(f"Successfully loaded model with exact parameters (vocab={vocab_size}, layers={layer_count})")
-                    except Exception as exact_e:
-                        logger.warning(f"Error loading with exact parameters: {exact_e}")
-                        logger.warning("Falling back to loading with relaxed constraints...")
-                        
-                        # Final fallback: try loading with strict=False
-                        try:
-                            # Load state dict again
-                            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-                            
-                            # Extract vocabulary size and hidden size
-                            if "model.token_embeddings.weight" in state_dict:
-                                vocab_size = state_dict["model.token_embeddings.weight"].size(0)
-                                hidden_size = state_dict["model.token_embeddings.weight"].size(1)
-                            else:
-                                # Default values if can't determine
-                                vocab_size = 32000
-                                hidden_size = 768
-                            
-                            # Create model with detected parameters but default layer count
-                            config = ApertisConfig(
-                                vocab_size=vocab_size,
-                                hidden_size=hidden_size,
-                                use_expert_system=True,  # Try with expert system as last resort
-                                multimodal=self.multimodal
-                            )
-                            
-                            self.model = ApertisForCausalLM(config)
-                            
-                            # Load with strict=False to allow parameter mismatches
-                            self.model.load_state_dict(state_dict, strict=False)
-                            logger.info(f"Loaded model with relaxed constraints (strict=False)")
-                        except Exception as fallback_e:
-                            logger.error(f"All loading attempts failed: {fallback_e}")
-                            # Create a minimal model as absolute fallback
-                            self.model = create_apertis_model(
-                                model_size="small", 
-                                multimodal=self.multimodal,
-                                use_expert_system=False
-                            )
+                        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                        if missing_keys or unexpected_keys:
+                           logger.warning(f"Fallback loading with exact parameters completed with:"
+                                          f" Missing keys: {missing_keys if missing_keys else 'None'}."
+                                          f" Unexpected keys: {unexpected_keys if unexpected_keys else 'None'}.")
+                        else:
+                           logger.info(f"Successfully loaded model with exact parameters (vocab={vocab_size_exact}, layers={layer_count_exact})")
+                    
+                    except Exception as fallback_e:
+                        logger.error(f"All loading attempts for .pt file failed: {fallback_e}")
+                        self.model = create_apertis_model(model_size="small", multimodal=self.multimodal, use_expert_system=False)
             
             # Move model to device
             self.model.to(self.device)
             self.model.eval()
             
-            logger.info("Model loaded successfully")
+            logger.info("Model loading process completed.")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
-            # Create a default model as fallback
             logger.info("Creating default model as fallback")
             self.model = create_apertis_model(model_size="base", multimodal=self.multimodal)
             self.model.to(self.device)
@@ -925,45 +897,58 @@ class ApertisInterface:
                 try:
                     # Save current model settings
                     old_multimodal = self.multimodal
-                    self.multimodal = self.model.config.multimodal if self.model else old_multimodal
-                    
+                    # Attempt to get multimodal status from current model if loaded, else keep old_multimodal
+                    if self.model and hasattr(self.model, 'config'):
+                         self.multimodal = self.model.config.multimodal
+                    else:
+                         self.multimodal = old_multimodal # Keep previous or initial if no model loaded
+
                     # If custom parameters are provided, create a custom configuration
                     if custom_vocab_size > 0 or custom_layer_count > 0 or use_expert_system:
                         # Load state dict to examine structure
                         if os.path.isdir(model_path):
                             state_dict_path = os.path.join(model_path, "model.pt")
+                            if not os.path.exists(state_dict_path):
+                                return "Error: model.pt not found in directory."
                             state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=True)
                         else:
+                            if not os.path.exists(model_path):
+                                return f"Error: Model file not found at {model_path}"
                             state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
                         
                         # Determine parameters
                         if "model.token_embeddings.weight" in state_dict:
+                            base_vocab_size = state_dict["model.token_embeddings.weight"].size(0)
+                            base_hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                            
                             # Use provided vocab size or detect from state dict
-                            vocab_size = custom_vocab_size if custom_vocab_size > 0 else state_dict["model.token_embeddings.weight"].size(0)
-                            hidden_size = state_dict["model.token_embeddings.weight"].size(1)
+                            final_vocab_size = int(custom_vocab_size) if custom_vocab_size > 0 else base_vocab_size
                             
                             # Use provided layer count or detect from state dict
                             if custom_layer_count > 0:
-                                layer_count = custom_layer_count
+                                final_layer_count = int(custom_layer_count)
                             else:
-                                # Count layers
-                                layer_count = 0
+                                final_layer_count = 0
                                 i = 0
                                 while any(f"model.layers.{i}.{suffix}" in state_dict for suffix in 
                                         ["input_layernorm.weight", "attn_norm.weight", 
                                          "attention.layer_norm.weight", "feed_forward.layer_norm.weight"]):
-                                    layer_count += 1
+                                    final_layer_count += 1
                                     i += 1
-                            
+                            if final_layer_count == 0: # If loop didn't run, means state_dict might be malformed or empty
+                                final_layer_count = 12 # Default to base
+                                logger.warning("Could not determine layer count from state_dict, defaulting to 12.")
+
+
                             # Create custom configuration
                             config = ApertisConfig(
-                                vocab_size=vocab_size,
-                                hidden_size=hidden_size,
-                                num_hidden_layers=layer_count,
-                                num_attention_heads=hidden_size // 64,  # Common ratio
-                                intermediate_size=hidden_size * 4,      # Common ratio
+                                vocab_size=final_vocab_size,
+                                hidden_size=base_hidden_size, # Keep detected hidden_size
+                                num_hidden_layers=final_layer_count,
+                                num_attention_heads=base_hidden_size // 64,  # Common ratio
+                                intermediate_size=base_hidden_size * 4,      # Common ratio
                                 use_expert_system=use_expert_system,
-                                multimodal=self.multimodal
+                                multimodal=self.multimodal # Use the potentially updated self.multimodal
                             )
                             
                             # Create model with custom configuration
@@ -976,70 +961,67 @@ class ApertisInterface:
                             self.load_vocabulary(vocab_path)
                             
                             # Get model information
-                            config = self.model.config
+                            loaded_config = self.model.config
                             info = f"Model loaded successfully with custom configuration!\n"
-                            info += f"Model type: {config.model_type}\n"
-                            info += f"Hidden size: {config.hidden_size}\n"
-                            info += f"Layers: {config.num_hidden_layers}\n"
-                            info += f"Attention heads: {config.num_attention_heads}\n"
-                            info += f"Expert system: {config.use_expert_system}\n"
-                            info += f"Model vocabulary size: {config.vocab_size}\n"
+                            info += f"Model type: {loaded_config.model_type}\n"
+                            info += f"Hidden size: {loaded_config.hidden_size}\n"
+                            info += f"Layers: {loaded_config.num_hidden_layers}\n"
+                            info += f"Attention heads: {loaded_config.num_attention_heads}\n"
+                            info += f"Expert system: {loaded_config.use_expert_system}\n"
+                            info += f"Model vocabulary size: {loaded_config.vocab_size}\n"
                             info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}\n"
                             
-                            # Add information about vocabulary adaptation
                             if self.token_mapping is not None and adapt_vocab:
                                 info += f"Vocabulary adaptation: Enabled (mapping between model and loaded vocabulary)\n"
                             else:
                                 info += f"Vocabulary adaptation: Disabled\n"
                             
-                            # Move model to device
                             self.model.to(self.device)
                             self.model.eval()
                             
                             return info
+                        else:
+                            return "Error: Could not determine base parameters from model.token_embeddings.weight in state_dict."
                     
-                    # Standard loading if no custom parameters
-                    self.model = None  # Reset model to ensure clean loading
-                    self.token_mapping = None  # Reset token mapping
+                    # Standard loading if no custom parameters are overriding
+                    self.model = None
+                    self.token_mapping = None
                     
-                    # Load model
-                    self.load_model(model_path)
+                    self.load_model(model_path) # This will use the refined internal logic
                     
-                    # Load vocabulary with adaptation if enabled
                     if not adapt_vocab:
-                        # Temporarily disable token mapping creation
                         original_create_token_mapping = self.create_token_mapping
-                        self.create_token_mapping = lambda *args, **kwargs: None
+                        self.create_token_mapping = lambda *args, **kwargs: None # Temporarily disable
                         self.load_vocabulary(vocab_path)
-                        self.create_token_mapping = original_create_token_mapping
+                        self.create_token_mapping = original_create_token_mapping # Restore
                     else:
                         self.load_vocabulary(vocab_path)
                     
-                    # Restore multimodal setting
-                    self.multimodal = old_multimodal
-                    
-                    # Get model information
+                    self.multimodal = old_multimodal # Restore original multimodal if it wasn't changed by loaded config
+                    if self.model and hasattr(self.model.config, 'multimodal'):
+                         self.multimodal = self.model.config.multimodal
+
+
                     if self.model is not None:
-                        config = self.model.config
+                        loaded_config = self.model.config
                         info = f"Model loaded successfully!\n"
-                        info += f"Model type: {config.model_type}\n"
-                        info += f"Hidden size: {config.hidden_size}\n"
-                        info += f"Layers: {config.num_hidden_layers}\n"
-                        info += f"Attention heads: {config.num_attention_heads}\n"
-                        info += f"Expert system: {config.use_expert_system}\n"
-                        info += f"Model vocabulary size: {config.vocab_size}\n"
+                        info += f"Model type: {loaded_config.model_type}\n"
+                        info += f"Hidden size: {loaded_config.hidden_size}\n"
+                        info += f"Layers: {loaded_config.num_hidden_layers}\n"
+                        info += f"Attention heads: {loaded_config.num_attention_heads}\n"
+                        info += f"Expert system: {loaded_config.use_expert_system}\n"
+                        info += f"Model vocabulary size: {loaded_config.vocab_size}\n"
                         info += f"Loaded vocabulary size: {len(self.vocab) if self.vocab else 'Unknown'}\n"
                         
-                        # Add information about vocabulary adaptation
                         if self.token_mapping is not None and adapt_vocab:
                             info += f"Vocabulary adaptation: Enabled (mapping between model and loaded vocabulary)\n"
                         else:
                             info += f"Vocabulary adaptation: Disabled\n"
-                        
                         return info
                     else:
                         return "Failed to load model."
                 except Exception as e:
+                    logger.error(f"Exception in load_model_handler: {str(e)}", exc_info=True)
                     return f"Error loading model: {str(e)}"
             
             load_model_btn.click(
@@ -1050,41 +1032,47 @@ class ApertisInterface:
             )
             
             # Model creation
-            def create_model_handler(model_size, multimodal, use_expert_system, vocab_size, output_path):
+            def create_model_handler(model_size_select, new_multimodal, new_expert, new_vocab_size, new_output_path):
                 try:
                     # Create custom configuration
+                    _model_presets_create = {
+                        "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+                        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+                        "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
+                    }
+                    preset = _model_presets_create[model_size_select]
+
                     config = ApertisConfig(
-                        vocab_size=int(vocab_size),
-                        hidden_size={"small": 512, "base": 768, "large": 1024}[model_size],
-                        num_hidden_layers={"small": 8, "base": 12, "large": 24}[model_size],
-                        num_attention_heads={"small": 8, "base": 12, "large": 16}[model_size],
-                        intermediate_size={"small": 2048, "base": 3072, "large": 4096}[model_size],
-                        use_expert_system=use_expert_system,
-                        multimodal=multimodal
+                        vocab_size=int(new_vocab_size),
+                        hidden_size=preset["hidden_size"],
+                        num_hidden_layers=preset["num_hidden_layers"],
+                        num_attention_heads=preset["num_attention_heads"],
+                        intermediate_size=preset["intermediate_size"],
+                        use_expert_system=new_expert,
+                        multimodal=new_multimodal
                     )
                     
-                    # Create model
                     model = ApertisForCausalLM(config)
                     
-                    # Create output directory
-                    os.makedirs(output_path, exist_ok=True)
+                    os.makedirs(new_output_path, exist_ok=True)
                     
-                    # Save model
-                    torch.save(model.state_dict(), os.path.join(output_path, "model.pt"))
+                    torch.save(model.state_dict(), os.path.join(new_output_path, "model.pt"))
                     
-                    # Save configuration
-                    with open(os.path.join(output_path, "config.json"), "w") as f:
+                    with open(os.path.join(new_output_path, "config.json"), "w") as f:
                         json.dump(model.config.to_dict(), f, indent=2)
                     
-                    # Create a minimal vocabulary if it doesn't exist
-                    vocab_path = os.path.join(output_path, "vocab.json")
-                    if not os.path.exists(vocab_path):
+                    vocab_p = os.path.join(new_output_path, "vocab.json")
+                    if not os.path.exists(vocab_p):
                         minimal_vocab = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
-                        with open(vocab_path, "w") as f:
+                        # Add more tokens up to vocab_size to make it somewhat usable
+                        for i in range(4, int(new_vocab_size)):
+                            minimal_vocab[f"token_{i}"] = i
+                        with open(vocab_p, "w") as f:
                             json.dump(minimal_vocab, f, indent=2)
                     
-                    return f"Model created successfully at {output_path}"
+                    return f"Model created successfully at {new_output_path}"
                 except Exception as e:
+                    logger.error(f"Exception in create_model_handler: {str(e)}", exc_info=True)
                     return f"Error creating model: {str(e)}"
             
             create_model_btn.click(
@@ -1128,10 +1116,10 @@ class ApertisInterface:
                         else:
                             f.write(vocab_file_ui)
                     
-                    val_path = None
+                    val_p = None # Use different name to avoid conflict with val_data component
                     if val_file is not None:
-                        val_path = os.path.join(temp_dir, "val.jsonl")
-                        with open(val_path, "wb") as f:
+                        val_p = os.path.join(temp_dir, "val.jsonl")
+                        with open(val_p, "wb") as f:
                             if hasattr(val_file, 'name'):
                                 with open(val_file.name, "rb") as source_file:
                                     f.write(source_file.read())
@@ -1141,21 +1129,27 @@ class ApertisInterface:
                     # Process GPU selection
                     selected_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids_ui] if gpu_ids_ui else None
                     
+                    # Get model preset for selected size
+                    _model_presets_train = {
+                        "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+                        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+                        "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
+                    }
+                    model_preset = _model_presets_train[model_size_ui]
+
                     # Create configuration
                     config = {
                         "data_config": {
                             "train_data_path": train_path,
                             "tokenizer_path": vocab_path,
-                            "max_length": 512, # Consider making this configurable
+                            "max_length": 512, 
                             "multimodal": multimodal_ui,
                         },
                         "model_config": {
-                            "hidden_size": {"small": 512, "base": 768, "large": 1024}[model_size_ui],
-                            "num_hidden_layers": {"small": 8, "base": 12, "large": 24}[model_size_ui],
-                            "num_attention_heads": {"small": 8, "base": 12, "large": 16}[model_size_ui],
-                            "intermediate_size": {"small": 2048, "base": 3072, "large": 4096}[model_size_ui],
+                            **model_preset, # Use all params from preset
                             "use_expert_system": expert_system_ui,
                             "multimodal": multimodal_ui,
+                            # vocab_size will be determined by ApertisTrainer from the vocab_file
                         },
                         "training_config": {
                             "output_dir": out_dir_ui,
@@ -1165,11 +1159,11 @@ class ApertisInterface:
                             "eval_every_n_epochs": eval_freq_ui,
                             "use_wandb": use_wb_ui,
                             "wandb_project": wb_project_ui,
-                            "gradient_accumulation_steps": 4, # Consider making this configurable
-                            "fp16": True, # Consider making this configurable
+                            "gradient_accumulation_steps": 4, 
+                            "fp16": True, 
                             "gpu_memory_fraction": gpu_memory_fraction_ui,
-                            "use_gradient_checkpointing": True, # Consider making this configurable
-                            "dynamic_batch_sizing": True, # Consider making this configurable
+                            "use_gradient_checkpointing": True, 
+                            "dynamic_batch_sizing": True, 
                             "checkpoint_steps": checkpoint_freq_ui,
                             "iteration_checkpoint_steps": iter_checkpoint_freq_ui,
                             "gpu_ids": selected_gpu_ids,
@@ -1177,42 +1171,34 @@ class ApertisInterface:
                         },
                     }
                     
-                    # Add validation data if provided
-                    if val_path is not None:
-                        config["data_config"]["val_data_path"] = val_path
+                    if val_p is not None:
+                        config["data_config"]["val_data_path"] = val_p
                     
-                    # Add image directory if provided
                     if multimodal_ui and img_dir:
                         config["data_config"]["image_dir"] = img_dir
                     
-                    # Save configuration
                     config_path = os.path.join(temp_dir, "config.json")
                     with open(config_path, "w") as f:
                         json.dump(config, f, indent=2)
                     
-                    # Start training in a separate thread
                     import threading
                     
                     def train_thread():
                         try:
                             from src.training.pipeline import train_from_config
                             train_from_config(config_path)
-                        except Exception as e:
-                            logger.error(f"Error in training thread: {str(e)}")
+                        except Exception as e_thread:
+                            logger.error(f"Error in training thread: {str(e_thread)}", exc_info=True)
                         finally:
-                            # Clean up temporary directory
-                            # Be careful with shutil.rmtree if multiple trainings are launched
-                            # This is okay for now as temp_dir is unique per call
                             try:
                                 shutil.rmtree(temp_dir)
                             except Exception as e_rm:
                                 logger.error(f"Error removing temp dir {temp_dir}: {e_rm}")
                     
                     thread = threading.Thread(target=train_thread)
-                    thread.daemon = True # Ensure thread exits when main program exits
+                    thread.daemon = True 
                     thread.start()
                     
-                    # Prepare GPU information for output
                     gpu_info = ""
                     if selected_gpu_ids:
                         gpu_info = f"- GPUs: {selected_gpu_ids}\n"
@@ -1224,16 +1210,16 @@ class ApertisInterface:
                     else:
                         gpu_info = "- Using CPU for training\n"
                     
-                    checkpoint_info = ""
+                    checkpoint_info_str = "" # Renamed to avoid conflict
                     if checkpoint_freq_ui > 0:
-                        checkpoint_info += f"- Global step checkpoints: Every {checkpoint_freq_ui} steps\n"
+                        checkpoint_info_str += f"- Global step checkpoints: Every {checkpoint_freq_ui} steps\n"
                     else:
-                        checkpoint_info += "- Global step checkpoints: Disabled\n"
+                        checkpoint_info_str += "- Global step checkpoints: Disabled\n"
                         
                     if iter_checkpoint_freq_ui > 0:
-                        checkpoint_info += f"- Iteration checkpoints: Every {iter_checkpoint_freq_ui} iterations within each epoch\n"
+                        checkpoint_info_str += f"- Iteration checkpoints: Every {iter_checkpoint_freq_ui} iterations within each epoch\n"
                     else:
-                        checkpoint_info += "- Iteration checkpoints: Disabled\n"
+                        checkpoint_info_str += "- Iteration checkpoints: Disabled\n"
 
                     eval_info = ""
                     if eval_freq_ui > 0:
@@ -1247,18 +1233,18 @@ class ApertisInterface:
                            f"- Learning rate: {lr_ui}\n"
                            f"- Epochs: {epochs_ui}\n"
                            f"{gpu_info}"
-                           f"{checkpoint_info}"
+                           f"{checkpoint_info_str}"
                            f"{eval_info}"
                            f"- Output directory: {out_dir_ui}\n\n"
                            f"Training is running in the background. Check the console for progress and logs in '{out_dir_ui}'.")
-                except Exception as e:
-                    # Clean up temp_dir in case of error before thread start
+                except Exception as e_start_train:
                     if 'temp_dir' in locals() and os.path.exists(temp_dir):
                         try:
                             shutil.rmtree(temp_dir)
-                        except Exception as e_rm:
-                            logger.error(f"Error removing temp dir {temp_dir} on failure: {e_rm}")
-                    return f"Error starting training: {str(e)}"
+                        except Exception as e_rm_fail:
+                            logger.error(f"Error removing temp dir {temp_dir} on failure: {e_rm_fail}")
+                    logger.error(f"Exception in start_training: {str(e_start_train)}", exc_info=True)
+                    return f"Error starting training: {str(e_start_train)}"
             
             train_btn.click(
                 start_training,
