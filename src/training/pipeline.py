@@ -215,14 +215,14 @@ class ApertisTrainer:
         fp16: bool = True,
         device: Optional[str] = None,
         checkpoint_steps: int = 1000,
-        iteration_checkpoint_steps: int = 0,  # New parameter for iteration-based checkpoints
+        iteration_checkpoint_steps: int = 0,
         gpu_memory_fraction: float = 0.7,
         use_gradient_checkpointing: bool = True,
-        eval_steps: int = 500,
+        eval_every_n_epochs: int = 1, # Validate after every N epochs (0 to disable)
         dynamic_batch_sizing: bool = True,
-        gpu_ids: Optional[List[int]] = None,  # New parameter for GPU selection
-        distributed_training: bool = False,   # New parameter for multi-GPU training
-        local_rank: int = -1,                 # For distributed training
+        gpu_ids: Optional[List[int]] = None,
+        distributed_training: bool = False,
+        local_rank: int = -1,
     ):
         """
         Initialize the trainer.
@@ -248,7 +248,7 @@ class ApertisTrainer:
             iteration_checkpoint_steps: Save checkpoint every N iterations within an epoch (0 to disable)
             gpu_memory_fraction: Fraction of GPU memory to use
             use_gradient_checkpointing: Whether to use gradient checkpointing
-            eval_steps: Evaluate model every N global steps
+            eval_every_n_epochs: Validate model every N epochs (0 to disable epoch-based validation)
             dynamic_batch_sizing: Whether to dynamically adjust batch size
             gpu_ids: List of GPU IDs to use for training (e.g., [0, 1, 2])
             distributed_training: Whether to use distributed training across multiple GPUs
@@ -273,7 +273,7 @@ class ApertisTrainer:
         self.iteration_checkpoint_steps = iteration_checkpoint_steps
         self.gpu_memory_fraction = gpu_memory_fraction
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.eval_steps = eval_steps
+        self.eval_every_n_epochs = eval_every_n_epochs
         self.dynamic_batch_sizing = dynamic_batch_sizing
         self.gpu_ids = gpu_ids
         self.distributed_training = distributed_training
@@ -413,6 +413,7 @@ class ApertisTrainer:
                     "distributed_training": self.distributed_training,
                     "world_size": self.world_size,
                     "gpu_ids": self.gpu_ids,
+                    "eval_every_n_epochs": self.eval_every_n_epochs,
                 }
             )
     
@@ -528,26 +529,6 @@ class ApertisTrainer:
                                 "global_step": global_step,
                             })
                         
-                        # Evaluate if needed
-                        if self.val_dataloader is not None and global_step > 0 and global_step % self.eval_steps == 0:
-                            val_loss = self.evaluate()
-                            
-                            # Log validation loss
-                            if self.use_wandb and self.is_main_process:
-                                wandb.log({
-                                    "val_loss": val_loss,
-                                    "global_step": global_step,
-                                })
-                            
-                            # Save best model
-                            if val_loss < best_val_loss and self.is_main_process:
-                                best_val_loss = val_loss
-                                self.save_checkpoint(f"best_model")
-                                logger.info(f"New best model saved with validation loss: {val_loss:.4f}")
-                            
-                            # Switch back to training mode
-                            self.model.train()
-                        
                         # Save checkpoint if needed (based on global steps)
                         if self.checkpoint_steps > 0 and global_step % self.checkpoint_steps == 0 and self.is_main_process:
                             self.save_checkpoint(f"step-{global_step}")
@@ -588,8 +569,8 @@ class ApertisTrainer:
             epoch_loss /= len(self.train_dataloader)
             logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Average loss: {epoch_loss:.4f}")
             
-            # Evaluate at the end of each epoch
-            if self.val_dataloader is not None:
+            # Evaluate at the end of each Nth epoch
+            if self.val_dataloader is not None and self.eval_every_n_epochs > 0 and (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss = self.evaluate()
                 
                 # Log validation loss
@@ -664,6 +645,9 @@ class ApertisTrainer:
         val_loss /= len(self.val_dataloader)
         logger.info(f"Validation loss: {val_loss:.4f}")
         
+        # Switch back to training mode (important if evaluate is called mid-training loop, though not strictly necessary here as it's at epoch end)
+        self.model.train()
+        
         return val_loss
     
     def save_checkpoint(self, name: str):
@@ -728,7 +712,7 @@ def train_from_config(config_path: str):
     )
     
     val_dataset = None
-    if "val_data_path" in data_config:
+    if "val_data_path" in data_config and data_config["val_data_path"]:
         val_dataset = ApertisDataset(
             data_path=data_config.get("val_data_path"),
             tokenizer_path=data_config.get("tokenizer_path"),
@@ -777,7 +761,7 @@ def train_from_config(config_path: str):
         iteration_checkpoint_steps=training_config.get("iteration_checkpoint_steps", 0),
         gpu_memory_fraction=training_config.get("gpu_memory_fraction", 0.7),
         use_gradient_checkpointing=training_config.get("use_gradient_checkpointing", True),
-        eval_steps=training_config.get("eval_steps", 500),
+        eval_every_n_epochs=training_config.get("eval_every_n_epochs", 1),
         dynamic_batch_sizing=training_config.get("dynamic_batch_sizing", True),
         gpu_ids=gpu_ids,
         distributed_training=distributed_training,

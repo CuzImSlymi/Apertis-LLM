@@ -678,6 +678,14 @@ class ApertisInterface:
                                 label="Number of Epochs",
                             )
                             
+                            eval_every_n_epochs = gr.Slider(
+                                minimum=0,
+                                maximum=10, 
+                                value=1,
+                                step=1,
+                                label="Evaluate Every N Epochs (0 to disable epoch-end validation)",
+                            )
+
                             # Add checkpoint frequency controls
                             with gr.Accordion("Checkpoint Settings", open=True):
                                 checkpoint_steps = gr.Slider(
@@ -1087,11 +1095,12 @@ class ApertisInterface:
             
             # Training functionality
             def start_training(
-                model_size, multimodal, expert_system,
-                train_file, val_file, vocab_file, img_dir,
-                batch, lr, epochs, checkpoint_freq, iter_checkpoint_freq, 
-                gpu_ids, distributed, gpu_memory_fraction,
-                out_dir, use_wb, wb_project,
+                model_size_ui, multimodal_ui, expert_system_ui,
+                train_file, val_file, vocab_file_ui, img_dir,
+                batch_ui, lr_ui, epochs_ui, eval_freq_ui,
+                checkpoint_freq_ui, iter_checkpoint_freq_ui, 
+                gpu_ids_ui, distributed_ui, gpu_memory_fraction_ui,
+                out_dir_ui, use_wb_ui, wb_project_ui,
             ):
                 try:
                     # Create temporary directory for training files
@@ -1099,66 +1108,72 @@ class ApertisInterface:
                     
                     # Save uploaded files
                     train_path = os.path.join(temp_dir, "train.jsonl")
+                    # Handle cases where train_file might be None or not a file-like object
+                    if train_file is None:
+                        return "Error: Training data file is required."
                     with open(train_path, "wb") as f:
                         if hasattr(train_file, 'name'):  # Handle NamedString objects from Gradio
                             with open(train_file.name, "rb") as source_file:
                                 f.write(source_file.read())
-                        else:
-                            f.write(train_file)
+                        else: # Should not happen with gr.File but good to be safe
+                            f.write(train_file) 
                     
                     vocab_path = os.path.join(temp_dir, "vocab.json")
+                    if vocab_file_ui is None:
+                        return "Error: Vocabulary file is required."
                     with open(vocab_path, "wb") as f:
-                        if hasattr(vocab_file, 'name'):  # Handle NamedString objects from Gradio
-                            with open(vocab_file.name, "rb") as source_file:
+                        if hasattr(vocab_file_ui, 'name'):
+                            with open(vocab_file_ui.name, "rb") as source_file:
                                 f.write(source_file.read())
                         else:
-                            f.write(vocab_file)
+                            f.write(vocab_file_ui)
                     
                     val_path = None
                     if val_file is not None:
                         val_path = os.path.join(temp_dir, "val.jsonl")
                         with open(val_path, "wb") as f:
-                            if hasattr(val_file, 'name'):  # Handle NamedString objects from Gradio
+                            if hasattr(val_file, 'name'):
                                 with open(val_file.name, "rb") as source_file:
                                     f.write(source_file.read())
                             else:
                                 f.write(val_file)
                     
                     # Process GPU selection
-                    selected_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids] if gpu_ids else None
+                    selected_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids_ui] if gpu_ids_ui else None
                     
                     # Create configuration
                     config = {
                         "data_config": {
                             "train_data_path": train_path,
                             "tokenizer_path": vocab_path,
-                            "max_length": 512,
-                            "multimodal": multimodal,
+                            "max_length": 512, # Consider making this configurable
+                            "multimodal": multimodal_ui,
                         },
                         "model_config": {
-                            "hidden_size": {"small": 512, "base": 768, "large": 1024}[model_size],
-                            "num_hidden_layers": {"small": 8, "base": 12, "large": 24}[model_size],
-                            "num_attention_heads": {"small": 8, "base": 12, "large": 16}[model_size],
-                            "intermediate_size": {"small": 2048, "base": 3072, "large": 4096}[model_size],
-                            "use_expert_system": expert_system,
-                            "multimodal": multimodal,
+                            "hidden_size": {"small": 512, "base": 768, "large": 1024}[model_size_ui],
+                            "num_hidden_layers": {"small": 8, "base": 12, "large": 24}[model_size_ui],
+                            "num_attention_heads": {"small": 8, "base": 12, "large": 16}[model_size_ui],
+                            "intermediate_size": {"small": 2048, "base": 3072, "large": 4096}[model_size_ui],
+                            "use_expert_system": expert_system_ui,
+                            "multimodal": multimodal_ui,
                         },
                         "training_config": {
-                            "output_dir": out_dir,
-                            "batch_size": batch,
-                            "learning_rate": lr,
-                            "num_epochs": epochs,
-                            "use_wandb": use_wb,
-                            "wandb_project": wb_project,
-                            "gradient_accumulation_steps": 4,
-                            "fp16": True,
-                            "gpu_memory_fraction": gpu_memory_fraction,
-                            "use_gradient_checkpointing": True,
-                            "dynamic_batch_sizing": True,
-                            "checkpoint_steps": checkpoint_freq,
-                            "iteration_checkpoint_steps": iter_checkpoint_freq,
+                            "output_dir": out_dir_ui,
+                            "batch_size": batch_ui,
+                            "learning_rate": lr_ui,
+                            "num_epochs": epochs_ui,
+                            "eval_every_n_epochs": eval_freq_ui,
+                            "use_wandb": use_wb_ui,
+                            "wandb_project": wb_project_ui,
+                            "gradient_accumulation_steps": 4, # Consider making this configurable
+                            "fp16": True, # Consider making this configurable
+                            "gpu_memory_fraction": gpu_memory_fraction_ui,
+                            "use_gradient_checkpointing": True, # Consider making this configurable
+                            "dynamic_batch_sizing": True, # Consider making this configurable
+                            "checkpoint_steps": checkpoint_freq_ui,
+                            "iteration_checkpoint_steps": iter_checkpoint_freq_ui,
                             "gpu_ids": selected_gpu_ids,
-                            "distributed_training": distributed,
+                            "distributed_training": distributed_ui,
                         },
                     }
                     
@@ -1167,7 +1182,7 @@ class ApertisInterface:
                         config["data_config"]["val_data_path"] = val_path
                     
                     # Add image directory if provided
-                    if multimodal and img_dir:
+                    if multimodal_ui and img_dir:
                         config["data_config"]["image_dir"] = img_dir
                     
                     # Save configuration
@@ -1186,45 +1201,63 @@ class ApertisInterface:
                             logger.error(f"Error in training thread: {str(e)}")
                         finally:
                             # Clean up temporary directory
-                            shutil.rmtree(temp_dir)
+                            # Be careful with shutil.rmtree if multiple trainings are launched
+                            # This is okay for now as temp_dir is unique per call
+                            try:
+                                shutil.rmtree(temp_dir)
+                            except Exception as e_rm:
+                                logger.error(f"Error removing temp dir {temp_dir}: {e_rm}")
                     
                     thread = threading.Thread(target=train_thread)
-                    thread.daemon = True
+                    thread.daemon = True # Ensure thread exits when main program exits
                     thread.start()
                     
                     # Prepare GPU information for output
                     gpu_info = ""
                     if selected_gpu_ids:
                         gpu_info = f"- GPUs: {selected_gpu_ids}\n"
-                        if distributed and len(selected_gpu_ids) > 1:
+                        if distributed_ui and len(selected_gpu_ids) > 1:
                             gpu_info += f"- Distributed training: Enabled\n"
                         elif len(selected_gpu_ids) > 1:
                             gpu_info += f"- Using DataParallel across GPUs\n"
-                        gpu_info += f"- GPU memory fraction: {gpu_memory_fraction}\n"
+                        gpu_info += f"- GPU memory fraction: {gpu_memory_fraction_ui}\n"
                     else:
                         gpu_info = "- Using CPU for training\n"
                     
                     checkpoint_info = ""
-                    if checkpoint_freq > 0:
-                        checkpoint_info += f"- Global step checkpoints: Every {checkpoint_freq} steps\n"
+                    if checkpoint_freq_ui > 0:
+                        checkpoint_info += f"- Global step checkpoints: Every {checkpoint_freq_ui} steps\n"
                     else:
                         checkpoint_info += "- Global step checkpoints: Disabled\n"
                         
-                    if iter_checkpoint_freq > 0:
-                        checkpoint_info += f"- Iteration checkpoints: Every {iter_checkpoint_freq} iterations within each epoch\n"
+                    if iter_checkpoint_freq_ui > 0:
+                        checkpoint_info += f"- Iteration checkpoints: Every {iter_checkpoint_freq_ui} iterations within each epoch\n"
                     else:
                         checkpoint_info += "- Iteration checkpoints: Disabled\n"
+
+                    eval_info = ""
+                    if eval_freq_ui > 0:
+                        eval_info = f"- Validation: Every {eval_freq_ui} epoch(s)\n"
+                    else:
+                        eval_info = f"- Validation: Disabled during epoch loop\n"
                     
-                    return f"Training started with configuration:\n" \
-                           f"- Model: {model_size} {'(multimodal)' if multimodal else ''} {'(expert system)' if expert_system else ''}\n" \
-                           f"- Batch size: {batch}\n" \
-                           f"- Learning rate: {lr}\n" \
-                           f"- Epochs: {epochs}\n" \
-                           f"{gpu_info}" \
-                           f"{checkpoint_info}" \
-                           f"- Output directory: {out_dir}\n\n" \
-                           f"Training is running in the background. Check the console for progress."
+                    return (f"Training started with configuration:\n"
+                           f"- Model: {model_size_ui} {'(multimodal)' if multimodal_ui else ''} {'(expert system)' if expert_system_ui else ''}\n"
+                           f"- Batch size: {batch_ui}\n"
+                           f"- Learning rate: {lr_ui}\n"
+                           f"- Epochs: {epochs_ui}\n"
+                           f"{gpu_info}"
+                           f"{checkpoint_info}"
+                           f"{eval_info}"
+                           f"- Output directory: {out_dir_ui}\n\n"
+                           f"Training is running in the background. Check the console for progress and logs in '{out_dir_ui}'.")
                 except Exception as e:
+                    # Clean up temp_dir in case of error before thread start
+                    if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                        try:
+                            shutil.rmtree(temp_dir)
+                        except Exception as e_rm:
+                            logger.error(f"Error removing temp dir {temp_dir} on failure: {e_rm}")
                     return f"Error starting training: {str(e)}"
             
             train_btn.click(
@@ -1232,7 +1265,7 @@ class ApertisInterface:
                 inputs=[
                     model_size, multimodal_checkbox, use_expert_system,
                     train_data, val_data, vocab_data, image_dir,
-                    batch_size, learning_rate, num_epochs, 
+                    batch_size, learning_rate, num_epochs, eval_every_n_epochs,
                     checkpoint_steps, iteration_checkpoint_steps,
                     gpu_selection, distributed_training, gpu_memory_fraction,
                     output_dir, use_wandb, wandb_project,

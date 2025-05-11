@@ -61,6 +61,7 @@ For multimodal training, include image paths:
    - Batch size
    - Learning rate
    - Number of epochs
+   - Evaluation frequency
    - Output directory
    - Weights & Biases logging (optional)
 
@@ -75,7 +76,7 @@ For advanced users, you can train via the command line:
    python src/apertis_cli.py create-config --output my_config.json
    ```
 
-2. Edit the configuration file to customize settings
+2. Edit the configuration file to customize settings (including `eval_every_n_epochs`).
 
 3. Start training:
    ```bash
@@ -103,6 +104,7 @@ For advanced users, you can train via the command line:
 | batch_size | Number of examples per batch | 4-32 (depends on GPU memory) |
 | learning_rate | Learning rate for optimizer | 1e-5 to 5e-5 |
 | num_epochs | Number of training epochs | 3-10 |
+| eval_every_n_epochs | Frequency of validation at epoch end | 1 (every epoch), N (every N epochs), 0 (disable) |
 | warmup_steps | Steps for learning rate warmup | 10% of total steps |
 | gradient_accumulation_steps | Steps to accumulate gradients | 1-8 |
 | fp16 | Whether to use mixed precision | true (if GPU supports it) |
