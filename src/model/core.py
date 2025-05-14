@@ -6,10 +6,15 @@ import math
 import numpy as np
 import sys
 import os
+from pathlib import Path # IMPORTED Path
 
 # Add the parent directory to the path so we can import the multimodal module
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src.multimodal.module import UnifiedMultimodalEncoder
+
+import logging
+logger = logging.getLogger(__name__)
+
 
 class ApertisConfig:
     """Core configuration for the Apertis architecture."""
@@ -20,10 +25,10 @@ class ApertisConfig:
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
-        intermediate_size: int = 3072,
+        intermediate_size: int = 3072, 
         hidden_act: str = "gelu",
         hidden_dropout_prob: float = 0.1,
-        attention_probs_dropout_prob: float = 0.1,
+        attention_probs_dropout_prob: float = 0.1, 
         max_position_embeddings: int = 2048,
         type_vocab_size: int = 2,
         initializer_range: float = 0.02,
@@ -31,15 +36,20 @@ class ApertisConfig:
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        position_embedding_type: str = "rotary",
+        unk_token_id: int = 3, 
+        position_embedding_type: str = "rotary", 
         use_cache: bool = True,
         classifier_dropout: float = None,
         model_type: str = "apertis",
         tie_word_embeddings: bool = True,
         rope_theta: float = 10000.0,
-        sliding_window: Optional[int] = None,
-        attention_type: str = "selective_linear",
-        use_flash_attention: bool = False,
+        sliding_window: Optional[int] = None, 
+        attention_type: str = "selective_ssm", 
+        ssm_d_inner: Optional[int] = None, 
+        ssm_d_state: int = 16,       
+        ssm_dt_rank: Union[int, str] = "auto", 
+        ssm_conv_kernel: int = 4,    
+        use_flash_attention: bool = False, 
         use_expert_system: bool = False,
         num_experts: int = 8,
         experts_per_token: int = 2,
@@ -49,13 +59,13 @@ class ApertisConfig:
         vision_patch_size: int = 16,
         vision_layers: int = 12,
         vision_heads: int = 12,
-        output_attentions: bool = False,
+        output_attentions: bool = False, 
         output_hidden_states: bool = False,
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
+        self.num_attention_heads = num_attention_heads 
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.hidden_dropout_prob = hidden_dropout_prob
@@ -67,14 +77,24 @@ class ApertisConfig:
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self.unk_token_id = unk_token_id
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
         self.model_type = model_type
         self.tie_word_embeddings = tie_word_embeddings
         self.rope_theta = rope_theta
-        self.sliding_window = sliding_window
+        self.sliding_window = sliding_window 
         self.attention_type = attention_type
+
+        self.ssm_d_inner = ssm_d_inner if ssm_d_inner is not None else 2 * self.hidden_size
+        self.ssm_d_state = ssm_d_state
+        if ssm_dt_rank == "auto":
+            self.ssm_dt_rank = math.ceil(self.hidden_size / 16)
+        else:
+            self.ssm_dt_rank = int(ssm_dt_rank) 
+        self.ssm_conv_kernel = ssm_conv_kernel
+        
         self.use_flash_attention = use_flash_attention
         self.use_expert_system = use_expert_system
         self.num_experts = num_experts
@@ -85,1105 +105,827 @@ class ApertisConfig:
         self.vision_patch_size = vision_patch_size
         self.vision_layers = vision_layers
         self.vision_heads = vision_heads
-        self.output_attentions = output_attentions
+        self.output_attentions = output_attentions 
         self.output_hidden_states = output_hidden_states
 
     @classmethod
     def from_dict(cls, config_dict):
-        """Create a configuration from a dictionary."""
-        return cls(**config_dict)
+        import inspect
+        sig = inspect.signature(cls.__init__)
+        valid_keys = {param.name for param in sig.parameters.values() if param.kind == param.POSITIONAL_OR_KEYWORD}
+        filtered_config_dict = {k: v for k, v in config_dict.items() if k in valid_keys}
+        return cls(**filtered_config_dict)
     
     def to_dict(self):
-        """Convert configuration to dictionary."""
         return self.__dict__
     
     @classmethod
-    def from_pretrained(cls, model_name_or_path):
-        """Load configuration from a pretrained model path."""
+    def from_pretrained(cls, model_name_or_path: str):
         import json
-        import os
         
+        config_file_path_str = ""
         if os.path.isdir(model_name_or_path):
-            config_file = os.path.join(model_name_or_path, "config.json")
-        else:
-            config_file = model_name_or_path
-            
-        with open(config_file, "r") as f:
+            config_file_path_str = os.path.join(model_name_or_path, "config.json")
+        elif os.path.isfile(model_name_or_path): 
+            config_file_path_str = model_name_or_path
+        
+        if not os.path.exists(config_file_path_str) and os.path.isdir(model_name_or_path):
+            parent_dir_config_file = os.path.join(Path(model_name_or_path).parent, "config.json")
+            if os.path.exists(parent_dir_config_file):
+                config_file_path_str = parent_dir_config_file
+        
+        if not os.path.exists(config_file_path_str):
+            raise FileNotFoundError(f"Config file not found in {model_name_or_path} or its direct parent (if a directory). Looked for: {config_file_path_str}")
+
+        with open(config_file_path_str, "r", encoding="utf-8") as f:
             config_dict = json.load(f)
             
         return cls.from_dict(config_dict)
     
-    def save_pretrained(self, save_directory):
-        """Save configuration to a directory."""
+    def save_pretrained(self, save_directory: str):
         import json
-        import os
-        
         os.makedirs(save_directory, exist_ok=True)
         config_file = os.path.join(save_directory, "config.json")
-        
-        with open(config_file, "w") as f:
+        with open(config_file, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary positional embeddings (RoPE)."""
-    
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: int = 10000):
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE dimension must be even, got {dim}")
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
-        # x: [batch_size, seq_len, num_heads, head_dim]
-        # position_ids: [batch_size, seq_len]
-        
-        # Create sinusoidal pattern
-        seq_len = position_ids.shape[1]
-        position_ids = position_ids.view(-1, seq_len)
-        
-        # [seq_len]
-        sincos_pos = torch.einsum("i,j->ij", position_ids.float(), self.inv_freq)
-        
-        # [batch_size, seq_len, dim//2]
-        sin, cos = torch.sin(sincos_pos), torch.cos(sincos_pos)
-        
-        # Reshape for broadcasting
-        sin = sin.unsqueeze(2)  # [batch_size, seq_len, 1, dim//2]
-        cos = cos.unsqueeze(2)  # [batch_size, seq_len, 1, dim//2]
-        
-        # Apply rotary embeddings
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        
-        # Rotate x by multiplying with cos and sin
-        rotated_x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-        
-        return rotated_x
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq) 
+        cos_cached = freqs.cos() 
+        sin_cached = freqs.sin() 
+        self.register_buffer("cos_cached", cos_cached.unsqueeze(0).unsqueeze(2), persistent=False) 
+        self.register_buffer("sin_cached", sin_cached.unsqueeze(0).unsqueeze(2), persistent=False) 
 
 
-class SelectiveLinearAttention(nn.Module):
-    """Selective Linear Attention mechanism for O(n) time complexity."""
-    
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        attention_dropout: float = 0.1,
-        sliding_window: Optional[int] = None,
-    ):
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None):
+        if seq_len is None:
+            seq_len = x.shape[-2] 
+
+        cos = self.cos_cached[:, :seq_len, ...] 
+        sin = self.sin_cached[:, :seq_len, ...] 
+
+        if x.ndim == 3: 
+            cos = cos.squeeze(2) 
+            sin = sin.squeeze(2) 
+        
+        x_reshaped = x.float().reshape(*x.shape[:-1], -1, 2) 
+        x1 = x_reshaped[..., 0] 
+        x2 = x_reshaped[..., 1] 
+        
+        rotated_x_part1 = x1 * cos - x2 * sin
+        rotated_x_part2 = x1 * sin + x2 * cos
+        
+        x_out = torch.empty_like(x)
+        x_out[..., 0::2] = rotated_x_part1
+        x_out[..., 1::2] = rotated_x_part2
+        
+        return x_out.type_as(x)
+
+
+class SelectiveLinearAttention(nn.Module): 
+    def __init__(self, config: ApertisConfig): 
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.attention_dropout = attention_dropout
-        self.sliding_window = sliding_window
+
+        self.hidden_size = config.hidden_size      
+        self.num_heads = config.num_attention_heads 
+        self.d_inner = config.ssm_d_inner
+        self.d_state = config.ssm_d_state          
+        self.dt_rank = config.ssm_dt_rank
+        self.conv_kernel_size = config.ssm_conv_kernel
         
-        self.head_dim = hidden_size // num_attention_heads
-        self.scaling = self.head_dim ** -0.5
+        if self.d_inner % self.num_heads != 0:
+            logger.warning(f"SSM d_inner ({self.d_inner}) not divisible by num_heads ({self.num_heads}). This configuration might lead to issues with head dimension calculations if not handled carefully downstream.")
+        self.head_d_inner = self.d_inner // self.num_heads
         
-        # Linear projections
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.o_proj = nn.Linear(hidden_size, hidden_size)
+        self.in_proj_x = nn.Linear(self.hidden_size, self.d_inner, bias=False)
+        self.in_proj_z = nn.Linear(self.hidden_size, self.d_inner, bias=False)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner, out_channels=self.d_inner,
+            kernel_size=self.conv_kernel_size, groups=self.d_inner,
+            padding=(self.conv_kernel_size - 1)
+        )
+
+        self.x_param_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.num_heads * self.d_state, bias=False)
         
-        # Dropout
-        self.dropout = nn.Dropout(attention_dropout)
+        self.dt_proj_head = nn.Linear(self.dt_rank, self.num_heads, bias=True)
+        torch.nn.init.uniform_(self.dt_proj_head.bias, a=math.log(1e-3), b=math.log(1e-2))
+
+        self.A_log = nn.Parameter(torch.empty(self.num_heads, self.d_state))
+        torch.nn.init.xavier_uniform_(self.A_log) 
+
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_proj = nn.Linear(self.d_inner, self.hidden_size, bias=False)
         
-        # Layer normalization for improved stability
-        self.layer_norm_q = nn.LayerNorm(hidden_size)
-        self.layer_norm_k = nn.LayerNorm(hidden_size)
-        self.layer_norm_v = nn.LayerNorm(hidden_size)
+        self.use_cache = False 
+        self.conv_state = None
+        self.ssm_state = None
+
+    def _ssm_pytorch_scan(self, u, delta, A_log_resolved, B, C, ssm_state_prev=None):
+        B_b, H_b, L_b, D_head_inner_ignored = u.shape 
+        N_state_b = A_log_resolved.shape[-1]       
+
+        A_cont_diag = torch.exp(A_log_resolved).neg() 
         
-        # Recurrent state for efficient processing
-        self.register_buffer("state_k", None, persistent=False)
-        self.register_buffer("state_v", None, persistent=False)
+        delta_A = delta * A_cont_diag.unsqueeze(0).unsqueeze(2)
+        A_bar = torch.exp(delta_A) 
+
+        if self.use_cache and ssm_state_prev is not None:
+            h = ssm_state_prev 
+        else:
+            h = torch.zeros(B_b, H_b, N_state_b, device=u.device, dtype=u.dtype)
+
+        ys = []
+        for i in range(L_b):
+            h = A_bar[:,:,i,:] * h + B[:,:,i,:] 
+            ys.append(C[:,:,i,:] * h) 
+
+        y_stacked = torch.stack(ys, dim=2) 
         
-    def _reset_state(self):
-        self.state_k = None
-        self.state_v = None
+        new_ssm_state = h.detach() if self.use_cache else None
         
+        if self.use_cache: return y_stacked, new_ssm_state
+        else: return y_stacked
+
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        batch_size, seq_len, _ = hidden_states.shape
+        self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,  
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+        output_attentions: bool = False, use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         
-        # Apply layer normalization for improved stability
-        normalized_hidden_states = hidden_states
+        self.use_cache = use_cache
+        B, L, D_hidden = hidden_states.shape 
         
-        # Project inputs to queries, keys, and values with layer norm
-        query_states = self.q_proj(self.layer_norm_q(normalized_hidden_states)) * self.scaling
-        key_states = self.k_proj(self.layer_norm_k(normalized_hidden_states))
-        value_states = self.v_proj(self.layer_norm_v(normalized_hidden_states))
-        
-        # Reshape for multi-head attention
-        query_states = query_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        
-        # Handle past key values
+        conv_state_prev, ssm_state_prev = None, None
         if past_key_value is not None:
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-            
-        past_key_value = (key_states, value_states) if use_cache else None
+            conv_state_prev, ssm_state_prev = past_key_value
+
+        x = self.in_proj_x(hidden_states) 
+        z = self.in_proj_z(hidden_states) 
+
+        x_t = x.transpose(1, 2) 
+        if conv_state_prev is not None and use_cache:
+            if conv_state_prev.shape[2] == self.conv_kernel_size -1 : 
+                 x_t = torch.cat([conv_state_prev, x_t], dim=2)
+            else:
+                 logger.warning(f"Mismatched conv_state shape: {conv_state_prev.shape}, expected K-1={self.conv_kernel_size-1}")
+
+        current_conv_state = x_t[:, :, -(self.conv_kernel_size - 1):].detach() if use_cache else None
         
-        # Apply sliding window if specified
-        if self.sliding_window is not None and key_states.shape[2] > self.sliding_window:
-            key_states = key_states[:, :, -self.sliding_window:]
-            value_states = value_states[:, :, -self.sliding_window:]
+        x_conv = self.conv1d(x_t)[:, :, :L] 
+        x_conv = x_conv.transpose(1, 2) 
+        x_activated = F.silu(x_conv)    
+
+        x_params = self.x_param_proj(x_activated)
         
-        # Compute attention with linear complexity using optimized selective scan
-        attn_output = self._selective_scan(query_states, key_states, value_states, attention_mask)
+        dt_rank_features, B_C_params = torch.split(x_params, [self.dt_rank, 2 * self.num_heads * self.d_state], dim=-1)
+        B_params, C_params = torch.split(B_C_params, [self.num_heads * self.d_state, self.num_heads * self.d_state], dim=-1)
         
-        # Reshape back to original dimensions
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        delta_logit = self.dt_proj_head(dt_rank_features) 
+        delta = F.softplus(delta_logit).transpose(1,2).unsqueeze(-1) 
+
+        B_ssm = B_params.view(B, L, self.num_heads, self.d_state).transpose(1,2) 
+        C_ssm = C_params.view(B, L, self.num_heads, self.d_state).transpose(1,2) 
         
-        # Final projection
-        attn_output = self.o_proj(attn_output)
+        u_scan = x_activated.view(B, L, self.num_heads, self.head_d_inner).transpose(1,2)
         
-        return attn_output, None, past_key_value
-    
-    def _selective_scan(
-        self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Improved efficient linear attention implementation
-        # Using the recurrent formulation: h_t = (1-α_t)h_{t-1} + α_t v_t
-        # with optimized memory access patterns
+        scan_output = self._ssm_pytorch_scan(u_scan, delta, self.A_log, B_ssm, C_ssm, ssm_state_prev)
         
-        batch_size, num_heads, seq_len, head_dim = query_states.shape
+        y_ssm, current_ssm_state = None, None
+        if use_cache:
+            y_ssm, current_ssm_state = scan_output
+        else:
+            y_ssm = scan_output 
+
+        y_ssm_permuted = y_ssm.transpose(1,2).contiguous().view(B, L, self.num_heads * self.d_state)
         
-        # Apply chunking for better cache locality
-        # Use dynamic chunk size that matches the sequence length dimensions
-        # This ensures tensor dimensions are compatible during training
-        chunk_size = seq_len  # Use full sequence length to avoid dimension mismatch
+        y_ssm_for_gating = y_ssm_permuted
+        if y_ssm_permuted.shape[-1] != z.shape[-1]:
+            if not hasattr(self, "_y_to_z_proj"):
+                self._y_to_z_proj = nn.Linear(y_ssm_permuted.shape[-1], z.shape[-1], device=z.device, dtype=z.dtype)
+                logger.warning(f"SSM output dim {y_ssm_permuted.shape[-1]} (H*N) != z dim {z.shape[-1]} (d_inner). Adding dynamic projection.")
+            y_ssm_for_gating = self._y_to_z_proj(y_ssm_permuted)
         
-        # Initialize output tensor
-        attn_output = torch.zeros_like(query_states)
+        y_ssm_out_plus_D_times_x = y_ssm_for_gating + self.D.unsqueeze(0).unsqueeze(0) * x_activated
+        output_gated_with_D = y_ssm_out_plus_D_times_x * F.silu(z)
+        attn_output = self.out_proj(output_gated_with_D)
+
+        present_kv_cache = None
+        if use_cache:
+            present_kv_cache = (current_conv_state, current_ssm_state)
         
-        # Compute full attention in one go for compatibility
-        # Compute query-key similarities
-        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2))
-        
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        
-        # Apply softmax to get attention probabilities
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Compute weighted sum of values
-        attn_output = torch.matmul(attn_weights, value_states)
-        
-        return attn_output
+        return attn_output, y_ssm_permuted if output_attentions else None, present_kv_cache
 
 
 class AdaptiveExpertSystem(nn.Module):
-    """Adaptive Expert System (AES) for efficient parameter usage."""
-    
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int = 8,
-        experts_per_token: int = 2,
-        activation_function: str = "gelu",
-    ):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int = 8, experts_per_token: int = 2, activation_function: str = "gelu"):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
-        self.experts_per_token = experts_per_token
-        
-        # Router for selecting experts with layer normalization for stability
+        self.experts_per_token = min(num_experts, experts_per_token) 
+
         self.router_norm = nn.LayerNorm(hidden_size)
         self.router = nn.Linear(hidden_size, num_experts)
         
-        # Expert feed-forward networks with improved architecture
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(hidden_size),
                 nn.Linear(hidden_size, intermediate_size),
                 self._get_activation_fn(activation_function),
-                nn.Dropout(0.1),  # Add dropout for regularization
+                nn.Dropout(0.1), 
                 nn.Linear(intermediate_size, hidden_size)
-            )
-            for _ in range(num_experts)
+            ) for _ in range(num_experts)
         ])
         
-        # Output layer normalization
-        self.output_norm = nn.LayerNorm(hidden_size)
-        
-    def _get_activation_fn(self, activation_function: str):
-        if activation_function == "gelu":
-            return nn.GELU()
-        elif activation_function == "relu":
-            return nn.ReLU()
-        elif activation_function == "silu" or activation_function == "swish":
-            return nn.SiLU()
-        else:
-            raise ValueError(f"Unsupported activation function: {activation_function}")
+    def _get_activation_fn(self, act_fn_str: str):
+        if act_fn_str == "gelu": return nn.GELU()
+        elif act_fn_str == "relu": return nn.ReLU()
+        elif act_fn_str == "silu" or act_fn_str == "swish": return nn.SiLU()
+        raise ValueError(f"Unsupported activation: {act_fn_str}")
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_size = hidden_states.shape
+        B, L, D = hidden_states.shape
         
-        # Compute routing probabilities with layer normalization
         normalized_hidden = self.router_norm(hidden_states)
-        router_logits = self.router(normalized_hidden)  # [batch_size, seq_len, num_experts]
+        router_logits = self.router(normalized_hidden).float() 
         
-        # Select top-k experts
-        routing_weights, selected_experts = torch.topk(
-            router_logits, self.experts_per_token, dim=-1
-        )  # [batch_size, seq_len, experts_per_token]
+        routing_weights, selected_indices = torch.topk(router_logits, self.experts_per_token, dim=-1)
+        routing_weights = F.softmax(routing_weights, dim=-1).to(hidden_states.dtype) 
         
-        # Normalize routing weights with softmax
-        routing_weights = F.softmax(routing_weights, dim=-1)
+        final_output = torch.zeros_like(hidden_states)
         
-        # Initialize output tensor
-        expert_outputs = torch.zeros_like(hidden_states)
-        
-        # Vectorized implementation for better efficiency
-        # Process in batches for better parallelism
-        for k in range(self.experts_per_token):
-            # Extract expert indices and weights for this k
-            expert_indices = selected_experts[:, :, k]  # [batch_size, seq_len]
-            expert_weights = routing_weights[:, :, k].unsqueeze(-1)  # [batch_size, seq_len, 1]
+        for k_idx in range(self.experts_per_token):
+            expert_indices_for_slot_k = selected_indices[:, :, k_idx] 
+            weights_for_slot_k = routing_weights[:, :, k_idx].unsqueeze(-1)
             
-            # Process each expert in parallel
-            for expert_idx in range(self.num_experts):
-                # Create a mask for tokens that use this expert
-                mask = (expert_indices == expert_idx).unsqueeze(-1)  # [batch_size, seq_len, 1]
-                
+            for expert_actual_idx in range(self.num_experts):
+                mask = (expert_indices_for_slot_k == expert_actual_idx) 
                 if mask.any():
-                    # Apply the expert to all tokens (will be masked later)
-                    expert_output = self.experts[expert_idx](hidden_states)
-                    
-                    # Only add the output for tokens that selected this expert
-                    expert_outputs += mask.float() * expert_weights * expert_output
-        
-        # Apply output normalization
-        expert_outputs = self.output_norm(expert_outputs)
-        
-        return expert_outputs
+                    selected_hidden_states = hidden_states[mask]
+                    if selected_hidden_states.shape[0] > 0: 
+                        expert_out = self.experts[expert_actual_idx](selected_hidden_states)
+                        current_expert_weights = weights_for_slot_k[mask]
+                        final_output[mask] += current_expert_weights * expert_out
+        return final_output
 
 
-class StateTrackingRecurrentCell(nn.Module):
-    """State Tracking Recurrent Cell (STRC) for efficient inference."""
-    
+class StateTrackingRecurrentCell(nn.Module): 
     def __init__(self, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
-        
-        # Recurrent cell parameters with improved architecture
         self.input_norm = nn.LayerNorm(hidden_size)
         self.state_norm = nn.LayerNorm(hidden_size)
-        
-        self.update_gate = nn.Linear(2 * hidden_size, hidden_size)
-        self.reset_gate = nn.Linear(2 * hidden_size, hidden_size)
-        self.output_gate = nn.Linear(2 * hidden_size, hidden_size)
-        
-        # Layer normalization for outputs
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        
-        # Dropout for regularization
+        self.update_gate_fc = nn.Linear(2 * hidden_size, hidden_size) 
+        self.reset_gate_fc = nn.Linear(2 * hidden_size, hidden_size)  
+        self.candidate_fc = nn.Linear(2 * hidden_size, hidden_size)   
+        self.output_layer_norm = nn.LayerNorm(hidden_size) 
         self.dropout = nn.Dropout(0.1)
         
-    def forward(
-        self,
-        input_states: torch.Tensor,
-        hidden_states: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Initialize hidden states if not provided
-        batch_size, seq_len, hidden_size = input_states.shape
-        if hidden_states is None:
-            hidden_states = torch.zeros(batch_size, hidden_size, device=input_states.device)
+    def forward(self, x_seq: torch.Tensor, h_prev: Optional[torch.Tensor]=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D_ = x_seq.shape
+        if h_prev is None: h_prev = torch.zeros(B, D_, device=x_seq.device, dtype=x_seq.dtype)
         
-        # Apply layer normalization
-        normalized_input = self.input_norm(input_states)
-        normalized_hidden = self.state_norm(hidden_states.unsqueeze(1))
-        
-        # Process sequence step by step
         outputs = []
-        for t in range(seq_len):
-            # Get current input
-            x_t = normalized_input[:, t]
+        h_t = h_prev
+        for t in range(L):
+            x_t = self.input_norm(x_seq[:, t, :])
+            h_prev_norm_t = self.state_norm(h_t)
             
-            # Concatenate input and hidden state
-            combined = torch.cat([x_t, normalized_hidden.squeeze(1)], dim=-1)
+            combined_zur = torch.cat([x_t, h_prev_norm_t], dim=1)
+            z_t = torch.sigmoid(self.update_gate_fc(combined_zur))
+            r_t = torch.sigmoid(self.reset_gate_fc(combined_zur))
             
-            # Compute gates
-            update = torch.sigmoid(self.update_gate(combined))
-            reset = torch.sigmoid(self.reset_gate(combined))
+            combined_hcand = torch.cat([x_t, r_t * h_prev_norm_t], dim=1)
+            h_cand_t = torch.tanh(self.candidate_fc(combined_hcand))
             
-            # Compute candidate hidden state
-            candidate = torch.tanh(
-                self.output_gate(
-                    torch.cat([x_t, reset * normalized_hidden.squeeze(1)], dim=-1)
-                )
-            )
+            h_t = (1 - z_t) * h_t + z_t * h_cand_t
+            h_t = self.dropout(h_t)
+            outputs.append(self.output_layer_norm(h_t))
             
-            # Update hidden state
-            hidden_states = (1 - update) * hidden_states + update * candidate
-            normalized_hidden = self.state_norm(hidden_states.unsqueeze(1))
-            
-            # Apply dropout
-            hidden_states = self.dropout(hidden_states)
-            
-            # Collect output
-            outputs.append(hidden_states)
-        
-        # Stack outputs
-        outputs = torch.stack(outputs, dim=1)
-        
-        # Apply layer normalization
-        outputs = self.layer_norm(outputs)
-        
-        return outputs
+        return torch.stack(outputs, dim=1), h_t
 
 
 class ApertisAttention(nn.Module):
-    """Attention module for Apertis architecture."""
-    
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        
-        # Choose attention implementation based on configuration
-        if config.attention_type == "selective_linear":
-            self.attention = SelectiveLinearAttention(
-                hidden_size=config.hidden_size,
-                num_attention_heads=config.num_attention_heads,
-                attention_dropout=config.attention_probs_dropout_prob,
-                sliding_window=config.sliding_window,
-            )
+        if config.attention_type == "selective_ssm" or config.attention_type == "selective_linear": 
+            if config.attention_type == "selective_linear":
+                 logger.warning("Config: 'selective_linear' aliased to 'selective_ssm'.")
+            self.attention_mechanism = SelectiveLinearAttention(config=config) 
         else:
-            # Default to standard attention
-            self.attention = nn.MultiheadAttention(
-                embed_dim=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                dropout=config.attention_probs_dropout_prob,
-                batch_first=True,
+            logger.warning(f"Config: Using standard nn.MultiheadAttention for attention_type='{config.attention_type}'.")
+            self.attention_mechanism = nn.MultiheadAttention(
+                config.hidden_size, config.num_attention_heads, 
+                dropout=config.attention_probs_dropout_prob, batch_first=True
             )
-            
-        # Rotary position embeddings
-        if config.position_embedding_type == "rotary":
-            self.rotary_embeddings = RotaryEmbedding(
-                dim=config.hidden_size // config.num_attention_heads,
-                max_position_embeddings=config.max_position_embeddings,
-                base=config.rope_theta,
-            )
-        else:
-            self.rotary_embeddings = None
-        
-        # Output projection and dropout
-        self.output_projection = nn.Linear(config.hidden_size, config.hidden_size)
-        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
-        
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # Apply layer normalization
-        residual = hidden_states
-        hidden_states = self.layer_norm(hidden_states)
-        
-        # Process with attention mechanism
-        if isinstance(self.attention, SelectiveLinearAttention):
-            # Use selective linear attention
-            hidden_states, attn_weights, past_key_value = self.attention(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-        else:
-            # Use standard attention
-            # Prepare key padding mask from attention mask
-            key_padding_mask = None
-            if attention_mask is not None:
-                key_padding_mask = attention_mask == 0
-            
-            # Apply standard attention
-            hidden_states, attn_weights = self.attention(
-                query=hidden_states,
-                key=hidden_states,
-                value=hidden_states,
-                key_padding_mask=key_padding_mask,
-                need_weights=output_attentions,
-            )
-            
-            past_key_value = None
-        
-        # Apply output projection and dropout
-        hidden_states = self.output_projection(hidden_states)
-        hidden_states = self.output_dropout(hidden_states)
-        
-        # Add residual connection
-        hidden_states = hidden_states + residual
-        
-        return hidden_states, attn_weights, past_key_value
+            self.mha_o_proj = nn.Linear(config.hidden_size, config.hidden_size)
 
+        self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) 
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_s: torch.Tensor, att_mask: Optional[torch.Tensor]=None, 
+                pos_ids: Optional[torch.Tensor]=None, past_kv: Optional[Any]=None, 
+                output_att: bool=False, use_c: bool=False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
+        
+        residual = hidden_s
+        normed_hidden_s = self.pre_norm(hidden_s)
+        
+        att_out, att_weights_proxy, present_cache = None, None, None
+
+        if isinstance(self.attention_mechanism, SelectiveLinearAttention): 
+            att_out, att_weights_proxy, present_cache = self.attention_mechanism(
+                normed_hidden_s, attention_mask=att_mask, 
+                position_ids=pos_ids, past_key_value=past_kv, 
+                output_attentions=output_att, use_cache=use_c
+            )
+        elif isinstance(self.attention_mechanism, nn.MultiheadAttention):
+            key_padding_mask_bool = None
+            if att_mask is not None: 
+                if att_mask.ndim == 4:
+                    key_padding_mask_bool = (att_mask.squeeze(1).squeeze(1) < -1e4) 
+                elif att_mask.ndim == 2: 
+                    key_padding_mask_bool = (att_mask == 0)
+
+            att_out, att_weights_proxy = self.attention_mechanism(
+                normed_hidden_s, normed_hidden_s, normed_hidden_s, 
+                key_padding_mask=key_padding_mask_bool, 
+                need_weights=output_att
+            )
+            att_out = self.mha_o_proj(att_out)
+        else:
+            raise TypeError(f"Unknown attention mechanism type: {type(self.attention_mechanism)}")
+
+        dropped_att_out = self.output_dropout(att_out)
+        final_out = dropped_att_out + residual
+        return final_out, att_weights_proxy, present_cache
 
 class ApertisFeedForward(nn.Module):
-    """Feed-forward module for Apertis architecture."""
-    
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        
         self.config = config
-        
-        # Choose implementation based on configuration
+        self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         if config.use_expert_system:
-            self.feed_forward = AdaptiveExpertSystem(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                num_experts=config.num_experts,
-                experts_per_token=config.experts_per_token,
-                activation_function=config.hidden_act,
+            self.ffn = AdaptiveExpertSystem(
+                config.hidden_size, config.intermediate_size, config.num_experts,
+                config.experts_per_token, config.hidden_act
             )
         else:
-            # Standard feed-forward network
-            self.feed_forward = nn.Sequential(
-                nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            self.ffn = nn.Sequential(
                 nn.Linear(config.hidden_size, config.intermediate_size),
                 self._get_activation_fn(config.hidden_act),
-                nn.Dropout(config.hidden_dropout_prob),
+                nn.Dropout(config.hidden_dropout_prob), 
                 nn.Linear(config.intermediate_size, config.hidden_size),
             )
-        
-        # Output dropout
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
         
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-    def _get_activation_fn(self, activation_function: str):
-        if activation_function == "gelu":
-            return nn.GELU()
-        elif activation_function == "relu":
-            return nn.ReLU()
-        elif activation_function == "silu" or activation_function == "swish":
-            return nn.SiLU()
-        else:
-            raise ValueError(f"Unsupported activation function: {activation_function}")
+    def _get_activation_fn(self, act_fn_str: str): 
+        if act_fn_str == "gelu": return nn.GELU()
+        elif act_fn_str == "relu": return nn.ReLU()
+        elif act_fn_str == "silu" or act_fn_str == "swish": return nn.SiLU()
+        return nn.GELU() 
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Apply layer normalization
-        residual = hidden_states
-        
-        # Process with feed-forward network
-        if isinstance(self.feed_forward, AdaptiveExpertSystem):
-            # Use adaptive expert system
-            hidden_states = self.feed_forward(hidden_states)
-        else:
-            # Use standard feed-forward network
-            hidden_states = self.feed_forward(hidden_states)
-        
-        # Apply output dropout
-        hidden_states = self.output_dropout(hidden_states)
-        
-        # Add residual connection
-        hidden_states = hidden_states + residual
-        
-        return hidden_states
-
+    def forward(self, hidden_s: torch.Tensor) -> torch.Tensor:
+        residual = hidden_s
+        normed_hidden_s = self.pre_norm(hidden_s)
+        ffn_out = self.ffn(normed_hidden_s)
+        dropped_ffn_out = self.output_dropout(ffn_out)
+        return dropped_ffn_out + residual
 
 class ApertisLayer(nn.Module):
-    """Transformer layer for Apertis architecture."""
-    
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        
         self.config = config
-        
-        # Attention module
         self.attention = ApertisAttention(config)
-        
-        # Feed-forward module
         self.feed_forward = ApertisFeedForward(config)
-        
-        # State tracking for efficient inference
-        if hasattr(config, "use_state_tracking") and config.use_state_tracking:
-            self.state_tracking = StateTrackingRecurrentCell(config.hidden_size)
-        else:
-            self.state_tracking = None
-        
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # Process with attention
-        attention_output, attn_weights, past_key_value = self.attention(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-        )
-        
-        # Process with feed-forward network
-        layer_output = self.feed_forward(attention_output)
-        
-        # Apply state tracking if enabled
-        if self.state_tracking is not None:
-            layer_output = self.state_tracking(layer_output)
-        
-        return layer_output, attn_weights, past_key_value
+        self.rope = None
+        if config.position_embedding_type == "rotary":
+            self.rope = RotaryEmbedding(config.hidden_size, config.max_position_embeddings, config.rope_theta)
 
+
+    def forward(self, hidden_s: torch.Tensor, att_mask: Optional[torch.Tensor]=None, 
+                pos_ids: Optional[torch.Tensor]=None, past_kv: Optional[Any]=None, 
+                output_att: bool=False, use_c: bool=False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
+        
+        x_for_attn = hidden_s
+        if self.rope: 
+             x_for_attn = self.rope(hidden_s) 
+
+
+        att_out, att_w, present_att_cache = self.attention(
+            x_for_attn, att_mask, pos_ids, past_kv, output_att, use_c
+        )
+        layer_out = self.feed_forward(att_out)
+        return layer_out, att_w, present_att_cache
 
 class ApertisModel(nn.Module):
-    """Base model for Apertis architecture."""
-    
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        
         self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         
-        # Token embeddings
-        self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.abs_pos_embeddings = None 
+        if config.position_embedding_type == "absolute":
+            self.abs_pos_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         
-        # Multimodal encoder if enabled
+        self.multimodal_encoder = None 
+        self.vision_projection = nn.Identity() 
         if config.multimodal:
-            self.multimodal_encoder = UnifiedMultimodalEncoder(
-                image_size=config.image_size,
-                patch_size=config.vision_patch_size,
-                embed_dim=config.vision_embed_dim,
-                depth=config.vision_layers,
-                num_heads=config.vision_heads,
-                output_dim=config.hidden_size,
-            )
-        else:
-            self.multimodal_encoder = None
+            self.multimodal_encoder = UnifiedMultimodalEncoder(config) 
+            if config.vision_embed_dim != config.hidden_size:
+                self.vision_projection = nn.Linear(config.vision_embed_dim, config.hidden_size)
         
-        # Transformer layers
-        self.layers = nn.ModuleList([
-            ApertisLayer(config)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList([ApertisLayer(config) for _ in range(config.num_hidden_layers)])
+        self.final_post_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) 
+        self.embed_dropout = nn.Dropout(config.hidden_dropout_prob) 
         
-        # Final layer normalization
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-        # Dropout
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        
-        # Initialize weights
         self.apply(self._init_weights)
-        
-        # Enable gradient checkpointing for memory efficiency
-        self.gradient_checkpointing_enable = self._gradient_checkpointing_enable
+        self.gradient_checkpointing = False
         
     def _init_weights(self, module):
-        """Initialize the weights."""
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
+            if module.bias is not None: module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            if module.padding_idx is not None: module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-    
-    def _gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory efficiency."""
-        self.gradient_checkpointing = True
-        
-        # Apply gradient checkpointing to transformer layers
-        for layer in self.layers:
-            if hasattr(layer, "attention") and hasattr(layer.attention, "attention"):
-                if hasattr(layer.attention.attention, "_checkpoint_activations"):
-                    layer.attention.attention._checkpoint_activations = True
-            
-            if hasattr(layer, "feed_forward") and hasattr(layer.feed_forward, "feed_forward"):
-                if hasattr(layer.feed_forward.feed_forward, "_checkpoint_activations"):
-                    layer.feed_forward.feed_forward._checkpoint_activations = True
-    
-    def get_input_embeddings(self):
-        """Get token embeddings."""
-        return self.token_embeddings
-    
-    def set_input_embeddings(self, embeddings):
-        """Set token embeddings."""
-        self.token_embeddings = embeddings
+            if hasattr(module, 'bias') and module.bias is not None: module.bias.data.zero_()
+            if hasattr(module, 'weight') and module.weight is not None: module.weight.data.fill_(1.0)
+        if isinstance(module, SelectiveLinearAttention): 
+            if hasattr(module, 'dt_proj_head') and module.dt_proj_head.bias is not None:
+                 torch.nn.init.uniform_(module.dt_proj_head.bias, a=math.log(1e-3), b=math.log(1e-2))
+
+
+    def gradient_checkpointing_enable(self): self.gradient_checkpointing = True
+    def get_input_embeddings(self): return self.token_embeddings
+    def set_input_embeddings(self, embs): self.token_embeddings = embs
     
     def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, ...]:
-        # Set default values
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        self, input_ids: Optional[torch.Tensor]=None, attention_mask: Optional[torch.Tensor]=None, 
+        position_ids: Optional[torch.Tensor]=None, past_key_values: Optional[List[Any]]=None, 
+        inputs_embeds: Optional[torch.Tensor]=None, pixel_values: Optional[torch.Tensor]=None, 
+        use_cache: Optional[bool]=None, output_attentions: Optional[bool]=None, 
+        output_hidden_states: Optional[bool]=None, return_dict: Optional[bool]=None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], Optional[Tuple[Optional[torch.Tensor], ...]], Optional[List[Any]]]:
         
-        # Get sequence length and batch size
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        use_c = use_cache if use_cache is not None else self.config.use_cache
+        output_att = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hs = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         
-        # Initialize past length
-        past_length = 0
-        if past_key_values is not None:
-            past_length = past_key_values[0][0].shape[2]
+        if input_ids is not None and inputs_embeds is not None: raise ValueError("Specify one of input_ids or inputs_embeds.")
         
-        # Create position IDs if not provided
-        if position_ids is None:
-            position_ids = torch.arange(
-                past_length, seq_length + past_length, dtype=torch.long, device=input_ids.device
-            ).unsqueeze(0).expand(batch_size, -1)
-        
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
-        
-        # Prepare attention mask for attention
-        # [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        
-        # Convert attention mask to additive mask
-        # 0.0 for positions to attend, -10000.0 for positions to ignore
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        
-        # Get embeddings
         if inputs_embeds is None:
-            inputs_embeds = self.token_embeddings(input_ids)
+            if input_ids is None: raise ValueError("input_ids required if inputs_embeds is None.")
+            inputs_embeds = self.token_embeddings(input_ids) 
         
-        # Process multimodal input if provided
-        if self.multimodal_encoder is not None and pixel_values is not None:
-            # Encode images
-            image_embeds = self.multimodal_encoder(pixel_values)
-            
-            # Combine with text embeddings
-            # For simplicity, we prepend image embeddings to text embeddings
-            # In a more sophisticated implementation, you might use a fusion mechanism
-            inputs_embeds = torch.cat([image_embeds, inputs_embeds], dim=1)
-            
-            # Update attention mask to include image tokens
-            image_attention_mask = torch.ones(
-                (batch_size, image_embeds.shape[1]), device=attention_mask.device
-            )
-            attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
-            
-            # Update position IDs to include image tokens
-            image_position_ids = torch.zeros(
-                (batch_size, image_embeds.shape[1]), device=position_ids.device
-            )
-            position_ids = torch.cat([image_position_ids, position_ids], dim=1)
-            
-            # Update extended attention mask
-            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        B, L_txt, D_ = inputs_embeds.shape
         
-        # Apply dropout to embeddings
-        hidden_states = self.dropout(inputs_embeds)
-        
-        # Initialize variables for outputs
-        all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-        all_past_key_values = () if use_cache else None
-        
-        # Process through transformer layers
-        for i, layer in enumerate(self.layers):
-            # Add hidden states to outputs if requested
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-            
-            # Get past key values for this layer
-            layer_past = past_key_values[i] if past_key_values is not None else None
-            
-            # Apply gradient checkpointing if enabled
-            if getattr(self, "gradient_checkpointing", False) and self.training:
-                # Custom function for gradient checkpointing
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs[:4])[0]
-                    return custom_forward
-                
-                # Apply layer with gradient checkpointing
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer),
-                    hidden_states,
-                    extended_attention_mask,
-                    position_ids,
-                    layer_past,
-                )
-                hidden_states = layer_outputs
-            else:
-                # Apply layer normally
-                layer_outputs = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=extended_attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=layer_past,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
-                hidden_states = layer_outputs[0]
-            
-            # Add attention outputs to outputs if requested
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
-            
-            # Add past key values to outputs if requested
-            if use_cache:
-                all_past_key_values = all_past_key_values + (layer_outputs[2],)
-        
-        # Apply final layer normalization
-        hidden_states = self.final_layer_norm(hidden_states)
-        
-        # Add final hidden states to outputs if requested
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-        
-        return (hidden_states, all_hidden_states, all_attentions, all_past_key_values)
+        past_len = 0
+        if past_key_values is not None and past_key_values[0] is not None: 
+            if attention_mask is not None and L_txt < attention_mask.shape[1]: 
+                past_len = attention_mask.shape[1] - L_txt
 
+        current_pos_ids = position_ids 
+        if current_pos_ids is None: 
+            current_pos_ids = torch.arange(past_len, L_txt + past_len, dtype=torch.long, device=inputs_embeds.device)
+            current_pos_ids = current_pos_ids.unsqueeze(0).expand(B, -1)
+
+
+        if self.config.position_embedding_type == "absolute" and self.abs_pos_embeddings:
+            abs_pos_embeds = self.abs_pos_embeddings(current_pos_ids)
+            inputs_embeds = inputs_embeds + abs_pos_embeds
+        
+        final_embeds = inputs_embeds
+        final_att_mask = attention_mask 
+        final_pos_ids_for_layers = current_pos_ids 
+
+        if self.multimodal_encoder and pixel_values is not None:
+            if past_len == 0: 
+                img_feats = self.multimodal_encoder(pixel_values) 
+                img_feats_proj = self.vision_projection(img_feats) 
+                L_img = img_feats_proj.shape[1]
+                
+                final_embeds = torch.cat([img_feats_proj, inputs_embeds], dim=1)
+                
+                if final_att_mask is not None: 
+                    img_att_mask = torch.ones((B, L_img), dtype=final_att_mask.dtype, device=final_att_mask.device)
+                    final_att_mask = torch.cat([img_att_mask, final_att_mask], dim=1) 
+                
+                img_pos_ids_for_layers = torch.arange(L_img, dtype=torch.long, device=final_embeds.device).unsqueeze(0).expand(B, -1)
+                text_pos_ids_shifted_for_layers = current_pos_ids + L_img 
+                final_pos_ids_for_layers = torch.cat([img_pos_ids_for_layers, text_pos_ids_shifted_for_layers], dim=1)
+            
+        hidden_s = self.embed_dropout(final_embeds)
+        
+        ext_att_mask = None
+        if final_att_mask is not None:
+            ext_att_mask = final_att_mask.unsqueeze(1).unsqueeze(2)
+            ext_att_mask = ext_att_mask.to(dtype=hidden_s.dtype)
+            ext_att_mask = (1.0 - ext_att_mask) * torch.finfo(hidden_s.dtype).min
+
+        all_hs_out, all_att_out, all_kv_cache_out = [], [], []
+        
+        for i, layer_mod in enumerate(self.layers):
+            if output_hs: all_hs_out.append(hidden_s)
+            layer_past_kv = past_key_values[i] if past_key_values and i < len(past_key_values) else None 
+            
+            
+            if self.gradient_checkpointing and self.training and not use_c: 
+                def create_cp_forward(mod): 
+                    def _cp_forward(h_states, att_m, p_ids, pkvs): 
+                        return mod(h_states, att_m, p_ids, pkvs, output_attentions, use_cache)[0] # Corrected closure
+                    return _cp_forward
+                
+                current_layer_cp_forward = create_cp_forward(layer_mod)
+                hidden_s = torch.utils.checkpoint.checkpoint(
+                    current_layer_cp_forward, hidden_s, ext_att_mask, final_pos_ids_for_layers, layer_past_kv, 
+                    use_reentrant=False 
+                )
+                if output_att: all_att_out.append(None) 
+                if use_c: all_kv_cache_out.append(None) 
+            else:
+                hidden_s, att_w, present_kv = layer_mod(
+                    hidden_s, ext_att_mask, final_pos_ids_for_layers, layer_past_kv, output_att, use_c
+                )
+                if output_att: all_att_out.append(att_w)
+                if use_c: all_kv_cache_out.append(present_kv)
+
+        hidden_s = self.final_post_norm(hidden_s)
+        if output_hs: all_hs_out.append(hidden_s)
+        
+        return (
+            hidden_s,
+            tuple(all_hs_out) if output_hs and all_hs_out else None,
+            tuple(all_att_out) if output_att and all_att_out else None,
+            tuple(all_kv_cache_out) if use_c and all_kv_cache_out else None
+        )
 
 class ApertisForCausalLM(nn.Module):
-    """Apertis model for causal language modeling."""
-    
     def __init__(self, config: ApertisConfig):
         super().__init__()
-        
         self.config = config
-        
-        # Base model
         self.model = ApertisModel(config)
-        
-        # LM head
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # Tie weights if configured
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.token_embeddings.weight
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
+        self._init_weights(self.lm_head)
+
+
+    def _init_weights(self, module): 
+        if isinstance(module, nn.Linear) and module is self.lm_head and not self.config.tie_word_embeddings:
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+
     def load_state_dict(self, state_dict, strict=True):
-        """
-        Overrides the default load_state_dict to handle model loading.
-        
-        Args:
-            state_dict: The state dictionary containing parameters
-            strict: Whether to strictly enforce that the keys in state_dict match the keys in this module's state_dict
-            
-        Returns:
-            A tuple of (missing_keys, unexpected_keys)
-        """
         return super().load_state_dict(state_dict, strict=strict)
         
     def save_pretrained(self, save_directory):
-        """
-        Save model to a directory.
-        
-        Args:
-            save_directory: Directory to save the model
-        """
-        import os
-        import torch
-        
         os.makedirs(save_directory, exist_ok=True)
-        
-        # Save the model weights
-        model_path = os.path.join(save_directory, "model.pt")
-        torch.save(self.state_dict(), model_path)
-        
-        # Save the configuration
+        model_save_path = os.path.join(save_directory, "pytorch_model.bin") 
+        torch.save(self.state_dict(), model_save_path)
         self.config.save_pretrained(save_directory)
         
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-    
+    def get_output_embeddings(self): return self.lm_head
+    def set_output_embeddings(self, new_lm_head): self.lm_head = new_lm_head
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,      
+        position_ids: Optional[torch.Tensor] = None,       
+        past_key_values: Optional[List[Any]] = None, 
         inputs_embeds: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,             
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, ...]:
-        return_dict = return_dict if return_dict is not None else True
+    ) -> Tuple[
+        Optional[torch.Tensor],  
+        torch.Tensor,           
+        Optional[Tuple[torch.Tensor, ...]], 
+        Optional[Tuple[Optional[torch.Tensor], ...]], 
+        Optional[List[Any]] 
+    ]:
         
-        # Forward pass through base model
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            pixel_values=pixel_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+        model_outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+            past_key_values=past_key_values, inputs_embeds=inputs_embeds, pixel_values=pixel_values,
+            use_cache=use_cache, output_attentions=output_attentions, output_hidden_states=output_hidden_states,
         )
         
-        # Get hidden states
-        hidden_states = outputs[0]
+        last_hidden_state = model_outputs[0]
+        logits = self.lm_head(last_hidden_state)
         
-        # Apply LM head
-        logits = self.lm_head(hidden_states)
-        
-        # Calculate loss if labels provided
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-            )
+            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id) 
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
         
-        return (loss, logits, outputs[1], outputs[2], outputs[3])
+        return (loss, logits) + model_outputs[1:]
     
     def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.Tensor,
-        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        **kwargs,
+        self, input_ids: torch.Tensor, past_key_values: Optional[List[Any]] = None, 
+        attention_mask: Optional[torch.Tensor] = None, 
+        **kwargs 
     ) -> Dict[str, Any]:
-        # Only last token for inputs_ids if past is defined
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            
-            # Create position_ids for the new token
-            if position_ids is not None:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
         
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "pixel_values": pixel_values,
-        }
-    
-    def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory efficiency."""
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-    
-    def generate(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        max_length: Optional[int] = None,
-        min_length: Optional[int] = None,
-        do_sample: Optional[bool] = None,
-        temperature: Optional[float] = None,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
-        repetition_penalty: Optional[float] = None,
-        num_return_sequences: Optional[int] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Generate text using the model."""
-        # Set default values
-        max_length = max_length if max_length is not None else 20
-        min_length = min_length if min_length is not None else 0
-        do_sample = do_sample if do_sample is not None else False
-        temperature = temperature if temperature is not None else 1.0
-        top_k = top_k if top_k is not None else 50
-        top_p = top_p if top_p is not None else 1.0
-        repetition_penalty = repetition_penalty if repetition_penalty is not None else 1.0
-        num_return_sequences = num_return_sequences if num_return_sequences is not None else 1
-        
-        # Initialize past key values
-        past_key_values = None
-        
-        # Initialize generated sequences
+        current_input_ids = input_ids
+        current_position_ids = None 
+
+        current_seq_len = input_ids.shape[1] 
         batch_size = input_ids.shape[0]
-        generated_sequences = input_ids.clone()
+
+        if past_key_values is not None:
+            current_input_ids = input_ids[:, -1].unsqueeze(-1)
+            if attention_mask is not None:
+                current_token_position = attention_mask.shape[1] - 1
+                current_position_ids = torch.tensor([[current_token_position]], dtype=torch.long, device=input_ids.device).expand(batch_size, -1)
+        else:
+            # For the first step (prompt processing), position_ids should cover the whole prompt.
+            # If `kwargs` contains `position_ids`, it's likely the prompt's positions.
+            # Otherwise, generate them.
+            if "position_ids" in kwargs and kwargs["position_ids"] is not None:
+                 current_position_ids = kwargs["position_ids"]
+            elif current_seq_len > 0 : # Only create if there are input_ids
+                 current_position_ids = torch.arange(current_seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+
+
+        model_inputs = {
+            "input_ids": current_input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask, 
+            "position_ids": current_position_ids, 
+            "use_cache": kwargs.get("use_cache", True),
+        }
         
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
+        if past_key_values is None and "pixel_values" in kwargs: 
+            model_inputs["pixel_values"] = kwargs["pixel_values"]
         
-        # Generate tokens
-        for _ in range(max_length):
-            # Prepare inputs
+        return model_inputs
+    
+    @torch.no_grad()
+    def generate(
+        self, input_ids: Optional[torch.Tensor] = None, 
+        attention_mask: Optional[torch.Tensor] = None, 
+        pixel_values: Optional[torch.Tensor] = None,
+        max_new_tokens: Optional[int] = 20, 
+        min_new_tokens: Optional[int] = 0, 
+        do_sample: Optional[bool] = False,
+        temperature: Optional[float] = 1.0,
+        top_k: Optional[int] = 50,
+        top_p: Optional[float] = 1.0,
+        repetition_penalty: Optional[float] = 1.0,
+        eos_token_id: Optional[Union[int, List[int]]] = None, 
+        pad_token_id: Optional[int] = None,
+        use_cache: bool = True, **kwargs,
+    ) -> torch.Tensor: 
+        
+        if input_ids is None: raise ValueError("input_ids must be provided.")
+        batch_size, prompt_len = input_ids.shape
+        
+        temp = max(temperature, 1e-6) if do_sample else 1.0 
+        eos_ids_final = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        if not isinstance(eos_ids_final, list): eos_ids_final = [eos_ids_final]
+        
+        current_pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+
+        current_attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
+        
+        generated_tokens = input_ids
+        internal_past_kv = None
+        
+        current_pixel_values = pixel_values
+
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+
+        for _ in range(max_new_tokens):
+            
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids=generated_sequences,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values if _ == 0 else None,  # Only use pixel_values for first token
+                input_ids=generated_tokens, 
+                past_key_values=internal_past_kv,
+                attention_mask=current_attention_mask, 
+                pixel_values=current_pixel_values, 
+                use_cache=use_cache,
+                # position_ids are handled inside prepare_inputs_for_generation
+            )
+            if current_pixel_values is not None: current_pixel_values = None 
+
+            outputs = self.model( 
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                position_ids=model_inputs["position_ids"],
+                past_key_values=model_inputs["past_key_values"],
+                pixel_values=model_inputs.get("pixel_values"), 
+                use_cache=model_inputs["use_cache"],
             )
             
-            # Forward pass
-            outputs = self(**model_inputs, use_cache=True)
-            logits = outputs[1]
-            past_key_values = outputs[3]
-            
-            # Get next token logits
-            next_token_logits = logits[:, -1, :]
-            
-            # Apply temperature
-            next_token_logits = next_token_logits / temperature
-            
-            # Apply repetition penalty
+            last_hidden_state = outputs[0] 
+            internal_past_kv = outputs[3]  
+
+            next_token_logits = self.lm_head(last_hidden_state[:, -1, :]) 
+
             if repetition_penalty != 1.0:
                 for i in range(batch_size):
-                    for token_id in set(generated_sequences[i].tolist()):
-                        next_token_logits[i, token_id] /= repetition_penalty
+                    if unfinished_sequences[i] == 0: continue 
+                    for token_id_in_seq in generated_tokens[i]:
+                        if token_id_in_seq < next_token_logits.shape[-1]: 
+                             next_token_logits[i, token_id_in_seq] /= repetition_penalty
             
-            # Apply top-k filtering
-            if top_k > 0:
-                indices_to_remove = torch.topk(next_token_logits, k=top_k, dim=-1)[0][:, -1].unsqueeze(-1) <= next_token_logits
-                next_token_logits = next_token_logits.masked_fill(indices_to_remove, -float("Inf"))
-            
-            # Apply top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                
-                # Shift the indices to the right to keep the first token above the threshold
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = 0
-                
-                for i in range(batch_size):
-                    indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
-                    next_token_logits[i, indices_to_remove] = -float("Inf")
-            
-            # Sample or greedy decode
             if do_sample:
+                if temp != 1.0: next_token_logits = next_token_logits / temp
+                if top_k > 0:
+                    top_k_vals, _ = torch.topk(next_token_logits, top_k)
+                    kth_val = top_k_vals[:, -1].unsqueeze(-1)
+                    next_token_logits.masked_fill_(next_token_logits < kth_val, float("-inf"))
+                if top_p < 1.0:
+                    s_logits, s_indices = torch.sort(next_token_logits, descending=True)
+                    cum_probs = torch.cumsum(F.softmax(s_logits, dim=-1), dim=-1)
+                    s_indices_to_remove = cum_probs > top_p
+                    s_indices_to_remove[..., 1:] = s_indices_to_remove[..., :-1].clone()
+                    s_indices_to_remove[..., 0] = 0
+                    indices_to_remove = torch.zeros_like(next_token_logits,dtype=torch.bool).scatter_(-1,s_indices,s_indices_to_remove)
+                    next_token_logits.masked_fill_(indices_to_remove, float("-inf"))
+                
                 probs = F.softmax(next_token_logits, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_logits, dim=-1)
             
-            # Append next tokens
-            generated_sequences = torch.cat([generated_sequences, next_tokens.unsqueeze(-1)], dim=-1)
+            next_tokens = next_tokens * unfinished_sequences + current_pad_token_id * (1 - unfinished_sequences)
+
+            generated_tokens = torch.cat([generated_tokens, next_tokens.unsqueeze(-1)], dim=-1)
+            current_attention_mask = torch.cat([current_attention_mask, unfinished_sequences.unsqueeze(-1)], dim=1) 
             
-            # Update attention mask
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)],
-                dim=-1,
-            )
+            for eos_id_val in eos_ids_final: # Use the correct variable here
+                unfinished_sequences = unfinished_sequences.masked_fill((next_tokens == eos_id_val) & (unfinished_sequences == 1), 0) 
             
-            # Check if all sequences have reached the end token
-            if (next_tokens == self.config.eos_token_id).all():
+            if unfinished_sequences.max() == 0 and generated_tokens.shape[1] - prompt_len >= min_new_tokens:
                 break
         
-        return generated_sequences
+        return generated_tokens
+
+    def gradient_checkpointing_enable(self):
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
 
 
 def create_apertis_model(
     model_size: str = "base",
+    vocab_size_override: Optional[int] = None, 
     multimodal: bool = False,
-    use_flash_attention: bool = False,
+    use_flash_attention: bool = False, 
     use_expert_system: bool = False,
+    ssm_d_inner: Optional[int] = None,
+    ssm_d_state: int = 16,
+    ssm_dt_rank: Union[int, str] = "auto",
+    ssm_conv_kernel: int = 4,
 ) -> ApertisForCausalLM:
-    """Create an Apertis model with specified configuration."""
-    # Define model sizes
-    model_configs = {
-        "small": {
-            "hidden_size": 512,
-            "num_hidden_layers": 8,
-            "num_attention_heads": 8,
-            "intermediate_size": 2048,
-        },
-        "base": {
-            "hidden_size": 768,
-            "num_hidden_layers": 12,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-        },
-        "large": {
-            "hidden_size": 1024,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 16,
-            "intermediate_size": 4096,
-        },
+    
+    model_configs_presets = {
+        "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+        "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
     }
     
-    # Get model configuration
-    if model_size not in model_configs:
-        raise ValueError(f"Unsupported model size: {model_size}. Choose from {list(model_configs.keys())}")
+    if model_size not in model_configs_presets:
+        raise ValueError(f"Unsupported model_size: {model_size}. Choose from {list(model_configs_presets.keys())}")
     
-    config_dict = model_configs[model_size]
+    config_dict = model_configs_presets[model_size].copy()
     
-    # Create configuration
-    config = ApertisConfig(
-        **config_dict,
-        multimodal=multimodal,
-        use_flash_attention=use_flash_attention,
-        use_expert_system=use_expert_system,
-    )
+    if vocab_size_override is not None: config_dict["vocab_size"] = vocab_size_override
     
-    # Create model
+    config_dict.update({
+        "multimodal": multimodal, "use_flash_attention": use_flash_attention,
+        "use_expert_system": use_expert_system, "attention_type": "selective_ssm",
+        "ssm_d_inner": ssm_d_inner if ssm_d_inner is not None else 2 * config_dict["hidden_size"],
+        "ssm_d_state": ssm_d_state,
+        "ssm_dt_rank": int(ssm_dt_rank) if isinstance(ssm_dt_rank, int) else (math.ceil(config_dict["hidden_size"] / 16) if ssm_dt_rank == "auto" else int(ssm_dt_rank)),
+        "ssm_conv_kernel": ssm_conv_kernel,
+    })
+    
+    config = ApertisConfig(**config_dict)
     model = ApertisForCausalLM(config)
-    
     return model
+
