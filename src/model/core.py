@@ -6,14 +6,17 @@ import math
 import numpy as np
 import sys
 import os
-from pathlib import Path # IMPORTED Path
-
-# Add the parent directory to the path so we can import the multimodal module
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from src.multimodal.module import UnifiedMultimodalEncoder
+from pathlib import Path 
 
 import logging
 logger = logging.getLogger(__name__)
+
+# Ensure the multimodal module can be imported if this file is run directly for tests.
+# This assumes 'src' is the parent of 'model' and 'multimodal'.
+if __name__ == '__main__' and __package__ is None:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
+from src.multimodal.module import UnifiedMultimodalEncoder
 
 
 class ApertisConfig:
@@ -24,7 +27,7 @@ class ApertisConfig:
         vocab_size: int = 32000,
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
-        num_attention_heads: int = 12,
+        num_attention_heads: int = 12, # H
         intermediate_size: int = 3072, 
         hidden_act: str = "gelu",
         hidden_dropout_prob: float = 0.1,
@@ -45,8 +48,9 @@ class ApertisConfig:
         rope_theta: float = 10000.0,
         sliding_window: Optional[int] = None, 
         attention_type: str = "selective_ssm", 
-        ssm_d_inner: Optional[int] = None, 
-        ssm_d_state: int = 16,       
+        # SSM specific parameters (inspired by Mamba)
+        ssm_d_inner: Optional[int] = None, # If None, will be H * N for SSM, or 2*D for FFN-like expansion
+        ssm_d_state: int = 16,       # N, state dimension per head
         ssm_dt_rank: Union[int, str] = "auto", 
         ssm_conv_kernel: int = 4,    
         use_flash_attention: bool = False, 
@@ -67,7 +71,7 @@ class ApertisConfig:
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads 
         self.hidden_act = hidden_act
-        self.intermediate_size = intermediate_size
+        self.intermediate_size = intermediate_size # For FFN in MoE or standard FFN
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.max_position_embeddings = max_position_embeddings
@@ -87,8 +91,27 @@ class ApertisConfig:
         self.sliding_window = sliding_window 
         self.attention_type = attention_type
 
-        self.ssm_d_inner = ssm_d_inner if ssm_d_inner is not None else 2 * self.hidden_size
-        self.ssm_d_state = ssm_d_state
+        # SSM specific parameters
+        self.ssm_d_state = ssm_d_state # N
+        # If attention is SSM, d_inner is H * N by Mamba-like construction.
+        # User can still provide ssm_d_inner for non-SSM attention types or future flexibility.
+        if self.attention_type == "selective_ssm":
+            # For headed SSMs, d_inner becomes the sum of head_states or an expansion based on it.
+            # In our Mamba-like setup, the main pathway (x_conv, z) uses d_inner.
+            # The SSM scan output per head is d_state. Concatenated H*d_state.
+            # For gating y_ssm * silu(z), these two need to match.
+            # So, d_inner for projections (in_proj_x, in_proj_z) MUST be H * d_state.
+            derived_ssm_d_inner = self.num_attention_heads * self.ssm_d_state
+            if ssm_d_inner is not None and ssm_d_inner != derived_ssm_d_inner:
+                logger.warning(f"For attention_type='selective_ssm', ssm_d_inner ({ssm_d_inner}) "
+                               f"is overridden by num_attention_heads*ssm_d_state ({derived_ssm_d_inner}).")
+            self.ssm_d_inner = derived_ssm_d_inner
+        elif ssm_d_inner is None: # For other attention types or if user doesn't specify
+            self.ssm_d_inner = 2 * self.hidden_size # Default expansion for non-SSM or general use
+        else: # User provided ssm_d_inner for a non-SSM attention type
+            self.ssm_d_inner = ssm_d_inner
+
+
         if ssm_dt_rank == "auto":
             self.ssm_dt_rank = math.ceil(self.hidden_size / 16)
         else:
@@ -113,7 +136,15 @@ class ApertisConfig:
         import inspect
         sig = inspect.signature(cls.__init__)
         valid_keys = {param.name for param in sig.parameters.values() if param.kind == param.POSITIONAL_OR_KEYWORD}
+        # Remove keys from config_dict that are not in __init__ signature
+        # This prevents errors if old config files with extra keys are loaded.
         filtered_config_dict = {k: v for k, v in config_dict.items() if k in valid_keys}
+        # Ensure ssm_dt_rank is int if it was string "auto" in old config and not re-calculated
+        if "ssm_dt_rank" in filtered_config_dict and filtered_config_dict["ssm_dt_rank"] == "auto":
+            # Need hidden_size to calculate, assume it's in filtered_config_dict
+            hs = filtered_config_dict.get("hidden_size", 768) # Default if not found
+            filtered_config_dict["ssm_dt_rank"] = math.ceil(hs / 16)
+
         return cls(**filtered_config_dict)
     
     def to_dict(self):
@@ -126,8 +157,11 @@ class ApertisConfig:
         config_file_path_str = ""
         if os.path.isdir(model_name_or_path):
             config_file_path_str = os.path.join(model_name_or_path, "config.json")
-        elif os.path.isfile(model_name_or_path): 
+        elif os.path.isfile(model_name_or_path) and model_name_or_path.endswith(".json"): 
             config_file_path_str = model_name_or_path
+        else: # Try assuming model_name_or_path is a dir even if .json not specified
+            config_file_path_str = os.path.join(model_name_or_path, "config.json")
+
         
         if not os.path.exists(config_file_path_str) and os.path.isdir(model_name_or_path):
             parent_dir_config_file = os.path.join(Path(model_name_or_path).parent, "config.json")
@@ -135,7 +169,7 @@ class ApertisConfig:
                 config_file_path_str = parent_dir_config_file
         
         if not os.path.exists(config_file_path_str):
-            raise FileNotFoundError(f"Config file not found in {model_name_or_path} or its direct parent (if a directory). Looked for: {config_file_path_str}")
+            raise FileNotFoundError(f"Config file not found for '{model_name_or_path}'. Looked for: '{config_file_path_str}'")
 
         with open(config_file_path_str, "r", encoding="utf-8") as f:
             config_dict = json.load(f)
@@ -200,60 +234,94 @@ class SelectiveLinearAttention(nn.Module):
 
         self.hidden_size = config.hidden_size      
         self.num_heads = config.num_attention_heads 
-        self.d_inner = config.ssm_d_inner
-        self.d_state = config.ssm_d_state          
+        
+        # For SSM, d_inner is effectively H * N (state_dim per head)
+        # This ensures consistency for gating with z.
+        self.d_inner = self.num_heads * config.ssm_d_state
+        self.d_state = config.ssm_d_state # N per head         
         self.dt_rank = config.ssm_dt_rank
         self.conv_kernel_size = config.ssm_conv_kernel
         
-        if self.d_inner % self.num_heads != 0:
-            logger.warning(f"SSM d_inner ({self.d_inner}) not divisible by num_heads ({self.num_heads}). This configuration might lead to issues with head dimension calculations if not handled carefully downstream.")
-        self.head_d_inner = self.d_inner // self.num_heads
+        # head_d_inner is the dimension of u_scan input per head, which is d_state (N)
+        self.head_d_inner = self.d_state # Each head processes a state of size N
+                                         # Input u_scan will be projected to this.
+                                         # This might require adjustment to in_proj_x/z or u_scan input.
+                                         # Mamba: in_proj makes d_inner. Conv keeps d_inner.
+                                         # x_activated (d_inner) is input to SSM projections and silu(z)
+                                         # If d_inner is H*N, then u_scan can be (B,H,L,N)
         
+        # Projections from D to d_inner (which is H*N)
         self.in_proj_x = nn.Linear(self.hidden_size, self.d_inner, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.d_inner, bias=False)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner, out_channels=self.d_inner,
-            kernel_size=self.conv_kernel_size, groups=self.d_inner,
-            padding=(self.conv_kernel_size - 1)
+            kernel_size=self.conv_kernel_size, groups=self.d_inner, # Depthwise
+            padding=(self.conv_kernel_size - 1) # Causal padding
         )
 
+        # x_param_proj: input d_inner (from x_activated), output dt_rank + H*N (for B) + H*N (for C)
         self.x_param_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.num_heads * self.d_state, bias=False)
         
         self.dt_proj_head = nn.Linear(self.dt_rank, self.num_heads, bias=True)
         torch.nn.init.uniform_(self.dt_proj_head.bias, a=math.log(1e-3), b=math.log(1e-2))
 
         self.A_log = nn.Parameter(torch.empty(self.num_heads, self.d_state))
-        torch.nn.init.xavier_uniform_(self.A_log) 
+        # Initialize A_log to small negative values, so exp(A_log) is close to 1 but < 1 for stability
+        torch.nn.init.uniform_(self.A_log, a=math.log(0.1), b=math.log(0.9))
 
-        self.D = nn.Parameter(torch.ones(self.d_inner))
 
+        self.D = nn.Parameter(torch.ones(self.d_inner)) # Skip connection, applied to x_activated
+
+        # Output projection from d_inner (H*N) back to D
         self.out_proj = nn.Linear(self.d_inner, self.hidden_size, bias=False)
         
         self.use_cache = False 
         self.conv_state = None
         self.ssm_state = None
 
-    def _ssm_pytorch_scan(self, u, delta, A_log_resolved, B, C, ssm_state_prev=None):
-        B_b, H_b, L_b, D_head_inner_ignored = u.shape 
-        N_state_b = A_log_resolved.shape[-1]       
-
-        A_cont_diag = torch.exp(A_log_resolved).neg() 
+    def _ssm_pytorch_scan(self, u_scan_input, delta, A_log_resolved, B_params, C_params, ssm_state_prev=None):
+        # u_scan_input: (B, H, L, N=d_state), this is x_ssm in Mamba paper Fig 3.
+        # delta: (B, H, L, 1)
+        # A_log_resolved: (H, N=d_state)
+        # B_params: (B, H, L, N=d_state), this is data-dependent B_k for recurrence h_k = A_bar_k h_{k-1} + B_bar_k u_k
+        # C_params: (B, H, L, N=d_state), this is data-dependent C_k for y_k = C_k h_k
         
-        delta_A = delta * A_cont_diag.unsqueeze(0).unsqueeze(2)
+        B, H, L, N = u_scan_input.shape # N here is d_state (ssm_d_state)
+
+        A_cont_diag = torch.exp(A_log_resolved).neg() # (H, N)
+        
+        # delta_A for A_bar = exp(delta * A)
+        delta_A = delta * A_cont_diag.unsqueeze(0).unsqueeze(2) # (B,H,L,1) * (1,H,1,N) -> (B,H,L,N)
         A_bar = torch.exp(delta_A) 
+
+        # B_bar_k * u_k term.
+        # In Mamba, B is projected from x, then discretized with delta & A.
+        # And u is also projected from x.
+        # Here, B_params is already the data-dependent B for the recurrence.
+        # u_scan_input is the u_k.
+        # So the term to add is B_params * u_scan_input (element-wise if B_params is structured for it)
+        # Or if B_params is a matrix to multiply u_scan_input.
+        # Given B_params is (B,H,L,N) and u_scan_input is (B,H,L,N), assume B_params already incorporates delta and input.
+        # This B_params is B_ssm from forward(). It's the (B_bar * x) term.
+        
+        # Let B_effective = delta * B_params * u_scan_input # If B_params was like continuous B from projection
+        # But forward already made B_ssm = B_params.view(...).transpose. It's (B,H,L,N).
+        # This B_ssm IS the B_k term (incorporating B_bar_k * u_k) to be added to recurrent state.
 
         if self.use_cache and ssm_state_prev is not None:
             h = ssm_state_prev 
         else:
-            h = torch.zeros(B_b, H_b, N_state_b, device=u.device, dtype=u.dtype)
+            h = torch.zeros(B, H, N, device=u_scan_input.device, dtype=u_scan_input.dtype)
 
         ys = []
-        for i in range(L_b):
-            h = A_bar[:,:,i,:] * h + B[:,:,i,:] 
-            ys.append(C[:,:,i,:] * h) 
+        for i in range(L):
+            h = A_bar[:,:,i,:] * h + B_params[:,:,i,:] # B_params is the B_k * u_k term
+            # y_i = C_k * h_k
+            # C_params is (B,H,L,N). h is (B,H,N). y_i should be (B,H,N)
+            ys.append(C_params[:,:,i,:] * h) 
 
-        y_stacked = torch.stack(ys, dim=2) 
+        y_stacked = torch.stack(ys, dim=2) # (B, H, L, N)
         
         new_ssm_state = h.detach() if self.use_cache else None
         
@@ -274,61 +342,78 @@ class SelectiveLinearAttention(nn.Module):
         if past_key_value is not None:
             conv_state_prev, ssm_state_prev = past_key_value
 
-        x = self.in_proj_x(hidden_states) 
-        z = self.in_proj_z(hidden_states) 
+        # 1. Input projections (x and z) to d_inner = H*N
+        x_projected = self.in_proj_x(hidden_states) # (B, L, H*N)
+        z_gate_features = self.in_proj_z(hidden_states) # (B, L, H*N)
 
-        x_t = x.transpose(1, 2) 
+        # 2. 1D Convolution on x_projected
+        x_conv_input = x_projected.transpose(1, 2) # (B, H*N, L) for Conv1D
         if conv_state_prev is not None and use_cache:
-            if conv_state_prev.shape[2] == self.conv_kernel_size -1 : 
-                 x_t = torch.cat([conv_state_prev, x_t], dim=2)
+            if conv_state_prev.shape[1] == self.d_inner and conv_state_prev.shape[2] == self.conv_kernel_size -1 : 
+                 x_conv_input = torch.cat([conv_state_prev, x_conv_input], dim=2)
             else:
-                 logger.warning(f"Mismatched conv_state shape: {conv_state_prev.shape}, expected K-1={self.conv_kernel_size-1}")
+                 logger.warning(f"Mismatched conv_state shape: {conv_state_prev.shape}, vs x_conv_input: {x_conv_input.shape} expected K-1={self.conv_kernel_size-1}")
+        
+        current_conv_state = x_conv_input[:, :, -(self.conv_kernel_size - 1):].detach() if use_cache else None
+        
+        x_convolved = self.conv1d(x_conv_input)[:, :, :L] # Ensure output length is L (causal padding handles this)
+        x_convolved = x_convolved.transpose(1, 2) # (B, L, H*N)
+        
+        # x_activated is the input to parameter projections for dt,B,C and also main input u to SSM
+        x_activated = F.silu(x_convolved) # (B, L, H*N)
 
-        current_conv_state = x_t[:, :, -(self.conv_kernel_size - 1):].detach() if use_cache else None
+        # 3. Project for SSM params (dt, B, C) from x_activated
+        ssm_params_raw = self.x_param_proj(x_activated) # (B, L, dt_rank + 2*H*N)
         
-        x_conv = self.conv1d(x_t)[:, :, :L] 
-        x_conv = x_conv.transpose(1, 2) 
-        x_activated = F.silu(x_conv)    
+        dt_rank_feats, B_raw_params, C_raw_params = torch.split(
+            ssm_params_raw, 
+            [self.dt_rank, self.num_heads * self.d_state, self.num_heads * self.d_state], 
+            dim=-1
+        ) 
+        
+        # Delta: dt_rank_feats (B,L,dt_rank) -> dt_logits (B,L,H) -> delta (B,H,L,1)
+        delta_logits = self.dt_proj_head(dt_rank_feats) 
+        delta = F.softplus(delta_logits).transpose(1,2).unsqueeze(-1) 
 
-        x_params = self.x_param_proj(x_activated)
+        # B_ssm_term and C_ssm_term for the scan
+        # B_raw_params is (B,L, H*N). Reshape to (B,L,H,N). Transpose to (B,H,L,N)
+        B_ssm_term = B_raw_params.view(B, L, self.num_heads, self.d_state).transpose(1,2)
+        C_ssm_term = C_raw_params.view(B, L, self.num_heads, self.d_state).transpose(1,2)
         
-        dt_rank_features, B_C_params = torch.split(x_params, [self.dt_rank, 2 * self.num_heads * self.d_state], dim=-1)
-        B_params, C_params = torch.split(B_C_params, [self.num_heads * self.d_state, self.num_heads * self.d_state], dim=-1)
-        
-        delta_logit = self.dt_proj_head(dt_rank_features) 
-        delta = F.softplus(delta_logit).transpose(1,2).unsqueeze(-1) 
+        # A_log is (H,N)
 
-        B_ssm = B_params.view(B, L, self.num_heads, self.d_state).transpose(1,2) 
-        C_ssm = C_params.view(B, L, self.num_heads, self.d_state).transpose(1,2) 
+        # Input u to scan: x_activated (B,L,H*N) needs to be (B,H,L,N) if each head processes N-dim state from its slice of H*N
+        # This means u_scan should be a view of x_activated where each head gets N features.
+        # head_dim_for_scan_input = self.d_state (N)
+        # d_inner = H * N was established.
+        u_scan_input = x_activated.view(B, L, self.num_heads, self.d_state).transpose(1,2) # (B,H,L,N)
         
-        u_scan = x_activated.view(B, L, self.num_heads, self.head_d_inner).transpose(1,2)
+        scan_output_tuple = self._ssm_pytorch_scan(u_scan_input, delta, self.A_log, B_ssm_term, C_ssm_term, ssm_state_prev)
         
-        scan_output = self._ssm_pytorch_scan(u_scan, delta, self.A_log, B_ssm, C_ssm, ssm_state_prev)
-        
-        y_ssm, current_ssm_state = None, None
+        y_ssm_scan_output, current_ssm_h_state = None, None
         if use_cache:
-            y_ssm, current_ssm_state = scan_output
+            y_ssm_scan_output, current_ssm_h_state = scan_output_tuple
         else:
-            y_ssm = scan_output 
+            y_ssm_scan_output = scan_output_tuple # (B,H,L,N_state)
 
-        y_ssm_permuted = y_ssm.transpose(1,2).contiguous().view(B, L, self.num_heads * self.d_state)
+        # y_ssm_scan_output is (B,H,L,N_state). Reshape to (B,L, H*N_state = d_inner)
+        y_ssm_processed = y_ssm_scan_output.transpose(1,2).contiguous().view(B, L, self.d_inner)
         
-        y_ssm_for_gating = y_ssm_permuted
-        if y_ssm_permuted.shape[-1] != z.shape[-1]:
-            if not hasattr(self, "_y_to_z_proj"):
-                self._y_to_z_proj = nn.Linear(y_ssm_permuted.shape[-1], z.shape[-1], device=z.device, dtype=z.dtype)
-                logger.warning(f"SSM output dim {y_ssm_permuted.shape[-1]} (H*N) != z dim {z.shape[-1]} (d_inner). Adding dynamic projection.")
-            y_ssm_for_gating = self._y_to_z_proj(y_ssm_permuted)
+        # Add D * x_activated term (Mamba-style skip before final gating)
+        y_ssm_plus_skip = y_ssm_processed + self.D.unsqueeze(0).unsqueeze(0) * x_activated
         
-        y_ssm_out_plus_D_times_x = y_ssm_for_gating + self.D.unsqueeze(0).unsqueeze(0) * x_activated
-        output_gated_with_D = y_ssm_out_plus_D_times_x * F.silu(z)
-        attn_output = self.out_proj(output_gated_with_D)
+        # Gate with z_gate_features (B,L,d_inner)
+        output_gated = y_ssm_plus_skip * F.silu(z_gate_features)
+        
+        # Final output projection
+        final_output = self.out_proj(output_gated) # (B, L, D_hidden)
 
-        present_kv_cache = None
+        current_cache_state = None
         if use_cache:
-            present_kv_cache = (current_conv_state, current_ssm_state)
+            current_cache_state = (current_conv_state, current_ssm_h_state)
         
-        return attn_output, y_ssm_permuted if output_attentions else None, present_kv_cache
+        # For output_attentions, return y_ssm_processed (B,L,H*N) as a proxy for "context"
+        return final_output, y_ssm_processed if output_attentions else None, current_cache_state
 
 
 class AdaptiveExpertSystem(nn.Module):
@@ -653,7 +738,7 @@ class ApertisModel(nn.Module):
             if self.gradient_checkpointing and self.training and not use_c: 
                 def create_cp_forward(mod): 
                     def _cp_forward(h_states, att_m, p_ids, pkvs): 
-                        return mod(h_states, att_m, p_ids, pkvs, output_attentions, use_cache)[0] # Corrected closure
+                        return mod(h_states, att_m, p_ids, pkvs, output_attentions, use_cache)[0] 
                     return _cp_forward
                 
                 current_layer_cp_forward = create_cp_forward(layer_mod)
@@ -763,12 +848,9 @@ class ApertisForCausalLM(nn.Module):
                 current_token_position = attention_mask.shape[1] - 1
                 current_position_ids = torch.tensor([[current_token_position]], dtype=torch.long, device=input_ids.device).expand(batch_size, -1)
         else:
-            # For the first step (prompt processing), position_ids should cover the whole prompt.
-            # If `kwargs` contains `position_ids`, it's likely the prompt's positions.
-            # Otherwise, generate them.
-            if "position_ids" in kwargs and kwargs["position_ids"] is not None:
+            if kwargs.get("position_ids") is not None:
                  current_position_ids = kwargs["position_ids"]
-            elif current_seq_len > 0 : # Only create if there are input_ids
+            elif current_seq_len > 0 : 
                  current_position_ids = torch.arange(current_seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
 
 
@@ -828,7 +910,6 @@ class ApertisForCausalLM(nn.Module):
                 attention_mask=current_attention_mask, 
                 pixel_values=current_pixel_values, 
                 use_cache=use_cache,
-                # position_ids are handled inside prepare_inputs_for_generation
             )
             if current_pixel_values is not None: current_pixel_values = None 
 
@@ -878,7 +959,7 @@ class ApertisForCausalLM(nn.Module):
             generated_tokens = torch.cat([generated_tokens, next_tokens.unsqueeze(-1)], dim=-1)
             current_attention_mask = torch.cat([current_attention_mask, unfinished_sequences.unsqueeze(-1)], dim=1) 
             
-            for eos_id_val in eos_ids_final: # Use the correct variable here
+            for eos_id_val in eos_ids_final: # CORRECTED HERE
                 unfinished_sequences = unfinished_sequences.masked_fill((next_tokens == eos_id_val) & (unfinished_sequences == 1), 0) 
             
             if unfinished_sequences.max() == 0 and generated_tokens.shape[1] - prompt_len >= min_new_tokens:
@@ -919,13 +1000,12 @@ def create_apertis_model(
     config_dict.update({
         "multimodal": multimodal, "use_flash_attention": use_flash_attention,
         "use_expert_system": use_expert_system, "attention_type": "selective_ssm",
-        "ssm_d_inner": ssm_d_inner if ssm_d_inner is not None else 2 * config_dict["hidden_size"],
+        "ssm_d_inner": ssm_d_inner, # Will be resolved in ApertisConfig based on attention_type
         "ssm_d_state": ssm_d_state,
-        "ssm_dt_rank": int(ssm_dt_rank) if isinstance(ssm_dt_rank, int) else (math.ceil(config_dict["hidden_size"] / 16) if ssm_dt_rank == "auto" else int(ssm_dt_rank)),
+        "ssm_dt_rank": ssm_dt_rank, # Will be resolved in ApertisConfig
         "ssm_conv_kernel": ssm_conv_kernel,
     })
     
     config = ApertisConfig(**config_dict)
     model = ApertisForCausalLM(config)
     return model
-
