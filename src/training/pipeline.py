@@ -13,6 +13,7 @@ import torchvision.transforms as transforms
 
 import sys
 import os
+import math # Import math for ceil
 
 # Add the parent directory to the path so we can import the src modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -44,22 +45,18 @@ def _load_vocabulary_and_get_size(tokenizer_path: str) -> Tuple[Dict[str, int], 
 
         if isinstance(vocab_data, dict):
             if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
-                # Format: {"tokens": ["token1", "token2", ...]}
                 token_list = vocab_data["tokens"]
                 actual_vocab_dict = {token: idx for idx, token in enumerate(token_list)}
                 actual_vocab_size = len(actual_vocab_dict)
-                # Check for ID consistency in list-based vocabs (IDs should be 0 to len-1)
                 for token, idx in actual_vocab_dict.items():
                     if idx >= actual_vocab_size:
                         logger.error(f"Inconsistent token ID {idx} for token '{token}' in list-based vocab. Expected max ID {actual_vocab_size-1}.")
                         raise ValueError("Inconsistent token IDs in list-based vocabulary file.")
             else:
-                # Standard format: {"token": id, ...}
                 actual_vocab_dict = vocab_data
                 actual_vocab_size = len(actual_vocab_dict)
-                if not actual_vocab_dict: # Handle empty vocabulary
+                if not actual_vocab_dict: 
                     return {}, 0
-
                 max_id_found = -1
                 seen_ids = set()
                 for token, token_id in actual_vocab_dict.items():
@@ -72,7 +69,6 @@ def _load_vocabulary_and_get_size(tokenizer_path: str) -> Tuple[Dict[str, int], 
                     seen_ids.add(token_id)
                     if token_id > max_id_found:
                         max_id_found = token_id
-                
                 if max_id_found >= actual_vocab_size:
                     logger.warning(
                         f"Vocabulary in {tokenizer_path} has {actual_vocab_size} unique tokens, "
@@ -92,8 +88,6 @@ def _load_vocabulary_and_get_size(tokenizer_path: str) -> Tuple[Dict[str, int], 
         raise
 
 class ApertisDataset(Dataset):
-    """Dataset for training Apertis models."""
-
     def __init__(
         self,
         data_path: str,
@@ -111,9 +105,7 @@ class ApertisDataset(Dataset):
         self.multimodal = multimodal
         self.image_dir = image_dir
         self.image_size = image_size
-
         self.data = self._load_data()
-
         if self.multimodal:
             self.image_transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
@@ -142,7 +134,6 @@ class ApertisDataset(Dataset):
         unk_token_name = "<unk>"
         default_unk_id = min(1, self.model_vocab_size -1) if self.model_vocab_size > 1 else 0 
         if self.model_vocab_size == 0: default_unk_id = 0
-
         unk_token_id = self.vocab.get(unk_token_name)
         if unk_token_id is None: 
             unk_token_id = default_unk_id
@@ -151,7 +142,6 @@ class ApertisDataset(Dataset):
         elif unk_token_id >= self.model_vocab_size : 
              logger.warning(f"'{unk_token_name}' ID {unk_token_id} is out of bounds for model_vocab_size {self.model_vocab_size}. Using {default_unk_id} instead.")
              unk_token_id = default_unk_id
-
         for word in text.split():
             token_id = self.vocab.get(word, unk_token_id)
             if token_id >= self.model_vocab_size:
@@ -182,7 +172,6 @@ class ApertisDataset(Dataset):
         input_text = item.get("text", "")
         if not input_text: logger.warning(f"Empty text found in item {idx} of {self.data_path}")
         input_ids = self._tokenize(input_text)
-        
         default_pad_id = 0
         pad_token_id = self.vocab.get("<pad>", default_pad_id)
         if "<pad>" not in self.vocab:
@@ -191,15 +180,12 @@ class ApertisDataset(Dataset):
         elif pad_token_id >= self.model_vocab_size:
              logger.warning(f"'<pad>' ID {pad_token_id} is out of bounds for model_vocab_size {self.model_vocab_size}. Using {default_pad_id} instead.")
              pad_token_id = default_pad_id
-
         seq_len = len(input_ids)
         if seq_len > self.max_length: input_ids = input_ids[:self.max_length]
         elif seq_len < self.max_length: input_ids.extend([pad_token_id] * (self.max_length - seq_len))
-        
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
         attention_mask = (input_ids_tensor != pad_token_id).long()
         output = {"input_ids": input_ids_tensor, "attention_mask": attention_mask, "labels": input_ids_tensor.clone()}
-
         if self.multimodal and "image" in item:
              if self.image_dir is None and not os.path.isabs(item["image"]):
                   logger.warning(f"Multimodal True, image_dir None, image path '{item['image']}' not absolute. Item {idx}.")
@@ -295,8 +281,16 @@ class ApertisTrainer:
                       {'params': [p for n,p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
         self.optimizer = optim.AdamW(opt_groups, lr=self.learning_rate)
         
-        num_train_steps = max(1, len(self.train_dataloader) // self.gradient_accumulation_steps * self.num_epochs)
-        self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.learning_rate, total_steps=num_train_steps, pct_start=0.1, anneal_strategy='cos', div_factor=25.0, final_div_factor=10000.0)
+        # Corrected calculation for num_training_steps
+        if len(self.train_dataloader) > 0 and self.gradient_accumulation_steps > 0:
+            num_optimizer_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.gradient_accumulation_steps)
+            num_training_steps = num_optimizer_steps_per_epoch * self.num_epochs
+        else: # Handle cases with empty dataloader or invalid gradient_accumulation_steps
+            num_training_steps = 1 # Avoid division by zero, scheduler still needs > 0 total_steps
+            if len(self.train_dataloader) == 0 :
+                logger.warning("Train dataloader is empty. Scheduler total_steps set to 1.")
+
+        self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.learning_rate, total_steps=num_training_steps, pct_start=0.1, anneal_strategy='cos', div_factor=25.0, final_div_factor=10000.0)
         self.scaler = torch.amp.GradScaler(enabled=self.fp16)
 
         if self.use_wandb and self.is_main_process:
@@ -329,6 +323,10 @@ class ApertisTrainer:
             epoch_loss_accumulator = 0.0
             batches_accumulated = 0
             
+            if not self.train_dataloader: # Handle empty dataloader
+                logger.warning(f"Skipping epoch {epoch+1} as train_dataloader is empty.")
+                continue
+
             progress_bar = tqdm(total=len(self.train_dataloader), desc=f"Epoch {epoch+1}/{self.num_epochs}", disable=not self.is_main_process)
             for step, batch in enumerate(self.train_dataloader):
                 try:
@@ -397,7 +395,6 @@ class ApertisTrainer:
                 continue 
             logger.info(f"Epoch {epoch+1} was interrupted. Continuing to next epoch or finishing if it was the last.")
 
-
         if self.is_main_process: self.save_checkpoint("final")
         logger.info("Training completed")
         if self.use_wandb and self.is_main_process: wandb.finish()
@@ -441,7 +438,7 @@ class ApertisTrainer:
         elif hasattr(self.model, 'config'): model_config = self.model.config 
         else: logger.error("Cannot find 'config' on model. Config.json will not be saved.")
 
-        model_save_path = os.path.join(checkpoint_dir, "pytorch_model.bin") # Using HF convention
+        model_save_path = os.path.join(checkpoint_dir, "pytorch_model.bin") 
         try: torch.save(model_to_save.state_dict(), model_save_path)
         except Exception as e: logger.error(f"Failed to save model state_dict to {model_save_path}: {e}"); return
 
@@ -474,7 +471,6 @@ def train_from_config(config_path: str):
     except Exception as e: logger.error(f"Failed to load vocab for size determination: {e}"); return
 
     try:
-        # Pass the loaded vocab_dict and actual_vocab_s to ApertisDataset
         train_ds = ApertisDataset(
             data_path=data_cfg.get("train_data_path"), 
             vocab_dict=loaded_vocab_dict, 
@@ -497,10 +493,9 @@ def train_from_config(config_path: str):
             )
     except Exception as e: logger.error(f"Error creating datasets: {e}"); return
     
-    # Use all keys from ApertisConfig defaults and override with model_cfg
     apertis_config_defaults = ApertisConfig().to_dict()
-    model_params = {**apertis_config_defaults, **model_cfg} # model_cfg overrides defaults
-    model_params["vocab_size"] = actual_vocab_s # Ensure correct vocab size
+    model_params = {**apertis_config_defaults, **model_cfg} 
+    model_params["vocab_size"] = actual_vocab_s 
     
     try:
         model_conf_obj = ApertisConfig(**model_params)
