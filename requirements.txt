@@ -7,3 +7,5 @@ wandb>=0.12.0
 torchvision>=0.11.0
 setuptools>=58.0.0
 wheel>=0.37.0
+transformers>=4.0.0 
+tokenizers>=0.10.0  
