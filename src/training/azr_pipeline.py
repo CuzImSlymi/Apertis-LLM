@@ -72,72 +72,71 @@ class AbsoluteZeroReasonerTrainer:
         setup_logging(log_level, log_file)
     
     def _setup_model(self) -> Tuple[torch.nn.Module, Any]:
-        """Set up the model and tokenizer."""
         try:
-            # Map config parameters to match Apertis model expectations
-            model_config = self.config.get("model", {}).copy()
+            model_config_from_file = self.config.get("model", {}).copy()
             
-            # Handle parameter name differences
             param_mapping = {
                 "rms_norm_eps": "layer_norm_eps",
                 "attention_dropout": "attention_probs_dropout_prob"
             }
             
             for old_param, new_param in param_mapping.items():
-                if old_param in model_config:
+                if old_param in model_config_from_file:
                     logger.info(f"Mapped config parameter '{old_param}' to '{new_param}'")
-                    model_config[new_param] = model_config.pop(old_param)
+                    model_config_from_file[new_param] = model_config_from_file.pop(old_param)
             
-            # Import here to avoid circular imports
             from src.model.core import ApertisConfig, ApertisForCausalLM
             
-            # Get the list of valid parameters for ApertisConfig
+            actual_tokenizer_dict = {}
+            actual_vocab_size = 0 # Default if vocab file fails to load
+            default_vocab_for_model_config = model_config_from_file.get("vocab_size", 32000) # Get from config or default
+
+            vocab_path = self.config.get("data", {}).get("tokenizer_path", None)
+            if vocab_path and os.path.exists(vocab_path):
+                with open(vocab_path, 'r', encoding='utf-8') as f:
+                    actual_tokenizer_dict = json.load(f)
+                actual_vocab_size = len(actual_tokenizer_dict)
+                logger.info(f"Loaded vocabulary with {actual_vocab_size} tokens from {vocab_path} for model configuration.")
+                # Override the vocab_size in the model_config_from_file
+                model_config_from_file["vocab_size"] = actual_vocab_size
+            else:
+                logger.warning(f"No vocabulary file found at {vocab_path} or path not provided. "
+                               f"Model will use configured/default vocab_size: {default_vocab_for_model_config}.")
+                # Use the vocab_size from config, or if it's not there, a fallback for placeholder tokenizer
+                actual_vocab_size = default_vocab_for_model_config 
+                actual_tokenizer_dict = { # Fallback tokenizer for the generator functions
+                    "<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3
+                }
+                # Ensure model_config_from_file has a vocab_size if it was missing and no vocab file
+                if "vocab_size" not in model_config_from_file:
+                     model_config_from_file["vocab_size"] = actual_vocab_size
+
+
             valid_params = set(ApertisConfig.__init__.__code__.co_varnames)
-            
-            # Filter out invalid parameters
             invalid_params = []
-            filtered_config = {}
-            for param, value in model_config.items():
+            filtered_config_for_apertis = {}
+            for param, value in model_config_from_file.items():
                 if param in valid_params:
-                    filtered_config[param] = value
+                    filtered_config_for_apertis[param] = value
                 else:
                     invalid_params.append(param)
             
             if invalid_params:
-                logger.info(f"Filtered out unsupported parameters: {', '.join(invalid_params)}")
+                logger.info(f"Filtered out unsupported parameters for ApertisConfig: {', '.join(invalid_params)}")
             
-            # Create model config with only valid parameters
-            model_config_obj = ApertisConfig(**filtered_config)
-            
-            # Create model
+            model_config_obj = ApertisConfig(**filtered_config_for_apertis)
+
             model = ApertisForCausalLM(model_config_obj)
-            logger.info(f"Created ApertisForCausalLM with config: {model_config_obj.__dict__}")
+            logger.info(f"Created ApertisForCausalLM with actual config: {model_config_obj.__dict__}")
             
-            # Load vocabulary
-            vocab_path = self.config.get("data", {}).get("tokenizer_path", None)
-            if vocab_path and os.path.exists(vocab_path):
-                with open(vocab_path, 'r', encoding='utf-8') as f:
-                    tokenizer = json.load(f)
-                logger.info(f"Loaded vocabulary with {len(tokenizer)} tokens from {vocab_path}")
-            else:
-                # Create a simple tokenizer if no vocabulary is provided
-                tokenizer = {
-                    "<pad>": 0,
-                    "<unk>": 1,
-                    "<bos>": 2,
-                    "<eos>": 3
-                }
-                logger.warning("No vocabulary file provided, using minimal default tokenizer")
-            
-            # Move model to device
             device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
             logger.info(f"Using device: {device}")
             
-            return model, tokenizer
+            return model, actual_tokenizer_dict # Return the loaded or fallback dictionary
             
         except Exception as e:
-            logger.error(f"Error creating model with {self.config.get('model', {})}: {e}")
+            logger.error(f"Error creating model with config {self.config.get('model', {})}: {e}", exc_info=True)
             raise
     
     def _init_components(self):
