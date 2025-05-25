@@ -787,9 +787,9 @@ class ApertisInterface:
                             "max_attempts": max_attempts, "seed_tasks_path": seed_p, 
                             "seed_task_probability": seed_prob,
                             "base_prompt": "Generate a challenging reasoning problem.",
-                            "max_new_tokens": 512, "temperature": temperature, "top_p": top_p
+                            "max_new_tokens": 100, "temperature": temperature, "top_p": top_p
                         },
-                        "task_validator": {"min_length": 10, "max_length": 2000, "min_complexity": 0.1, "max_complexity": 1.0, "min_clarity": 0.3}, # Adjusted to match defaults in TaskValidator
+                        "task_validator": {"min_length": 10, "max_length": 2500, "min_complexity": 0.1, "max_complexity": 1.0, "min_clarity": 0.3}, # Adjusted to match defaults in TaskValidator
                         "solution_generator": {"max_attempts": max_attempts, "base_prompt": "Solve the following problem step by step:", "include_task_type_hint": True, "max_new_tokens": 1024, "temperature": temperature, "top_p": top_p},
                         "solution_validator": {"min_coherence": 0.3, "min_relevance": 0.3, "min_structure": 0.2}, # Adjusted
                         "learnability_reward": {"weight": learn_weight},
