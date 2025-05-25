@@ -295,8 +295,8 @@ class ApertisInterface:
             return self.detokenize(response_ids)
         except Exception as e:
             logger.error(f"Error generating response: {e}", exc_info=True)
-            return f"Error: {str(e)}"
-    
+            return f"Error generating response: {str(e)}"
+
     def chat(
         self, message: str, image_path: Optional[str] = None, max_length: int = 100,
         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9,
@@ -370,6 +370,82 @@ class ApertisInterface:
                             wandb_train_cb.change(lambda x: gr.update(visible=x), inputs=wandb_train_cb, outputs=wandb_proj_train_tb)
                             start_train_btn = gr.Button("Start Training")
                             train_status_tb = gr.Textbox(label="Training Status", interactive=False, lines=10)
+
+                # New AZR Tab
+                with gr.TabItem("Absolute Zero Reasoner"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("## Absolute Zero Reasoner Training")
+                            gr.Markdown("""
+                            Train your model using the Absolute Zero Reasoner method, which enables 
+                            language models to improve reasoning capabilities through self-play without 
+                            requiring any external training data.
+                            """)
+                            
+                            gr.Markdown("## Model Config")
+                            azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                            azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
+                            azr_multimodal_cb = gr.Checkbox(label="Multimodal")
+                            azr_expert_sys_cb = gr.Checkbox(label="Use Expert System")
+                            
+                            gr.Markdown("## Vocabulary")
+                            azr_vocab_file_up = gr.File(label="Vocab File (JSON)", file_types=[".json"])
+                            
+                            gr.Markdown("## Seed Data (Optional)")
+                            azr_seed_tasks_up = gr.File(label="Seed Tasks (JSONL, optional)", file_types=[".jsonl"])
+                            azr_seed_prob_sl = gr.Slider(0.0, 1.0, 0.2, step=0.05, label="Seed Task Probability")
+                            
+                        with gr.Column(scale=1):
+                            gr.Markdown("## AZR Training Parameters")
+                            azr_iterations_sl = gr.Slider(10, 500, 100, step=10, label="Number of Iterations")
+                            azr_tasks_per_iter_sl = gr.Slider(1, 20, 5, step=1, label="Tasks Per Iteration")
+                            
+                            with gr.Accordion("Task Generation", open=False):
+                                azr_task_types = gr.CheckboxGroup(
+                                    ["abduction", "deduction", "induction"], 
+                                    value=["abduction", "deduction", "induction"],
+                                    label="Task Types"
+                                )
+                                azr_task_dist_abduction = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="Abduction Weight")
+                                azr_task_dist_deduction = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="Deduction Weight")
+                                azr_task_dist_induction = gr.Slider(0.0, 1.0, 0.4, step=0.05, label="Induction Weight")
+                                azr_max_attempts_sl = gr.Slider(1, 10, 3, step=1, label="Max Generation Attempts")
+                                azr_temperature_sl = gr.Slider(0.1, 1.5, 0.7, step=0.05, label="Generation Temperature")
+                                azr_top_p_sl = gr.Slider(0.1, 1.0, 0.9, step=0.05, label="Top-P")
+                            
+                            with gr.Accordion("Rewards", open=False):
+                                gr.Markdown("### Learnability Reward")
+                                azr_learn_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Weight")
+                                
+                                gr.Markdown("### Accuracy Reward")
+                                azr_acc_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Weight")
+                                azr_partial_credit_cb = gr.Checkbox(value=True, label="Allow Partial Credit")
+                                
+                                gr.Markdown("### Diversity Reward")
+                                azr_div_weight_sl = gr.Slider(0.0, 2.0, 0.5, step=0.1, label="Weight")
+                                azr_history_size_sl = gr.Slider(1, 50, 10, step=1, label="History Size")
+                                
+                                gr.Markdown("### Complexity Reward")
+                                azr_complex_weight_sl = gr.Slider(0.0, 2.0, 0.3, step=0.1, label="Weight")
+                                azr_target_complex_sl = gr.Slider(0.0, 1.0, 0.7, step=0.05, label="Target Complexity")
+                                azr_tolerance_sl = gr.Slider(0.0, 0.5, 0.2, step=0.05, label="Tolerance")
+                            
+                            with gr.Accordion("Python Executor", open=False):
+                                azr_timeout_sl = gr.Slider(1, 30, 5, step=1, label="Execution Timeout (seconds)")
+                                azr_max_output_sl = gr.Slider(1000, 50000, 10000, step=1000, label="Max Output Size")
+                            
+                            with gr.Accordion("GPU", open=False):
+                                azr_gpu_choices = [str(g['id']) for g in available_gpus_list]
+                                azr_gpu_select_cbg = gr.CheckboxGroup(choices=azr_gpu_choices, value=[azr_gpu_choices[0]] if azr_gpu_choices else [], label="Select GPUs", visible=bool(azr_gpu_choices))
+                                azr_gpu_mem_frac_sl = gr.Slider(0.1, 1.0, 0.7, step=0.05, label="GPU Memory Fraction")
+                            
+                            azr_output_dir_tb = gr.Textbox("output_azr", label="Output Directory")
+                            azr_wandb_cb = gr.Checkbox(label="Log to W&B")
+                            azr_wandb_proj_tb = gr.Textbox("apertis-azr", label="W&B Project", visible=False)
+                            azr_wandb_cb.change(lambda x: gr.update(visible=x), inputs=[azr_wandb_cb], outputs=[azr_wandb_proj_tb])
+                            
+                            azr_start_btn = gr.Button("Start AZR Training")
+                            azr_status_tb = gr.Textbox(label="AZR Training Status", interactive=False, lines=10)
 
                 with gr.TabItem("Models"):
                     with gr.Row():
@@ -506,5 +582,210 @@ class ApertisInterface:
                                   chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
                                   gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb],
                                  [train_status_tb])
+            
+            # AZR Training Handler
+            def ui_start_azr_training_handler(
+                m_s, attn_t, m_m, exp_s, voc_f, seed_f, seed_prob,
+                iterations, tasks_per_iter, task_types, abduction_w, deduction_w, induction_w,
+                max_attempts, temperature, top_p, learn_weight, acc_weight, partial_credit,
+                div_weight, history_size, complex_weight, target_complex, tolerance,
+                timeout, max_output, g_sel, g_mem_f, out_d, use_wb, wb_p
+            ):
+                if not voc_f: return "Vocabulary file is required."
+                
+                # Create temporary directory for files
+                tmp_dir = tempfile.mkdtemp()
+                vocab_p = os.path.join(tmp_dir, "vocab.json")
+                shutil.copy(voc_f.name, vocab_p)
+                
+                # Handle seed file if provided
+                seed_p = None
+                if seed_f:
+                    seed_p = os.path.join(tmp_dir, "seed_tasks.jsonl")
+                    shutil.copy(seed_f.name, seed_p)
+                
+                # Normalize task distribution weights
+                task_dist = []
+                if "abduction" in task_types:
+                    task_dist.append(abduction_w)
+                else:
+                    task_dist.append(0.0)
+                    
+                if "deduction" in task_types:
+                    task_dist.append(deduction_w)
+                else:
+                    task_dist.append(0.0)
+                    
+                if "induction" in task_types:
+                    task_dist.append(induction_w)
+                else:
+                    task_dist.append(0.0)
+                
+                # Normalize to sum to 1.0
+                total = sum(task_dist)
+                if total > 0:
+                    task_dist = [w/total for w in task_dist]
+                else:
+                    task_dist = [1/3, 1/3, 1/3]  # Default equal distribution
+                
+                # Selected GPUs
+                sel_gpus = [int(gid) for gid in g_sel] if g_sel else None
+                
+                # Create configuration
+                cfg = {
+                    "model": {
+                        "vocab_size": 32000,  # Will be determined from vocab file
+                        "hidden_size": 768,   # Will be updated based on model size
+                        "num_hidden_layers": 12,
+                        "num_attention_heads": 12,
+                        "intermediate_size": 3072,
+                        "hidden_act": "silu",
+                        "max_position_embeddings": 4096,
+                        "initializer_range": 0.02,
+                        "rms_norm_eps": 1e-6,
+                        "use_cache": True,
+                        "pad_token_id": 0,
+                        "bos_token_id": 1,
+                        "eos_token_id": 2,
+                        "tie_word_embeddings": False,
+                        "rope_theta": 10000.0,
+                        "attention_bias": False,
+                        "attention_dropout": 0.0,
+                        "multimodal": m_m,
+                        "use_expert_system": exp_s
+                    },
+                    "data": {
+                        "tokenizer_path": vocab_p
+                    },
+                    "training": {
+                        "method": "azr",
+                        "output_dir": out_d,
+                        "batch_size": 1,
+                        "learning_rate": 5e-5,
+                        "weight_decay": 0.01,
+                        "use_wandb": use_wb,
+                        "wandb_project": wb_p if use_wb else "apertis-azr",
+                        "fp16": True,
+                        "device": "cuda" if torch.cuda.is_available() else "cpu",
+                        "gpu_memory_fraction": g_mem_f,
+                        "use_gradient_checkpointing": True,
+                        "gpu_ids": sel_gpus
+                    },
+                    "azr": {
+                        "num_iterations": iterations,
+                        "tasks_per_iteration": tasks_per_iter,
+                        "checkpoint_interval": 10,
+                        "python_executor": {
+                            "timeout": timeout,
+                            "max_output_size": max_output
+                        },
+                        "task_generator": {
+                            "task_types": task_types,
+                            "task_distribution": task_dist,
+                            "max_attempts": max_attempts,
+                            "seed_tasks_path": seed_p,
+                            "seed_task_probability": seed_prob,
+                            "base_prompt": "Generate a challenging reasoning problem.",
+                            "max_new_tokens": 512,
+                            "temperature": temperature,
+                            "top_p": top_p
+                        },
+                        "task_validator": {
+                            "min_length": 20,
+                            "max_length": 1000,
+                            "min_complexity": 0.3,
+                            "max_complexity": 0.9,
+                            "min_clarity": 0.5
+                        },
+                        "solution_generator": {
+                            "max_attempts": max_attempts,
+                            "base_prompt": "Solve the following problem step by step:",
+                            "include_task_type_hint": True,
+                            "max_new_tokens": 1024,
+                            "temperature": temperature,
+                            "top_p": top_p
+                        },
+                        "solution_validator": {
+                            "min_coherence": 0.5,
+                            "min_relevance": 0.6,
+                            "min_structure": 0.4,
+                            "min_output_similarity": 0.8
+                        },
+                        "learnability_reward": {
+                            "weight": learn_weight,
+                            "min_threshold": 0.0,
+                            "max_threshold": 1.0
+                        },
+                        "accuracy_reward": {
+                            "weight": acc_weight,
+                            "partial_credit": partial_credit
+                        },
+                        "diversity_reward": {
+                            "weight": div_weight,
+                            "history_size": history_size
+                        },
+                        "complexity_reward": {
+                            "weight": complex_weight,
+                            "target_complexity": target_complex,
+                            "tolerance": tolerance
+                        },
+                        "reward_calculator": {},
+                        "tracker": {
+                            "save_tasks": True,
+                            "save_solutions": True
+                        }
+                    }
+                }
+                
+                # Update model config based on selected size
+                _presets = {
+                    "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+                    "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+                    "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096}
+                }
+                cfg["model"].update(_presets[m_s])
+                
+                # Save configuration
+                os.makedirs(out_d, exist_ok=True)
+                cfg_path = os.path.join(tmp_dir, "azr_config.json")
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                
+                # Copy config to output dir for reference
+                out_cfg_path = os.path.join(out_d, "azr_config.json")
+                with open(out_cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                
+                # Start training in a separate thread
+                import threading
+                def _thread_azr_train(c_path, t_dir):
+                    try:
+                        from src.training import train_from_config
+                        train_from_config(c_path)
+                    except Exception as e:
+                        logger.error(f"Error in AZR training: {e}", exc_info=True)
+                    finally:
+                        shutil.rmtree(t_dir)
+                
+                threading.Thread(target=_thread_azr_train, args=(cfg_path, tmp_dir), daemon=True).start()
+                return f"AZR Training started. Configuration saved to {out_cfg_path}. Logs and outputs will be in {out_d}."
+            
+            # Connect AZR training button
+            azr_start_btn.click(
+                ui_start_azr_training_handler,
+                [
+                    azr_model_size_dd, azr_attn_type_dd, azr_multimodal_cb, azr_expert_sys_cb,
+                    azr_vocab_file_up, azr_seed_tasks_up, azr_seed_prob_sl,
+                    azr_iterations_sl, azr_tasks_per_iter_sl, azr_task_types,
+                    azr_task_dist_abduction, azr_task_dist_deduction, azr_task_dist_induction,
+                    azr_max_attempts_sl, azr_temperature_sl, azr_top_p_sl,
+                    azr_learn_weight_sl, azr_acc_weight_sl, azr_partial_credit_cb,
+                    azr_div_weight_sl, azr_history_size_sl, azr_complex_weight_sl,
+                    azr_target_complex_sl, azr_tolerance_sl, azr_timeout_sl, azr_max_output_sl,
+                    azr_gpu_select_cbg, azr_gpu_mem_frac_sl, azr_output_dir_tb,
+                    azr_wandb_cb, azr_wandb_proj_tb
+                ],
+                [azr_status_tb]
+            )
 
         interface.launch(server_name="0.0.0.0", server_port=self.port, share=self.share)
