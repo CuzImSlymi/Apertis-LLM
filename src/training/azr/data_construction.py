@@ -40,91 +40,90 @@ class TaskGenerator:
             return {task_type: [] for task_type in self.task_types}
     
     def generate_task(self, model, tokenizer) -> Dict[str, Any]:
-        """Generate a reasoning task using the model."""
-        # Select task type based on distribution
         import numpy as np
         task_type = np.random.choice(self.task_types, p=self.task_distribution)
         
-        # Use seed task if available and configured
         if self.seed_tasks.get(task_type) and np.random.random() < self.config.get("seed_task_probability", 0.2):
-            seed_tasks = self.seed_tasks.get(task_type, [])
-            if seed_tasks:  # Check if the list is not empty
-                task = np.random.choice(seed_tasks)
+            seed_tasks_for_type = self.seed_tasks.get(task_type, [])
+            if seed_tasks_for_type:
+                task = np.random.choice(seed_tasks_for_type)
                 return {"task": task, "type": task_type, "from_seed": True}
         
-        # Generate task using model
         prompt = self._get_task_generation_prompt(task_type)
-        
-        # Determine device
         device = self._get_model_device(model)
         
+        reverse_tokenizer = {v: k for k, v in tokenizer.items()}
+
         for attempt in range(self.max_attempts):
             try:
-                # Generate task using model
-                # Convert tokenizer from dict to function if needed
                 if isinstance(tokenizer, dict):
-                    # If tokenizer is a dictionary, create a simple tokenizer function
                     def tokenize_func(text, return_tensors=None):
-                        tokens = []
-                        for word in text.split():
-                            token_id = tokenizer.get(word, tokenizer.get("<unk>", 3))
-                            tokens.append(token_id)
-                        tokens_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
-                        result = {"input_ids": tokens_tensor}
-                        return result
-                    tokenize = tokenize_func
+                        tokens_list = []
+                        for word_in_text in text.split():
+                            token_id_val = tokenizer.get(word_in_text, tokenizer.get("<unk>", 3))
+                            tokens_list.append(token_id_val)
+                        tokens_tensor_val = torch.tensor([tokens_list], dtype=torch.long, device=device)
+                        return {"input_ids": tokens_tensor_val}
+                    tokenize_for_input = tokenize_func
                 else:
-                    # Use the provided tokenizer directly
-                    tokenize = tokenizer
+                    tokenize_for_input = tokenizer
                 
-                # Use the appropriate tokenizer
-                inputs = tokenize(prompt, return_tensors="pt")
+                inputs = tokenize_for_input(prompt, return_tensors="pt")
                 
-                # Ensure inputs are on the same device as the model
                 if hasattr(inputs, "to"):
                     inputs = inputs.to(device)
                 else:
-                    # If inputs is a dict, move each tensor to the correct device
-                    for key in inputs:
-                        if isinstance(inputs[key], torch.Tensor):
-                            inputs[key] = inputs[key].to(device)
+                    for key_in_inputs in inputs:
+                        if isinstance(inputs[key_in_inputs], torch.Tensor):
+                            inputs[key_in_inputs] = inputs[key_in_inputs].to(device)
                 
-                outputs = model.generate(
+                outputs_tensor = model.generate(
                     **inputs,
                     max_new_tokens=self.config.get("max_new_tokens", 512),
                     temperature=self.config.get("temperature", 0.7),
                     top_p=self.config.get("top_p", 0.9),
-                    do_sample=True
+                    do_sample=True,
+                    eos_token_id=tokenizer.get("<eos>", 3) # Added eos_token_id
                 )
                 
-                # Handle decoding based on tokenizer type
-                if hasattr(tokenize, "decode"):
-                    # If tokenizer has a decode method, use it
-                    generated_text = tokenize.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                else:
-                    # Simple fallback decoding
-                    generated_text = " ".join([str(token) for token in outputs[0][inputs["input_ids"].shape[1]:].tolist()])
+                output_ids_list = outputs_tensor[0][inputs["input_ids"].shape[1]:].tolist()
+                generated_tokens_text = [reverse_tokenizer.get(token_id_val, f"<ID:{token_id_val}>") for token_id_val in output_ids_list]
                 
-                # Extract task from generated text
-                task = self._extract_task(generated_text)
+                # Filter out special tokens for cleaner text
+                special_tokens_to_filter = ["<pad>", "<bos>", "<eos>", "<unk>"] # Include <unk> if desired
+                # Or get them from the tokenizer if they have specific IDs you want to map to actual strings
+                # eos_token_str = reverse_tokenizer.get(tokenizer.get("<eos>", 3), "<eos>") # Example
+                
+                filtered_tokens = []
+                for tok_id in output_ids_list:
+                    token_str = reverse_tokenizer.get(tok_id)
+                    if token_str == reverse_tokenizer.get(tokenizer.get("<eos>", 3)): # Stop if EOS token is encountered
+                        break
+                    if token_str and token_str not in special_tokens_to_filter:
+                        filtered_tokens.append(token_str)
+                    elif not token_str: # Fallback for unknown ID
+                         filtered_tokens.append(f"<ID:{tok_id}>")
+
+                generated_text_str = " ".join(filtered_tokens).strip()
+                
+                task = self._extract_task(generated_text_str)
                 if task:
-                    # Add a default task if the generated one is too short
-                    if len(task) < 10:
-                        task = f"Create a {task_type} reasoning problem about {task}."
+                    # We can check if the task came from a seed or if it's a placeholder based on the return dict.
+                    # For now, applying a simple length check on the generated task.
+                    if len(task) < 10: # Simple heuristic, adjust as needed
+                        task = f"Create a {task_type} reasoning problem about '{task}' that is more detailed."
                     return {"task": task, "type": task_type, "from_seed": False}
                     
                 logger.warning(f"Failed to extract task from generated text (attempt {attempt+1}/{self.max_attempts})")
             except Exception as e:
-                logger.error(f"Error generating task (attempt {attempt+1}/{self.max_attempts}): {e}")
+                logger.error(f"Error generating task (attempt {attempt+1}/{self.max_attempts}): {e}", exc_info=True)
                 
-        # If all attempts fail, use a seed task if available
-        seed_tasks = self.seed_tasks.get(task_type, [])
-        if seed_tasks:  # Check if the list is not empty
-            task = np.random.choice(seed_tasks)
+        seed_tasks_for_type_fallback = self.seed_tasks.get(task_type, [])
+        if seed_tasks_for_type_fallback:
+            task = np.random.choice(seed_tasks_for_type_fallback)
             logger.warning(f"Using seed task after {self.max_attempts} failed generation attempts")
             return {"task": task, "type": task_type, "from_seed": True}
             
-        # Last resort - return a simple placeholder task
         logger.info(f"All task generation attempts failed, using placeholder task")
         return {
             "task": f"Create a simple {task_type} reasoning problem about numbers. For example, if we have a sequence 2, 4, 6, 8, what comes next and why?",
@@ -344,47 +343,38 @@ class SolutionGenerator:
         self.max_attempts = config.get("max_attempts", 3)
         
     def generate_solution(self, task_info: Dict[str, Any], model, tokenizer) -> Dict[str, Any]:
-        """Generate a solution for the given task."""
         task = task_info.get("task", "")
         task_type = task_info.get("type", "")
-        
-        # Generate solution using model
         prompt = self._get_solution_generation_prompt(task, task_type)
-        
-        # Determine device
         device = self._get_model_device(model)
-        
+
+        # Create reverse tokenizer for decoding
+        reverse_tokenizer = {v: k for k, v in tokenizer.items()}
+
         for attempt in range(self.max_attempts):
             try:
-                # Convert tokenizer from dict to function if needed
                 if isinstance(tokenizer, dict):
-                    # If tokenizer is a dictionary, create a simple tokenizer function
                     def tokenize_func(text, return_tensors=None):
-                        tokens = []
-                        for word in text.split():
-                            token_id = tokenizer.get(word, tokenizer.get("<unk>", 3))
-                            tokens.append(token_id)
-                        tokens_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
-                        result = {"input_ids": tokens_tensor}
-                        return result
-                    tokenize = tokenize_func
+                        tokens_list = []
+                        for word_in_text in text.split():
+                            token_id_val = tokenizer.get(word_in_text, tokenizer.get("<unk>", 3))
+                            tokens_list.append(token_id_val)
+                        tokens_tensor_val = torch.tensor([tokens_list], dtype=torch.long, device=device)
+                        return {"input_ids": tokens_tensor_val}
+                    tokenize_for_input = tokenize_func
                 else:
-                    # Use the provided tokenizer directly
-                    tokenize = tokenizer
+                    tokenize_for_input = tokenizer
                 
-                # Use the appropriate tokenizer
-                inputs = tokenize(prompt, return_tensors="pt")
+                inputs = tokenize_for_input(prompt, return_tensors="pt")
                 
-                # Ensure inputs are on the same device as the model
                 if hasattr(inputs, "to"):
                     inputs = inputs.to(device)
                 else:
-                    # If inputs is a dict, move each tensor to the correct device
-                    for key in inputs:
-                        if isinstance(inputs[key], torch.Tensor):
-                            inputs[key] = inputs[key].to(device)
+                    for key_in_inputs in inputs:
+                        if isinstance(inputs[key_in_inputs], torch.Tensor):
+                            inputs[key_in_inputs] = inputs[key_in_inputs].to(device)
                 
-                outputs = model.generate(
+                outputs_tensor = model.generate(
                     **inputs,
                     max_new_tokens=self.config.get("max_new_tokens", 1024),
                     temperature=self.config.get("temperature", 0.7),
@@ -392,32 +382,28 @@ class SolutionGenerator:
                     do_sample=True
                 )
                 
-                # Handle decoding based on tokenizer type
-                if hasattr(tokenize, "decode"):
-                    # If tokenizer has a decode method, use it
-                    generated_text = tokenize.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                else:
-                    # Simple fallback decoding
-                    generated_text = " ".join([str(token) for token in outputs[0][inputs["input_ids"].shape[1]:].tolist()])
-                
-                # Extract solution from generated text
-                solution = self._extract_solution(generated_text)
+                output_ids_list = outputs_tensor[0][inputs["input_ids"].shape[1]:].tolist()
+                # Decode using reverse_tokenizer
+                generated_tokens_text = [reverse_tokenizer.get(token_id_val, str(token_id_val)) for token_id_val in output_ids_list]
+                # Filter out special tokens for cleaner text, adjust as needed
+                filtered_tokens = [tok for tok in generated_tokens_text if tok not in ["<pad>", "<bos>", "<eos>"]]
+                generated_text_str = " ".join(filtered_tokens)
+                                
+                solution = self._extract_solution(generated_text_str)
                 if solution:
                     return {
                         "task": task,
                         "type": task_type,
                         "solution": solution,
-                        "raw_generation": generated_text
+                        "raw_generation": generated_text_str 
                     }
                     
                 logger.warning(f"Failed to extract solution from generated text (attempt {attempt+1}/{self.max_attempts})")
             except Exception as e:
-                logger.error(f"Error generating solution (attempt {attempt+1}/{self.max_attempts}): {e}")
+                logger.error(f"Error generating solution (attempt {attempt+1}/{self.max_attempts}): {e}", exc_info=True)
                 
-        # If all attempts fail, return a placeholder solution
         logger.info(f"All solution generation attempts failed, using placeholder solution")
         
-        # Create a more helpful placeholder solution based on task type
         if task_type == "abduction":
             placeholder = f"To solve this abductive reasoning problem, I need to find the most likely explanation. Looking at the given information: {task[:50]}..., I would infer that the most probable cause is related to the key elements mentioned."
         elif task_type == "deduction":
