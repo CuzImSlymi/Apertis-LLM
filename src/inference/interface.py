@@ -678,6 +678,7 @@ class ApertisInterface:
                 cfg_path = os.path.join(tmp_dir, "run_cfg_standard.json"); 
                 with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
                 out_cfg_path = os.path.join(out_d, "run_cfg_standard.json")
+                os.makedirs(out_d, exist_ok=True) # Ensure output directory exists
                 shutil.copy(cfg_path, out_cfg_path)
                 
                 import threading
