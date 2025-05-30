@@ -13,29 +13,23 @@ import torchvision.transforms as transforms
 
 import sys
 import os
-import math # Import math for ceil
+import math
+import threading
 
-# Add the parent directory to the path so we can import the src modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src.model.core import ApertisConfig, ApertisForCausalLM
 
-# Import distributed training modules
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Helper function to load vocabulary and get its size
 def _load_vocabulary_and_get_size(tokenizer_path: str) -> Tuple[Dict[str, int], int]:
-    """Loads vocabulary, returns the vocab dict and its actual size (number of entries).
-       Warns if max_id is inconsistent with the number of entries.
-    """
     try:
         with open(tokenizer_path, 'r', encoding='utf-8') as f:
             vocab_data = json.load(f)
@@ -202,6 +196,7 @@ class ApertisTrainer:
         fp16: bool = True, device: Optional[str] = None, checkpoint_steps: int = 1000, iteration_checkpoint_steps: int = 0,
         gpu_memory_fraction: float = 0.7, use_gradient_checkpointing: bool = True, eval_every_n_epochs: int = 1,
         dynamic_batch_sizing: bool = True, gpu_ids: Optional[List[int]] = None, distributed_training: bool = False, local_rank: int = -1,
+        stop_event: Optional[threading.Event] = None
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -227,6 +222,7 @@ class ApertisTrainer:
         self.gpu_ids = gpu_ids
         self.distributed_training = distributed_training
         self.local_rank = local_rank
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
 
         os.makedirs(output_dir, exist_ok=True)
         self.world_size = 1
@@ -281,12 +277,11 @@ class ApertisTrainer:
                       {'params': [p for n,p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
         self.optimizer = optim.AdamW(opt_groups, lr=self.learning_rate)
         
-        # Corrected calculation for num_training_steps
         if len(self.train_dataloader) > 0 and self.gradient_accumulation_steps > 0:
             num_optimizer_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.gradient_accumulation_steps)
             num_training_steps = num_optimizer_steps_per_epoch * self.num_epochs
-        else: # Handle cases with empty dataloader or invalid gradient_accumulation_steps
-            num_training_steps = 1 # Avoid division by zero, scheduler still needs > 0 total_steps
+        else:
+            num_training_steps = 1
             if len(self.train_dataloader) == 0 :
                 logger.warning("Train dataloader is empty. Scheduler total_steps set to 1.")
 
@@ -318,17 +313,24 @@ class ApertisTrainer:
         best_val_loss = float('inf')
         global_step = 0
         for epoch in range(self.num_epochs):
+            if self.stop_event.is_set():
+                logger.info(f"Stop event received. Halting training at epoch {epoch+1}.")
+                break
             if self.distributed_training and hasattr(self.train_dataloader.sampler, 'set_epoch'): self.train_dataloader.sampler.set_epoch(epoch)
             self.model.train()
             epoch_loss_accumulator = 0.0
             batches_accumulated = 0
             
-            if not self.train_dataloader: # Handle empty dataloader
+            if not self.train_dataloader:
                 logger.warning(f"Skipping epoch {epoch+1} as train_dataloader is empty.")
                 continue
 
             progress_bar = tqdm(total=len(self.train_dataloader), desc=f"Epoch {epoch+1}/{self.num_epochs}", disable=not self.is_main_process)
             for step, batch in enumerate(self.train_dataloader):
+                if self.stop_event.is_set():
+                    logger.info(f"Stop event received during epoch {epoch+1}, step {step+1}. Halting training.")
+                    progress_bar.close()
+                    break
                 try:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with torch.amp.autocast('cuda', enabled=self.fp16):
@@ -378,25 +380,33 @@ class ApertisTrainer:
                         break 
                     else: raise e
                 progress_bar.update(1)
-            else: 
-                progress_bar.close()
-                logger.info(f"Epoch {epoch+1}/{self.num_epochs} completed.")
-                if self.val_dataloader and self.eval_every_n_epochs > 0 and (epoch + 1) % self.eval_every_n_epochs == 0:
-                    val_loss = self.evaluate()
-                    if not np.isinf(val_loss):
-                        logger.info(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}")
-                        if self.use_wandb and self.is_main_process: wandb.log({"eval/val_loss": val_loss, "eval/epoch": epoch + 1}, step=global_step)
-                        if val_loss < best_val_loss and self.is_main_process:
-                            best_val_loss = val_loss
-                            self.save_checkpoint("best_model")
-                            logger.info(f"New best model saved (Val Loss: {val_loss:.4f})")
-                    else: logger.warning(f"Epoch {epoch+1} validation skipped/failed.")
-                if self.is_main_process: self.save_checkpoint(f"epoch-{epoch+1}")
-                continue 
-            logger.info(f"Epoch {epoch+1} was interrupted. Continuing to next epoch or finishing if it was the last.")
+            
+            if self.stop_event.is_set(): # Check again after inner loop
+                break
 
-        if self.is_main_process: self.save_checkpoint("final")
-        logger.info("Training completed")
+            progress_bar.close()
+            logger.info(f"Epoch {epoch+1}/{self.num_epochs} completed.")
+            if self.val_dataloader and self.eval_every_n_epochs > 0 and (epoch + 1) % self.eval_every_n_epochs == 0:
+                if self.stop_event.is_set():
+                    logger.info(f"Stop event received before evaluation for epoch {epoch+1}. Skipping evaluation.")
+                    break
+                val_loss = self.evaluate()
+                if not np.isinf(val_loss):
+                    logger.info(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}")
+                    if self.use_wandb and self.is_main_process: wandb.log({"eval/val_loss": val_loss, "eval/epoch": epoch + 1}, step=global_step)
+                    if val_loss < best_val_loss and self.is_main_process:
+                        best_val_loss = val_loss
+                        self.save_checkpoint("best_model")
+                        logger.info(f"New best model saved (Val Loss: {val_loss:.4f})")
+                else: logger.warning(f"Epoch {epoch+1} validation skipped/failed.")
+            if self.is_main_process: self.save_checkpoint(f"epoch-{epoch+1}")
+
+        if self.is_main_process and not self.stop_event.is_set():
+            self.save_checkpoint("final")
+        elif self.is_main_process and self.stop_event.is_set():
+            logger.info("Training was stopped. Final checkpoint 'final' will not be saved.")
+            
+        logger.info("Training process finished.")
         if self.use_wandb and self.is_main_process: wandb.finish()
 
     def evaluate(self):
@@ -409,7 +419,11 @@ class ApertisTrainer:
         num_val_batches = 0
         progress_bar = tqdm(total=len(self.val_dataloader), desc="Validation", disable=not self.is_main_process)
         with torch.no_grad():
-            for batch in self.val_dataloader:
+            for batch_idx, batch in enumerate(self.val_dataloader):
+                if self.stop_event.is_set():
+                    logger.info(f"Stop event received during evaluation (batch {batch_idx+1}). Halting evaluation.")
+                    progress_bar.close()
+                    return float('inf') # Indicate evaluation was interrupted
                 try:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with torch.amp.autocast('cuda', enabled=self.fp16):
@@ -457,7 +471,7 @@ def get_available_gpus() -> List[Dict[str, Any]]:
             gpu_info.append({"id": i, "name": props.name, "total_memory": props.total_memory / (1024**3), "compute_capability": f"{props.major}.{props.minor}"})
     return gpu_info
 
-def train_from_config(config_path: str):
+def train_from_config(config_path: str, stop_event: Optional[threading.Event] = None):
     try:
         with open(config_path, "r", encoding="utf-8") as f: config = json.load(f)
     except Exception as e: logger.error(f"Failed to load/parse config {config_path}: {e}"); return
@@ -503,6 +517,8 @@ def train_from_config(config_path: str):
         logger.info(f"Created ApertisForCausalLM with config: {model_conf_obj.to_dict()}")
     except Exception as e: logger.error(f"Error creating model with {model_params}: {e}"); return
 
+    actual_stop_event = stop_event if stop_event is not None else threading.Event()
+
     try:
         trainer = ApertisTrainer(
             model, train_ds, val_ds,
@@ -514,16 +530,23 @@ def train_from_config(config_path: str):
             train_cfg.get("iteration_checkpoint_steps",0), train_cfg.get("gpu_memory_fraction",0.7),
             train_cfg.get("use_gradient_checkpointing",True), train_cfg.get("eval_every_n_epochs",1),
             train_cfg.get("dynamic_batch_sizing",True), train_cfg.get("gpu_ids"),
-            train_cfg.get("distributed_training",False), train_cfg.get("local_rank",-1)
+            train_cfg.get("distributed_training",False), train_cfg.get("local_rank",-1),
+            stop_event=actual_stop_event
         )
     except Exception as e: logger.error(f"Error initializing ApertisTrainer: {e}"); return
 
     try:
         logger.info(f"Starting training with config: {config_path}")
         trainer.train()
-        logger.info(f"Finished training for {config_path}")
+        if actual_stop_event.is_set():
+            logger.info(f"Training for {config_path} was stopped by user request.")
+        else:
+            logger.info(f"Finished training for {config_path}")
     except Exception as e: logger.error(f"Error during training: {e}", exc_info=True)
 
 class YoloStyleTrainingPipeline:
-    def __init__(self, config_path: str): self.config_path = config_path
-    def train(self): train_from_config(self.config_path)
+    def __init__(self, config_path: str, stop_event: Optional[threading.Event] = None):
+        self.config_path = config_path
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+    def train(self):
+        train_from_config(self.config_path, self.stop_event)

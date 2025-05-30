@@ -6,8 +6,9 @@ import torch
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
 from tqdm import tqdm
+import threading
 
-from transformers import AutoTokenizer # IMPORT THIS
+from transformers import AutoTokenizer
 
 from .azr.rewards import LearnabilityReward, DiversityReward, ComplexityReward
 from .azr.data_construction import TaskGenerator, TaskValidator, SolutionGenerator, SolutionValidator
@@ -16,11 +17,11 @@ from .azr.utils import save_metrics, load_metrics, setup_logging, PythonExecutor
 logger = logging.getLogger(__name__)
 
 class AbsoluteZeroReasonerTrainer:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, stop_event: Optional[threading.Event] = None):
         self.config = self._load_config(config_path)
         self.setup_logging()
         
-        self.model, self.hf_tokenizer = self._setup_model_and_tokenizer() # MODIFIED METHOD NAME
+        self.model, self.hf_tokenizer = self._setup_model_and_tokenizer()
         
         self._init_components()
         
@@ -42,6 +43,7 @@ class AbsoluteZeroReasonerTrainer:
                 self.metrics = load_metrics(checkpoint_path)
                 logger.info(f"Loaded metrics from checkpoint: {checkpoint_path}")
         
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
         logger.info("Initialized all AZR components")
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
@@ -59,18 +61,15 @@ class AbsoluteZeroReasonerTrainer:
         log_file = self.config.get("log_file", None)
         setup_logging(log_level, log_file)
     
-    def _setup_model_and_tokenizer(self) -> Tuple[torch.nn.Module, Any]: # RENAMED AND MODIFIED
+    def _setup_model_and_tokenizer(self) -> Tuple[torch.nn.Module, Any]:
         try:
             model_config_from_file = self.config.get("model", {}).copy()
             
-            # --- Hugging Face Tokenizer Integration ---
             tokenizer_name = self.config.get("data", {}).get("tokenizer_name", "bert-base-uncased")
             try:
                 hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
                 logger.info(f"Successfully loaded Hugging Face tokenizer: {tokenizer_name}")
-                # Override vocab_size in model_config_from_file with the actual HF tokenizer vocab size
                 model_config_from_file["vocab_size"] = hf_tokenizer.vocab_size
-                # Set pad, bos, eos token IDs from HF tokenizer if available, else use ApertisConfig defaults
                 if hf_tokenizer.pad_token_id is not None:
                     model_config_from_file["pad_token_id"] = hf_tokenizer.pad_token_id
                 if hf_tokenizer.bos_token_id is not None:
@@ -83,9 +82,8 @@ class AbsoluteZeroReasonerTrainer:
             except Exception as e:
                 logger.error(f"Failed to load Hugging Face tokenizer '{tokenizer_name}'. Error: {e}", exc_info=True)
                 logger.warning("Falling back to minimal tokenizer due to HF tokenizer load failure.")
-                # Fallback minimal tokenizer (less ideal)
-                minimal_vocab = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "[SEP]": 102, "[CLS]": 101} # Added common BERT specials
-                class MinimalHFCompatTokenizer: # A mock object that has some HF tokenizer attributes
+                minimal_vocab = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "[SEP]": 102, "[CLS]": 101}
+                class MinimalHFCompatTokenizer:
                     def __init__(self, vocab):
                         self.vocab = vocab
                         self.ids_to_tokens = {v: k for k,v in vocab.items()}
@@ -98,7 +96,6 @@ class AbsoluteZeroReasonerTrainer:
                         self.cls_token_id = vocab.get("[CLS]", 101)
 
                     def encode(self, text, add_special_tokens=True, truncation=True, max_length=512, return_tensors=None):
-                        # Extremely basic tokenization
                         tokens = text.lower().split()
                         ids = [self.vocab.get(t, self.unk_token_id) for t in tokens]
                         if add_special_tokens and hasattr(self, 'cls_token_id') and hasattr(self, 'sep_token_id'):
@@ -117,7 +114,7 @@ class AbsoluteZeroReasonerTrainer:
                             tokens.append(token_str)
                         return " ".join(tokens)
 
-                    def __call__(self, text, **kwargs): # Make it callable like HF tokenizers
+                    def __call__(self, text, **kwargs):
                         return self.encode(text, **kwargs)
 
                 hf_tokenizer = MinimalHFCompatTokenizer(minimal_vocab)
@@ -126,9 +123,6 @@ class AbsoluteZeroReasonerTrainer:
                 model_config_from_file["bos_token_id"] = hf_tokenizer.bos_token_id
                 model_config_from_file["eos_token_id"] = hf_tokenizer.eos_token_id
                 model_config_from_file["unk_token_id"] = hf_tokenizer.unk_token_id
-
-
-            # --- End Hugging Face Tokenizer Integration ---
 
             param_mapping = {
                 "rms_norm_eps": "layer_norm_eps",
@@ -157,11 +151,11 @@ class AbsoluteZeroReasonerTrainer:
             model = ApertisForCausalLM(model_config_obj)
             logger.info(f"Created ApertisForCausalLM with actual config: {model_config_obj.to_dict()}")
             
-            device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+            device = self.config.get("training", {}).get("device", "cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
             logger.info(f"Using device: {device}")
             
-            return model, hf_tokenizer # Return the HF tokenizer object
+            return model, hf_tokenizer
             
         except Exception as e:
             logger.error(f"Error creating model or tokenizer: {e}", exc_info=True)
@@ -186,7 +180,7 @@ class AbsoluteZeroReasonerTrainer:
 
         task_gen_conf = azr_specific_config.get("task_generator", {})
         logger.info(f"TaskGenerator using config: {task_gen_conf}")
-        self.task_generator = TaskGenerator(task_gen_conf) # TaskGenerator will use self.hf_tokenizer internally
+        self.task_generator = TaskGenerator(task_gen_conf)
         logger.info("TaskGenerator initialized.")
 
         task_val_conf = azr_specific_config.get("task_validator", {})
@@ -196,7 +190,7 @@ class AbsoluteZeroReasonerTrainer:
         
         sol_gen_conf = azr_specific_config.get("solution_generator", {})
         logger.info(f"SolutionGenerator using config: {sol_gen_conf}")
-        self.solution_generator = SolutionGenerator(sol_gen_conf) # SolutionGenerator will use self.hf_tokenizer
+        self.solution_generator = SolutionGenerator(sol_gen_conf)
         logger.info("SolutionGenerator initialized.")
 
         sol_val_conf = azr_specific_config.get("solution_validator", {})
@@ -224,7 +218,7 @@ class AbsoluteZeroReasonerTrainer:
     def train(self):
         logger.info("Starting Absolute Zero Reasoner training")
         
-        num_iterations = self.config.get("azr",{}).get("num_iterations", 100) # Get from azr config
+        num_iterations = self.config.get("azr",{}).get("num_iterations", 100)
         tasks_per_iteration = self.config.get("azr",{}).get("tasks_per_iteration", 5)
         checkpoint_interval = self.config.get("azr",{}).get("checkpoint_interval", 10)
         
@@ -236,6 +230,9 @@ class AbsoluteZeroReasonerTrainer:
         start_iteration = self.metrics["iterations"] + 1
         
         for iteration in range(start_iteration, start_iteration + num_iterations):
+            if self.stop_event.is_set():
+                logger.info(f"Stop event received. Halting AZR training at iteration {iteration}.")
+                break
             logger.info(f"Starting iteration {iteration}/{start_iteration + num_iterations - 1}")
             
             should_force_accept_tasks = force_accept_tasks
@@ -250,14 +247,16 @@ class AbsoluteZeroReasonerTrainer:
                 logger.info(f"Valid tasks ({self.metrics['tasks_valid']}) > threshold {min_valid_tasks_before_validation}: Disabling forced solution acceptance")
             
             valid_tasks = []
-            task_rewards_iter = [] # Renamed to avoid conflict with attribute
+            task_rewards_iter = []
             tasks_attempted = 0
             tasks_valid_this_iteration = 0
             
             for task_idx in range(1, tasks_per_iteration + 1):
+                if self.stop_event.is_set():
+                    logger.info(f"Stop event received during task generation for iteration {iteration}. Halting.")
+                    break
                 logger.info(f"Generating task {task_idx}/{tasks_per_iteration}")
                 
-                # Pass the Hugging Face tokenizer object
                 task_info = self.task_generator.generate_task(self.model, self.hf_tokenizer) 
                 self.metrics["tasks_generated"] += 1
                 tasks_attempted += 1
@@ -289,35 +288,39 @@ class AbsoluteZeroReasonerTrainer:
                         "learnability": learnability, "diversity": diversity,
                         "complexity": complexity, "total": learnability + diversity + complexity
                     }
-                    task_rewards_iter.append(reward) # Use local variable
-                    self.metrics["task_rewards"].append(reward) # Append to class attribute list
+                    task_rewards_iter.append(reward)
+                    self.metrics["task_rewards"].append(reward)
                 else:
                     logger.info(f"Task {task_idx} is invalid, skipping. Validation result: {validation_result}")
             
+            if self.stop_event.is_set(): break # Check after task generation loop
+
             task_validation_rate = tasks_valid_this_iteration / tasks_attempted if tasks_attempted > 0 else 0
             self.metrics["validation_rates"]["tasks"].append(task_validation_rate)
             logger.info(f"Task validation rate for iteration {iteration}: {task_validation_rate:.2f}")
             
             valid_solutions = []
-            solution_rewards_iter = [] # Renamed
+            solution_rewards_iter = []
             solutions_attempted = 0
             solutions_valid_this_iteration = 0
             
-            for sol_task_idx, task_info_for_sol in enumerate(valid_tasks): # Renamed task_info
+            for sol_task_idx, task_info_for_sol in enumerate(valid_tasks):
+                if self.stop_event.is_set():
+                    logger.info(f"Stop event received during solution generation for iteration {iteration}. Halting.")
+                    break
                 logger.info(f"Generating solution for task {sol_task_idx + 1}/{len(valid_tasks)}")
                 
-                # Pass the Hugging Face tokenizer object
                 solution_info = self.solution_generator.generate_solution(task_info_for_sol, self.model, self.hf_tokenizer)
                 self.metrics["solutions_generated"] += 1
                 solutions_attempted += 1
                 
-                task_text_for_sol = task_info_for_sol.get("task", "") # Use renamed task_info
+                task_text_for_sol = task_info_for_sol.get("task", "")
                 solution_text = solution_info.get("solution", "")
                 logger.info(f"Task: {task_text_for_sol}\nGenerated solution:\n{solution_text}")
                 
-                validation_result_sol = self.solution_validator.validate(task_info_for_sol, solution_info) # Use renamed task_info
+                validation_result_sol = self.solution_validator.validate(task_info_for_sol, solution_info)
                 
-                is_sol_valid = validation_result_sol["is_valid"] # Renamed
+                is_sol_valid = validation_result_sol["is_valid"]
                 if should_force_accept_solutions and not is_sol_valid:
                     logger.info(f"Force accepting solution for task {sol_task_idx + 1} to ensure training progress")
                     is_sol_valid = True
@@ -328,12 +331,14 @@ class AbsoluteZeroReasonerTrainer:
                     self.metrics["solutions_valid"] += 1
                     solutions_valid_this_iteration += 1
                     
-                    reward_sol = {"correctness": validation_result_sol.get("correctness", 0.5)} # Renamed
-                    solution_rewards_iter.append(reward_sol) # Use local variable
-                    self.metrics["solution_rewards"].append(reward_sol) # Append to class attribute list
+                    reward_sol = {"correctness": validation_result_sol.get("correctness", 0.5)}
+                    solution_rewards_iter.append(reward_sol)
+                    self.metrics["solution_rewards"].append(reward_sol)
                 else:
                     logger.info(f"Solution for task {sol_task_idx + 1} is invalid, skipping. Validation result: {validation_result_sol}")
             
+            if self.stop_event.is_set(): break # Check after solution generation loop
+
             solution_validation_rate = solutions_valid_this_iteration / solutions_attempted if solutions_attempted > 0 else 0
             self.metrics["validation_rates"]["solutions"].append(solution_validation_rate)
             logger.info(f"Solution validation rate for iteration {iteration}: {solution_validation_rate:.2f}")
@@ -341,14 +346,18 @@ class AbsoluteZeroReasonerTrainer:
             self.metrics["iterations"] = iteration
             logger.info(f"Iteration {iteration} metrics: {self.metrics}")
             
-            if iteration % checkpoint_interval == 0:
+            if iteration % checkpoint_interval == 0 and not self.stop_event.is_set():
                 self._save_checkpoint(iteration)
         
-        self._save_checkpoint(self.metrics["iterations"])
-        logger.info("AZR training completed")
+        if not self.stop_event.is_set():
+            self._save_checkpoint(self.metrics["iterations"])
+        else:
+            logger.info("AZR training was stopped. Final checkpoint will not be saved unless it was due.")
+
+        logger.info("AZR training process finished.")
     
     def _save_checkpoint(self, iteration: int):
-        checkpoint_dir = self.config.get("azr",{}).get("checkpoint_dir", "checkpoints") # Get from azr config
+        checkpoint_dir = self.config.get("azr",{}).get("checkpoint_dir", "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         metrics_path = os.path.join(checkpoint_dir, f"metrics_iter_{iteration}.json")
@@ -356,17 +365,24 @@ class AbsoluteZeroReasonerTrainer:
         logger.info(f"Saved metrics to {metrics_path}")
         
         model_path = os.path.join(checkpoint_dir, f"model_iter_{iteration}")
-        self.model.save_pretrained(model_path) # Assumes ApertisForCausalLM has save_pretrained
-        # If you also want to save the HF tokenizer config (though it's loaded by name):
-        # self.hf_tokenizer.save_pretrained(model_path) 
-        logger.info(f"Saved model to {model_path}")
+        if hasattr(self.model, 'save_pretrained'):
+            self.model.save_pretrained(model_path)
+            logger.info(f"Saved model to {model_path} using save_pretrained.")
+        else:
+            # Fallback for models without save_pretrained, e.g. if it's a raw nn.Module
+            torch.save(self.model.state_dict(), os.path.join(model_path, "pytorch_model.bin"))
+            # Save config manually if model is ApertisForCausalLM
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'save_pretrained'):
+                 self.model.config.save_pretrained(model_path)
+            logger.info(f"Saved model state_dict to {model_path}/pytorch_model.bin")
 
-def train_azr(config_path: str):
-    trainer = AbsoluteZeroReasonerTrainer(config_path)
+
+def train_azr(config_path: str, stop_event: Optional[threading.Event] = None):
+    trainer = AbsoluteZeroReasonerTrainer(config_path, stop_event)
     trainer.train()
 
-def train_from_config(config_path: str):
-    return train_azr(config_path)
+def train_from_config(config_path: str, stop_event: Optional[threading.Event] = None): # Renamed arg for consistency
+    return train_azr(config_path, stop_event)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
