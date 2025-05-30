@@ -390,7 +390,7 @@ class ApertisAttention(nn.Module):
                  logger.warning("Config: 'selective_linear' is now treated as 'selective_ssm'.")
             self.attention_mechanism_impl = SelectiveLinearAttention(config=config)
         elif config.attention_type == "standard_mha":
-            self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0) # Bias logic like HF
+            self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0)
             self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0)
             self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0)
             self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0)
@@ -405,8 +405,8 @@ class ApertisAttention(nn.Module):
             self.attention_mechanism_impl = None
 
         self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.output_dropout = nn.Dropout(config.hidden_dropout_prob) # This is for the final output of attention block
-        self.attention_dropout = nn.Dropout(config.attention_probs_dropout_prob) # This is for attention scores/probs
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.attention_dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
     def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -517,13 +517,7 @@ class ApertisLayer(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
         
         x_for_attn = hidden_s
-        if self.rope and self.config.attention_type == "standard_mha": # Apply RoPE only for MHA for now
-             q_rope = self.rope(self.attention.q_proj(self.attention.pre_norm(hidden_s)), position_ids=pos_ids)
-             k_rope = self.rope(self.attention.k_proj(self.attention.pre_norm(hidden_s)), position_ids=pos_ids)
-             # This is a common pattern but slightly changes the flow if q_proj/k_proj are inside ApertisAttention
-             # Let's ensure ApertisAttention handles RoPE internally or receives RoPE'd Q/K
-             # The current structure applies RoPE on hidden_s, then ApertisAttention does QKV proj.
-             # This is also a valid way.
+        if self.rope and self.config.attention_type == "standard_mha":
              x_for_attn = self.rope(hidden_s, position_ids=pos_ids)
 
         att_out, att_w, present_att_cache = self.attention(
@@ -572,83 +566,52 @@ class ApertisModel(nn.Module):
     def get_input_embeddings(self): return self.token_embeddings
     def set_input_embeddings(self, embs): self.token_embeddings = embs
     
+    def resize_token_embeddings(self, new_num_tokens: int):
+        old_embeddings = self.token_embeddings
+        new_embeddings = nn.Embedding(new_num_tokens, self.config.hidden_size, device=old_embeddings.weight.device, dtype=old_embeddings.weight.dtype)
+        self._init_weights(new_embeddings) # Initialize new embeddings
+
+        # Copy old weights
+        num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
+        new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
+        
+        self.token_embeddings = new_embeddings
+        self.config.vocab_size = new_num_tokens
+        self.vocab_size = new_num_tokens
+        # Update padding_idx if it's out of bounds for the new vocab size, though it usually isn't.
+        if self.padding_idx is not None and self.padding_idx >= new_num_tokens:
+            logger.warning(f"Padding idx {self.padding_idx} is out of new vocab size {new_num_tokens}. Setting to 0.")
+            self.padding_idx = 0 # Or handle as error/configurable
+            self.token_embeddings.padding_idx = self.padding_idx
+        logger.info(f"Resized token embeddings to {new_num_tokens} tokens.")
+        return self.token_embeddings
+
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
-        if input_shape[-1] > 1: # Not in generation mode or first step of generation
-            causal_mask = torch.ones(input_shape, dtype=torch.bool, device=inputs_embeds.device).tril(diagonal=0)
-            if past_key_values_length > 0:
-                # If past_key_values are used, we need to extend the causal mask
-                # to cover the past keys, making them visible to all current queries.
-                # The causal part applies only to the new tokens.
-                # This is a bit complex with HF's MHA direct call vs custom loop.
-                # For now, let's assume causal_mask is for the current input_shape.
-                # And if attention_mask (padding mask) is provided, combine it.
-                 pass # Handled by attention_mask directly if it's shaped (B, L_total)
+        if input_shape[-1] > 1:
+            L_q = input_shape[1]
+            L_kv = past_key_values_length + L_q
+            
+            full_causal_mask = torch.ones((L_kv, L_kv), dtype=torch.bool, device=inputs_embeds.device).tril(diagonal=0)
+            causal_mask_for_current_q = full_causal_mask[past_key_values_length:, :]
+            causal_mask_for_current_q = causal_mask_for_current_q[None, None, :, :].expand(
+                input_shape[0],1, L_q, L_kv
+            )
 
-            if attention_mask is not None:
-                if attention_mask.ndim == 2: # (B, L_total_kv)
-                    expanded_padding_mask = attention_mask[:, None, None, :].expand(
-                        input_shape[0], 1, input_shape[1], attention_mask.shape[-1]
-                    ).to(torch.bool)
-                    # Causal mask is (B, L_q_curr, L_q_curr), padding is (B, 1, L_q_curr, L_k_total)
-                    # This needs careful alignment.
-                    # Let's simplify: build mask of (B, L_q, L_kv)
-                    
-                    # Causal mask of (L_q, L_kv)
-                    # L_q is input_shape[1]
-                    # L_kv is past_key_values_length + input_shape[1]
-                    
-                    L_q = input_shape[1]
-                    L_kv = past_key_values_length + L_q
-                    
-                    # Create a square causal mask for L_kv (full sequence including past)
-                    full_causal_mask = torch.ones((L_kv, L_kv), dtype=torch.bool, device=inputs_embeds.device).tril(diagonal=0)
-                    
-                    # Slice the relevant part for current queries: (L_q, L_kv)
-                    # The queries attend to all past keys and current keys up to themselves.
-                    # So, query i attends to keys 0...past_len+i
-                    # This corresponds to the last L_q rows of the full_causal_mask.
-                    causal_mask_for_current_q = full_causal_mask[past_key_values_length:, :] # (L_q, L_kv)
-                    
-                    # Expand for batch and num_heads (compatible with MHA)
-                    causal_mask_for_current_q = causal_mask_for_current_q[None, None, :, :].expand(
-                        input_shape[0],1, L_q, L_kv
-                    )
+            if attention_mask is not None: # attention_mask is (B, L_kv_total)
+                padding_mask_expanded = attention_mask[:, None, None, :].expand(
+                    input_shape[0], 1, L_q, L_kv
+                ).to(torch.bool)
+                combined_attention_mask = causal_mask_for_current_q & padding_mask_expanded
+            else:
+                 combined_attention_mask = causal_mask_for_current_q
 
-                    # Combine with padding mask (attention_mask)
-                    # attention_mask is (B, L_kv)
-                    padding_mask_expanded = attention_mask[:, None, None, :].expand(
-                        input_shape[0], 1, L_q, L_kv
-                    )
-                    combined_attention_mask = causal_mask_for_current_q & padding_mask_expanded
-
-
-                elif attention_mask.ndim == 4: # Already prepared
-                    combined_attention_mask = attention_mask
-                else:
-                    raise ValueError(f"attention_mask.ndim={attention_mask.ndim} is not supported.")
-            else: # No padding mask, just causal
-                 L_q = input_shape[1]
-                 L_kv = past_key_values_length + L_q
-                 full_causal_mask = torch.ones((L_kv, L_kv), dtype=torch.bool, device=inputs_embeds.device).tril(diagonal=0)
-                 causal_mask_for_current_q = full_causal_mask[past_key_values_length:, :]
-                 combined_attention_mask = causal_mask_for_current_q[None, None, :, :].expand(input_shape[0],1, L_q, L_kv)
-
-        # During generation, input_shape[-1] is 1, past_key_values_length > 0
-        # We just need the padding mask for the KV cache.
-        elif past_key_values_length > 0 and attention_mask is not None: # Generation step with cache
-            # attention_mask is (B, L_total_kv)
-            # No causal part needed for the single query token against all keys.
-            # Mask just needs to be (B, 1, 1, L_total_kv)
+        elif past_key_values_length > 0 and attention_mask is not None:
              combined_attention_mask = attention_mask[:, None, None, :].expand(
-                input_shape[0], 1, 1, attention_mask.shape[-1] # L_total_kv
+                input_shape[0], 1, 1, attention_mask.shape[-1]
              ).to(torch.bool)
 
-
         if combined_attention_mask is not None:
-            # Convert boolean mask to float mask for adding to scores
             float_mask = combined_attention_mask.to(dtype=inputs_embeds.dtype)
             return (1.0 - float_mask) * torch.finfo(inputs_embeds.dtype).min
         return None
@@ -677,12 +640,9 @@ class ApertisModel(nn.Module):
         past_kv_len = 0
         if past_key_values is not None and past_key_values[0] is not None:
             if self.config.attention_type == "standard_mha":
-                past_kv_len = past_key_values[0][0].shape[1] # K cache is (B, L_past, D) for MHA if not transposed yet
-                                                             # Or (B, nH, L_past, hs) if transposed.
-                                                             # ApertisAttention stores K as (B, L_past_total, D) before transpose
-                past_kv_len = past_key_values[0][0].shape[1] # So this should be L_past
-            elif self.config.attention_type == "selective_ssm": # SSM cache shape is different
-                past_kv_len = past_key_values[0][0].shape[2] # (B, D_inner, L_conv_past)
+                past_kv_len = past_key_values[0][0].shape[1]
+            elif self.config.attention_type == "selective_ssm":
+                past_kv_len = past_key_values[0][0].shape[2]
         
         current_pos_ids = position_ids
         if current_pos_ids is None:
@@ -693,19 +653,13 @@ class ApertisModel(nn.Module):
             abs_pos_embeds = self.abs_pos_embeddings(current_pos_ids)
             inputs_embeds = inputs_embeds + abs_pos_embeds
         
-        # Multimodal processing
-        # Effective query embeddings and their positions/mask for the ApertisLayers
         query_embeddings_for_layers = inputs_embeds
         pos_ids_for_layers = current_pos_ids
-        # The `attention_mask` passed to `forward` is the *full* padding mask for KVs
-        # It might be (B, L_total_kv_cache)
-        # We need to construct the specific mask for the attention layers based on this.
         
-        # Handle multimodal image input on the first pass (no past_key_values)
         num_img_tokens = 0
         if self.config.multimodal and pixel_values is not None and past_kv_len == 0:
-            img_feats = self.multimodal_encoder(pixel_values) # (B, L_img, D_vision)
-            img_feats_proj = self.vision_projection(img_feats) # (B, L_img, D_hidden)
+            img_feats = self.multimodal_encoder(pixel_values)
+            img_feats_proj = self.vision_projection(img_feats)
             num_img_tokens = img_feats_proj.shape[1]
 
             query_embeddings_for_layers = torch.cat([img_feats_proj, inputs_embeds], dim=1)
@@ -714,11 +668,10 @@ class ApertisModel(nn.Module):
             text_pos_ids_shifted = current_pos_ids + num_img_tokens
             pos_ids_for_layers = torch.cat([img_pos_ids, text_pos_ids_shifted], dim=1)
             
-            # Update attention_mask if it was provided for text only
             if attention_mask is not None and attention_mask.shape[1] == L_curr_query:
                 img_padding_mask = torch.ones((B, num_img_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([img_padding_mask, attention_mask], dim=1)
-            elif attention_mask is None: # Create full mask if none provided
+            elif attention_mask is None:
                 attention_mask = torch.ones((B, num_img_tokens + L_curr_query), dtype=torch.long, device=query_embeddings_for_layers.device)
 
         elif self.config.multimodal and pixel_values is not None and past_kv_len > 0:
@@ -726,12 +679,9 @@ class ApertisModel(nn.Module):
 
         hidden_s = self.embed_dropout(query_embeddings_for_layers)
         
-        # Prepare attention mask for layers
-        # `attention_mask` here is the full padding mask (B, L_kv_total)
-        # `_prepare_decoder_attention_mask` will create the causal + padding float mask
         ext_att_mask = self._prepare_decoder_attention_mask(
-            attention_mask, # Full padding mask for KVs
-            (B, query_embeddings_for_layers.shape[1]), # Current query shape (B, L_q_eff)
+            attention_mask,
+            (B, query_embeddings_for_layers.shape[1]),
             query_embeddings_for_layers,
             past_kv_len
         )
@@ -741,9 +691,6 @@ class ApertisModel(nn.Module):
             if output_hs: all_hs_out.append(hidden_s)
             
             layer_past_kv = past_key_values[i] if past_key_values and i < len(past_key_values) else None
-            
-            # Position IDs for the current set of queries being processed by the layer
-            # If RoPE is applied inside attention, it needs these specific positions.
             current_layer_pos_ids = pos_ids_for_layers
             
             if self.gradient_checkpointing and self.training and not use_c:
@@ -754,7 +701,7 @@ class ApertisModel(nn.Module):
                 current_layer_cp_forward = create_cp_forward(layer_mod)
                 hidden_s = torch.utils.checkpoint.checkpoint(
                     current_layer_cp_forward, hidden_s, ext_att_mask, current_layer_pos_ids, layer_past_kv,
-                    use_reentrant=False # Recommended for PyTorch 1.10+
+                    use_reentrant=False
                 )
                 if output_att: all_att_out.append(None)
                 if use_c: all_kv_cache_out.append(None)
@@ -768,13 +715,8 @@ class ApertisModel(nn.Module):
         hidden_s = self.final_post_norm(hidden_s)
         if output_hs: all_hs_out.append(hidden_s)
         
-        # If multimodal and image tokens were prepended, slice them off before returning
-        # if the downstream consumer (e.g. LMHead for loss) expects only text tokens.
-        # However, for generation, we need the full hidden_s.
-        # This slicing logic is better handled in ApertisForCausalLM.forward
-        
         return (
-            hidden_s, # Full hidden state including image tokens if any
+            hidden_s,
             tuple(all_hs_out) if output_hs and all_hs_out else None,
             tuple(all_att_out) if output_att and all_att_out else None,
             tuple(all_kv_cache_out) if use_c and all_kv_cache_out else None
@@ -795,8 +737,6 @@ class ApertisForCausalLM(nn.Module):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
 
     def load_state_dict(self, state_dict, strict=True):
-        # Custom logic to handle potential older state_dict keys if necessary
-        # For now, standard loading. The warnings from interface.py will indicate mismatches.
         return super().load_state_dict(state_dict, strict=strict)
         
     def save_pretrained(self, save_directory):
@@ -807,6 +747,27 @@ class ApertisForCausalLM(nn.Module):
         
     def get_output_embeddings(self): return self.lm_head
     def set_output_embeddings(self, new_lm_head): self.lm_head = new_lm_head
+
+    def resize_token_embeddings(self, new_num_tokens: int):
+        self.model.resize_token_embeddings(new_num_tokens)
+        # If lm_head is not tied or needs separate resizing
+        if not self.config.tie_word_embeddings or self.lm_head.weight is not self.model.token_embeddings.weight:
+            old_lm_head = self.lm_head
+            self.lm_head = nn.Linear(self.config.hidden_size, new_num_tokens, bias=False, device=old_lm_head.weight.device, dtype=old_lm_head.weight.dtype)
+            self._init_weights(self.lm_head) # Initialize new lm_head weights
+            
+            num_tokens_to_copy = min(old_lm_head.out_features, new_num_tokens)
+            self.lm_head.weight.data[:num_tokens_to_copy, :] = old_lm_head.weight.data[:num_tokens_to_copy, :]
+        elif self.config.tie_word_embeddings:
+             self.lm_head.weight = self.model.token_embeddings.weight # Re-tie
+             # Update out_features for the tied head (nn.Linear doesn't auto-update this if weight is replaced)
+             self.lm_head.out_features = new_num_tokens
+
+
+        self.config.vocab_size = new_num_tokens # Update config as well
+        logger.info(f"Resized LM head to {new_num_tokens} tokens.")
+        return self.get_output_embeddings()
+
 
     def forward(
         self,
@@ -828,79 +789,59 @@ class ApertisForCausalLM(nn.Module):
         Optional[List[Any]]
     ]:
         
-        # `input_ids` to this function refers to text tokens.
-        # `attention_mask` and `position_ids` also correspond to these text tokens initially.
-        # `ApertisModel.forward` handles prepending image features and adjusting masks/positions.
-        
         model_outputs = self.model(
-            input_ids=input_ids, # Text input_ids
-            attention_mask=attention_mask, # Padding mask for text input_ids, or full if multimodal and precomputed
-            position_ids=position_ids, # Positions for text input_ids
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds, # Can be pre-computed text embeds
-            pixel_values=pixel_values, # Raw image pixels
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
         
-        hidden_states_from_model = model_outputs[0] # (B, L_total_effective, D)
-        
-        # Determine which part of hidden_states_from_model corresponds to text for LM head
-        # If multimodal and images were processed, hidden_states_from_model includes image features.
-        # For loss calculation against text `labels`, we only want text logits.
-        # For generation, we always take the *last* hidden state, which is fine.
+        hidden_states_from_model = model_outputs[0]
         
         text_logits_hidden_states = hidden_states_from_model
         if self.config.multimodal and pixel_values is not None and past_key_values is None:
-            # This was the first pass with an image. `hidden_states_from_model` has img_feats prepended.
-            # `input_ids` (if provided) tells us the length of the text part.
             if input_ids is not None:
                 L_text_original = input_ids.shape[1]
                 text_start_index = hidden_states_from_model.shape[1] - L_text_original
                 if text_start_index >= 0:
                      text_logits_hidden_states = hidden_states_from_model[:, text_start_index:, :]
-                else: # Should not happen with cat([img, text])
+                else:
                     logger.error("Error slicing text hidden states for multimodal logits.")
-            elif inputs_embeds is not None and input_ids is None:
-                # If only inputs_embeds were passed, and it was *only* text, we need a way to know L_text_original
-                # This case is tricky. Assume for now if input_ids is None, inputs_embeds is already combined.
-                # Or, the user must ensure labels align with the full multimodal sequence if that's intended.
-                # Safest for now: if input_ids missing, assume text_logits_hidden_states is correct.
-                pass
-
-
+            
         logits = self.lm_head(text_logits_hidden_states)
         
         loss = None
         if labels is not None:
-            # labels are (B, L_text_labels)
-            # logits should be (B, L_text_labels, VocabSize) for this loss calculation
-            
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Ensure shapes match for loss calculation
+            current_ignore_index = -100 # Default for fine-tuning where labels include -100
+            # If labels do not contain -100 (e.g. pre-training), use pad_token_id for ignoring padding.
+            # This assumes labels are never -100 during pre-training.
+            if not (labels == -100).any():
+                current_ignore_index = self.config.pad_token_id
+
             if shift_logits.shape[1] != shift_labels.shape[1]:
-                # This can happen if text_logits_hidden_states slicing was imperfect
-                # or labels don't match the text part of the output.
-                # For simplicity, truncate the longer one.
-                # A more robust solution would be careful tracking of sequence lengths.
                 min_len = min(shift_logits.shape[1], shift_labels.shape[1])
                 shift_logits = shift_logits[:, :min_len, :]
                 shift_labels = shift_labels[:, :min_len]
                 if min_len == 0:
                     logger.warning("Logits or labels have zero sequence length after shifting. Loss will be 0 or error.")
-                    loss = torch.tensor(0.0, device=logits.device, requires_grad=True) # Or handle as error
+                    loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
                 else:
-                    loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=current_ignore_index)
                     loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-            elif shift_logits.shape[1] == 0: # Seq len is 1, after shift it's 0
+            elif shift_logits.shape[1] == 0:
                  logger.warning("Sequence length is 1, so shift_logits/labels are empty. Loss set to 0.")
                  loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
             else:
-                loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+                loss_fct = nn.CrossEntropyLoss(ignore_index=current_ignore_index)
                 loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             
         return (loss, logits) + model_outputs[1:]
@@ -908,13 +849,9 @@ class ApertisForCausalLM(nn.Module):
     def prepare_inputs_for_generation(
         self, input_ids: torch.Tensor, past_key_values: Optional[List[Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids_override: Optional[torch.Tensor] = None, # Allow explicit position_ids for complex cases
+        position_ids_override: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        
-        # `input_ids` here are the *current* tokens to process.
-        # (B, L_prompt) on first step, (B, 1) on subsequent steps.
-        # `attention_mask` is the *full* attention mask for KVs including past. (B, L_total_kv)
         
         B, L_curr = input_ids.shape
         
@@ -922,43 +859,36 @@ class ApertisForCausalLM(nn.Module):
         pos_ids_for_model = None
 
         if past_key_values is not None:
-            # Subsequent generation step
-            current_input_ids_for_model = input_ids[:, -1:] # Only the last new token
+            current_input_ids_for_model = input_ids[:, -1:]
             
             past_kv_len = 0
             if self.config.attention_type == "standard_mha" and past_key_values[0] is not None:
-                past_kv_len = past_key_values[0][0].shape[1] # K cache is (B, L_past, D)
+                past_kv_len = past_key_values[0][0].shape[1]
             elif self.config.attention_type == "selective_ssm" and past_key_values[0] is not None:
-                past_kv_len = past_key_values[0][0].shape[2] # Conv state (B, D_inner, L_conv_past)
+                past_kv_len = past_key_values[0][0].shape[2]
 
-            # The position for the new token is past_kv_len
-            # (assuming 0-indexed positions and L_kv_cache == num_past_tokens)
-            # If attention_mask gives total length, then new position is attention_mask.shape[1] - 1
-            # This assumes `attention_mask` grows with each token.
             current_absolute_position = attention_mask.shape[1] - 1
             pos_ids_for_model = torch.tensor([[current_absolute_position]], dtype=torch.long, device=input_ids.device).expand(B, -1)
 
         else:
-            # First step (prompt processing)
             if position_ids_override is not None:
                 pos_ids_for_model = position_ids_override
             else:
                 pos_ids_for_model = torch.arange(L_curr, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(B, -1)
         
-        if position_ids_override is not None: # User explicitly provides positions
+        if position_ids_override is not None:
             pos_ids_for_model = position_ids_override
-
 
         model_inputs = {
             "input_ids": current_input_ids_for_model,
             "past_key_values": past_key_values,
-            "attention_mask": attention_mask, # Full KV attention_mask
-            "position_ids": pos_ids_for_model, # Positions for the *current_input_ids_for_model*
+            "attention_mask": attention_mask,
+            "position_ids": pos_ids_for_model,
             "use_cache": kwargs.get("use_cache", True),
         }
 
         if past_key_values is None and "pixel_values" in kwargs:
-            model_inputs["pixel_values"] = kwargs["pixel_values"] # Only for the first step
+            model_inputs["pixel_values"] = kwargs["pixel_values"]
         
         return model_inputs
     
@@ -966,7 +896,7 @@ class ApertisForCausalLM(nn.Module):
     def generate(
         self, input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None, # Initial position_ids for the prompt
+        position_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         max_new_tokens: Optional[int] = 20,
         min_new_tokens: Optional[int] = 0,
@@ -993,27 +923,20 @@ class ApertisForCausalLM(nn.Module):
             logger.warning("pad_token_id is None, generation might behave unexpectedly with padding.")
             current_pad_token_id = 0
 
-        # Initialize attention_mask and position_ids for the prompt if not provided
         current_attention_mask = attention_mask
         if current_attention_mask is None:
             current_attention_mask = torch.ones_like(input_ids)
 
-        # `position_ids` argument to `generate` is for the initial prompt.
-        # `prepare_inputs_for_generation` will handle subsequent steps.
         prompt_position_ids = position_ids
         if prompt_position_ids is None:
             prompt_position_ids = torch.arange(prompt_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         
-        # For multimodal, if images are prepended, the effective prompt length and masks/positions change.
         num_effective_prompt_tokens = prompt_len
-        current_pixel_values = pixel_values # Will be used only in the first step
+        current_pixel_values = pixel_values
         
         if self.config.multimodal and current_pixel_values is not None:
-            # Simulate getting num_img_tokens (placeholder)
-            # In a real scenario, UME.forward would be called once to get img_embeds and their count.
-            # For generation, we assume img_tokens are prepended.
-            dummy_img_config = self.config # Or specific vision config
-            num_img_tokens_est = (dummy_img_config.image_size // dummy_img_config.vision_patch_size)**2 +1 # num_patches + cls
+            dummy_img_config = self.config
+            num_img_tokens_est = (dummy_img_config.image_size // dummy_img_config.vision_patch_size)**2 +1
             
             img_padding_mask = torch.ones((batch_size, num_img_tokens_est), dtype=current_attention_mask.dtype, device=current_attention_mask.device)
             current_attention_mask = torch.cat([img_padding_mask, current_attention_mask], dim=1)
@@ -1023,45 +946,29 @@ class ApertisForCausalLM(nn.Module):
             prompt_position_ids = torch.cat([img_pos_ids, text_pos_ids_shifted], dim=1)
             num_effective_prompt_tokens += num_img_tokens_est
 
-
-        generated_tokens = input_ids # Contains only text tokens initially
+        generated_tokens = input_ids
         internal_past_kv = None
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         
-        # On the first pass, `prepare_inputs_for_generation` gets the full `generated_tokens` (prompt)
-        # and the full `prompt_position_ids`.
-        # On subsequent passes, it gets `generated_tokens` (which now includes generated ones)
-        # but processes only the *last* token of it to create `model_inputs["input_ids"]`.
-        
         for step in range(max_new_tokens):
-            # `generated_tokens` grows, `current_attention_mask` grows.
-            # `prepare_inputs_for_generation` needs the *current tokens to be processed*
-            # and their *absolute positions*.
-            
-            # If first step, input_ids_for_prep is the prompt.
-            # If subsequent, input_ids_for_prep is the last generated token.
             input_ids_for_prep = generated_tokens if internal_past_kv is None else generated_tokens[:, -1:]
-            
-            # If first step, positions are for the prompt.
-            # If subsequent, `prepare_inputs_for_generation` calculates position for the new token.
             position_ids_for_prep = prompt_position_ids if internal_past_kv is None else None
-
 
             model_inputs = self.prepare_inputs_for_generation(
                 input_ids=input_ids_for_prep,
                 past_key_values=internal_past_kv,
                 attention_mask=current_attention_mask,
-                position_ids_override=position_ids_for_prep, # Pass pre-calculated positions for current tokens
+                position_ids_override=position_ids_for_prep,
                 pixel_values=current_pixel_values,
                 use_cache=use_cache
             )
             
-            if current_pixel_values is not None: current_pixel_values = None # Consume image only once
+            if current_pixel_values is not None: current_pixel_values = None
             
             outputs = self(
-                input_ids=model_inputs["input_ids"], # This will be (B, L_prompt_eff) or (B, 1)
-                attention_mask=model_inputs["attention_mask"], # This is (B, L_kv_total)
-                position_ids=model_inputs["position_ids"], # This is (B, L_prompt_eff) or (B, 1)
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                position_ids=model_inputs["position_ids"],
                 past_key_values=model_inputs["past_key_values"],
                 pixel_values=model_inputs.get("pixel_values"),
                 use_cache=model_inputs["use_cache"],
@@ -1073,8 +980,6 @@ class ApertisForCausalLM(nn.Module):
             if repetition_penalty != 1.0:
                 for i in range(batch_size):
                     if unfinished_sequences[i] == 0: continue
-                    # Check against all tokens *currently* in generated_tokens for this batch item
-                    # which includes the prompt and previously generated tokens.
                     for token_id_in_seq in generated_tokens[i]:
                         if token_id_in_seq < next_token_logits.shape[-1]:
                              next_token_logits[i, token_id_in_seq] /= repetition_penalty
@@ -1153,17 +1058,14 @@ def create_apertis_model(
         "ssm_dt_rank": ssm_dt_rank,
         "ssm_conv_kernel": ssm_conv_kernel,
     })
-    # Ensure num_attention_heads is sensible for hidden_size
     if config_dict["hidden_size"] % config_dict["num_attention_heads"] != 0:
         logger.warning(f"hidden_size {config_dict['hidden_size']} not divisible by num_attention_heads {config_dict['num_attention_heads']}. Adjusting num_attention_heads.")
-        # Find a divisor, e.g.
         for i in range(config_dict["num_attention_heads"], 0, -1):
             if config_dict["hidden_size"] % i == 0:
                 config_dict["num_attention_heads"] = i
                 break
-        if config_dict["hidden_size"] % config_dict["num_attention_heads"] != 0: # fallback
+        if config_dict["hidden_size"] % config_dict["num_attention_heads"] != 0:
              config_dict["num_attention_heads"] = 1
-
 
     config = ApertisConfig(**config_dict)
     model = ApertisForCausalLM(config)

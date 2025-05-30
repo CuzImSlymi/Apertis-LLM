@@ -16,7 +16,7 @@ import threading
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model
-from src.training.pipeline import YoloStyleTrainingPipeline, ApertisDataset, get_available_gpus
+from src.training.pipeline import YoloStyleTrainingPipeline, ApertisPretrainDataset, get_available_gpus # CHANGED ApertisDataset to ApertisPretrainDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,8 +62,11 @@ class ApertisInterface:
 
         self.standard_training_stop_event = threading.Event()
         self.azr_training_stop_event = threading.Event()
+        self.finetune_training_stop_event = threading.Event()
         self.standard_training_thread: Optional[threading.Thread] = None
         self.azr_training_thread: Optional[threading.Thread] = None
+        self.finetune_training_thread: Optional[threading.Thread] = None
+
 
         if web:
             self.launch_web_interface()
@@ -423,7 +426,7 @@ class ApertisInterface:
                                 top_k_slider_chat = gr.Slider(0, 100, 50, step=1, label="Top K (0=disable)")
                                 top_p_slider_chat = gr.Slider(0.0, 1.0, 0.9, step=0.05, label="Top P (0=disable)")
                 
-                with gr.TabItem("Training"):
+                with gr.TabItem("Pre-training"):
                     with gr.Row():
                         with gr.Column(scale=1):
                             gr.Markdown("## Model Config")
@@ -433,14 +436,14 @@ class ApertisInterface:
                             expert_sys_train_cb = gr.Checkbox(label="Use Expert System")
                             
                             gr.Markdown("## Data")
-                            train_file_up = gr.File(label="Train Data (JSONL)", file_types=[".jsonl"])
+                            train_file_up = gr.File(label="Train Data (JSONL, field: 'text')", file_types=[".jsonl"])
                             val_file_up = gr.File(label="Val Data (JSONL, optional)", file_types=[".jsonl"])
-                            vocab_file_up_std_train = gr.File(label="Vocab File (JSON) - For Standard Training", file_types=[".json"])
+                            vocab_file_up_std_train = gr.File(label="Vocab File (JSON)", file_types=[".json"])
                             img_dir_train_tb = gr.Textbox(label="Image Dir (for multimodal)", placeholder="/path/to/images", visible=False)
                             multimodal_train_cb.change(lambda x: gr.update(visible=x), inputs=[multimodal_train_cb], outputs=[img_dir_train_tb])
 
                         with gr.Column(scale=1):
-                            gr.Markdown("## Training Params")
+                            gr.Markdown("## Pre-training Params")
                             batch_size_train_sl = gr.Slider(1, 64, 4, step=1, label="Batch Size")
                             lr_train_sl = gr.Slider(1e-6, 1e-3, 5e-5, step=1e-6, label="Learning Rate")
                             epochs_train_sl = gr.Slider(1, 100, 3, step=1, label="Epochs")
@@ -457,15 +460,65 @@ class ApertisInterface:
                                 dist_train_cb = gr.Checkbox(label="Distributed Training", visible=len(gpu_choices)>1)
                                 gpu_select_train_cbg.change(lambda g: gr.update(visible=len(g)>1), inputs=gpu_select_train_cbg, outputs=dist_train_cb)
                                 gpu_mem_frac_sl = gr.Slider(0.1,1.0,0.7,step=0.05, label="GPU Mem Fraction")
-                            output_dir_train_tb = gr.Textbox("output_training", label="Output Dir")
+                            output_dir_train_tb = gr.Textbox("output_pretraining", label="Output Dir")
                             wandb_train_cb = gr.Checkbox(label="Log to W&B")
-                            wandb_proj_train_tb = gr.Textbox("apertis-training", label="W&B Project", visible=False)
+                            wandb_proj_train_tb = gr.Textbox("apertis-pretraining", label="W&B Project", visible=False)
                             wandb_train_cb.change(lambda x: gr.update(visible=x), inputs=wandb_train_cb, outputs=wandb_proj_train_tb)
                             
                             with gr.Row():
-                                start_train_btn = gr.Button("Start Training", variant="primary")
-                                stop_train_btn = gr.Button("Stop Training")
-                            train_status_tb = gr.Textbox(label="Training Status", interactive=False, lines=10)
+                                start_train_btn = gr.Button("Start Pre-training", variant="primary")
+                                stop_train_btn = gr.Button("Stop Pre-training")
+                            train_status_tb = gr.Textbox(label="Pre-training Status", interactive=False, lines=10)
+
+                with gr.TabItem("Fine-tuning"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("## Base Model for Fine-tuning")
+                            ft_base_model_path_tb = gr.Textbox(label="Path to Pre-trained Apertis Model Directory")
+                            
+                            gr.Markdown("## Fine-tuning Data")
+                            ft_data_file_up = gr.File(label="Fine-tuning Data (JSONL, fields: 'instruction', 'output')", file_types=[".jsonl"])
+                            ft_val_file_up = gr.File(label="Validation Data (JSONL, optional)", file_types=[".jsonl"])
+
+                            gr.Markdown("## Tokenizer for Fine-tuning")
+                            ft_tokenizer_option_dd = gr.Dropdown(["Use HF Tokenizer (Recommended)", "Use Manual Vocab (from base model)"], value="Use HF Tokenizer (Recommended)", label="Tokenizer Option")
+                            ft_hf_tokenizer_name_tb = gr.Textbox(label="HF Tokenizer Name/Path (if selected)", placeholder="e.g., meta-llama/Llama-2-7b-hf", visible=True)
+                            ft_manual_vocab_info = gr.Markdown("Manual vocab will be inferred from base model's config if tokenizer path is not specified with it.", visible=False)
+                            
+                            def toggle_tokenizer_input(choice):
+                                if choice == "Use HF Tokenizer (Recommended)":
+                                    return gr.update(visible=True), gr.update(visible=False)
+                                return gr.update(visible=False), gr.update(visible=True)
+                            ft_tokenizer_option_dd.change(toggle_tokenizer_input, ft_tokenizer_option_dd, [ft_hf_tokenizer_name_tb, ft_manual_vocab_info])
+                            
+                            ft_prompt_template_tb = gr.Textbox(value="User: {instruction}\nAssistant: {output}", label="Prompt Template")
+
+                        with gr.Column(scale=1):
+                            gr.Markdown("## Fine-tuning Params")
+                            ft_batch_size_sl = gr.Slider(1, 64, 2, step=1, label="Batch Size")
+                            ft_lr_sl = gr.Slider(1e-7, 1e-4, 2e-5, step=1e-7, label="Learning Rate")
+                            ft_epochs_sl = gr.Slider(1, 50, 3, step=1, label="Epochs")
+                            ft_eval_epochs_sl = gr.Slider(0, 10, 1, step=1, label="Eval Every N Epochs (0=disable)")
+                            
+                            with gr.Accordion("GPU (Fine-tuning)", open=False):
+                                available_gpus_list_ft = get_available_gpus() # Use a different variable name if needed, but it's scoped
+                                gpu_md_text_ft = "### GPUs:\n" + ("\n".join([f"- {g['id']}: {g['name']} ({g['total_memory']:.1f}GB)" for g in available_gpus_list_ft]) or "None detected.")
+                                gr.Markdown(gpu_md_text_ft)
+                                ft_gpu_choices = [str(g['id']) for g in available_gpus_list_ft]
+                                ft_gpu_select_cbg = gr.CheckboxGroup(choices=ft_gpu_choices, value=[ft_gpu_choices[0]] if ft_gpu_choices else [], label="Select GPUs", visible=bool(ft_gpu_choices))
+                                ft_dist_train_cb = gr.Checkbox(label="Distributed Training", visible=len(ft_gpu_choices)>1)
+                                ft_gpu_select_cbg.change(lambda g: gr.update(visible=len(g)>1), inputs=ft_gpu_select_cbg, outputs=ft_dist_train_cb)
+                                ft_gpu_mem_frac_sl = gr.Slider(0.1,1.0,0.7,step=0.05, label="GPU Mem Fraction")
+
+                            ft_output_dir_tb = gr.Textbox("output_finetuning", label="Output Dir")
+                            ft_wandb_cb = gr.Checkbox(label="Log to W&B")
+                            ft_wandb_proj_tb = gr.Textbox("apertis-finetuning", label="W&B Project", visible=False)
+                            ft_wandb_cb.change(lambda x: gr.update(visible=x), inputs=[ft_wandb_cb], outputs=[ft_wandb_proj_tb])
+                            
+                            with gr.Row():
+                                start_ft_btn = gr.Button("Start Fine-tuning", variant="primary")
+                                stop_ft_btn = gr.Button("Stop Fine-tuning")
+                            ft_status_tb = gr.Textbox(label="Fine-tuning Status", interactive=False, lines=10)
 
 
                 with gr.TabItem("Absolute Zero Reasoner"):
@@ -516,7 +569,10 @@ class ApertisInterface:
                                 azr_max_output_sl = gr.Slider(1000, 50000, 10000, step=1000, label="Max Output Size")
                             
                             with gr.Accordion("GPU", open=False):
-                                azr_gpu_choices = [str(g['id']) for g in available_gpus_list]
+                                available_gpus_list_azr = get_available_gpus()
+                                gpu_md_text_azr = "### GPUs:\n" + ("\n".join([f"- {g['id']}: {g['name']} ({g['total_memory']:.1f}GB)" for g in available_gpus_list_azr]) or "None detected.")
+                                gr.Markdown(gpu_md_text_azr)
+                                azr_gpu_choices = [str(g['id']) for g in available_gpus_list_azr]
                                 azr_gpu_select_cbg = gr.CheckboxGroup(choices=azr_gpu_choices, value=[azr_gpu_choices[0]] if azr_gpu_choices else [], label="Select GPUs", visible=bool(azr_gpu_choices))
                                 azr_gpu_mem_frac_sl = gr.Slider(0.1, 1.0, 0.7, step=0.05, label="GPU Memory Fraction")
                             
@@ -619,9 +675,9 @@ class ApertisInterface:
             def ui_start_training_handler(
                 m_s, attn_t, m_m, exp_s, tr_f, v_f, voc_f_std, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
-                if not tr_f or not voc_f_std: return "Training & Vocab files required for standard training."
+                if not tr_f or not voc_f_std: return "Training & Vocab files required for pre-training."
                 if self.standard_training_thread and self.standard_training_thread.is_alive():
-                    return "Standard training is already in progress."
+                    return "Pre-training is already in progress."
                 
                 self.standard_training_stop_event.clear()
                 tmp_dir = tempfile.mkdtemp()
@@ -642,6 +698,7 @@ class ApertisInterface:
                         "multimodal":m_m, "use_expert_system":exp_s,
                     },
                     "training_config": {
+                        "task_type": "pretrain",
                         "output_dir":out_d, "batch_size":b_s, "learning_rate":learn_r, "num_epochs":eps, 
                         "warmup_steps":0, "gradient_accumulation_steps":4, "max_grad_norm": 1.0,
                         "eval_every_n_epochs":eval_ep, "use_wandb":use_wb, "wandb_project":wb_p if use_wb else None,
@@ -662,31 +719,31 @@ class ApertisInterface:
                 cfg["model_config"]["use_expert_system"] = exp_s
                 if "model_size_preset" in cfg["model_config"]: del cfg["model_config"]["model_size_preset"]
 
-                cfg_path = os.path.join(tmp_dir, "run_cfg_standard.json"); 
+                cfg_path = os.path.join(tmp_dir, "run_cfg_pretrain.json"); 
                 with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
-                out_cfg_path = os.path.join(out_d, "run_cfg_standard.json")
+                out_cfg_path = os.path.join(out_d, "run_cfg_pretrain.json")
                 os.makedirs(out_d, exist_ok=True)
                 shutil.copy(cfg_path, out_cfg_path)
                 
-                def _thread_train(c_path, t_dir, stop_event):
+                def _thread_train_job(c_path, t_dir, stop_event):
                     try:
                         from src.training.pipeline import train_from_config
                         train_from_config(c_path, stop_event)
                     except Exception as e:
-                         logger.error(f"Error in Standard training thread: {e}", exc_info=True)
+                         logger.error(f"Error in Pre-training thread: {e}", exc_info=True)
                     finally: 
                         shutil.rmtree(t_dir)
                         self.standard_training_thread = None
                 
-                self.standard_training_thread = threading.Thread(target=_thread_train, args=(cfg_path, tmp_dir, self.standard_training_stop_event), daemon=True)
+                self.standard_training_thread = threading.Thread(target=_thread_train_job, args=(cfg_path, tmp_dir, self.standard_training_stop_event), daemon=True)
                 self.standard_training_thread.start()
-                return f"Standard Training started. Config: {out_cfg_path}. Output: {out_d}."
+                return f"Pre-training started. Config: {out_cfg_path}. Output: {out_d}."
             
             def ui_stop_training_handler():
                 if self.standard_training_thread and self.standard_training_thread.is_alive():
                     self.standard_training_stop_event.set()
-                    return "Stop request sent to Standard Training. Please wait for current step to finish."
-                return "No Standard Training in progress."
+                    return "Stop request sent to Pre-training. Please wait for current step to finish."
+                return "No Pre-training in progress."
 
             start_train_btn.click(ui_start_training_handler, 
                                  [model_size_train_dd, attn_type_train_dd, multimodal_train_cb, expert_sys_train_cb,
@@ -696,6 +753,106 @@ class ApertisInterface:
                                   gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb],
                                  [train_status_tb])
             stop_train_btn.click(ui_stop_training_handler, outputs=[train_status_tb])
+
+            def ui_start_finetuning_handler(
+                base_model_path, ft_data_f, ft_val_f, 
+                tokenizer_opt, hf_tokenizer_name, prompt_template,
+                batch_s, learn_r, eps, eval_ep,
+                g_sel, d_train, g_mem_f, out_d, use_wb, wb_p
+            ):
+                if not base_model_path: return "Base model path required for fine-tuning."
+                if not ft_data_f: return "Fine-tuning data file required."
+                if tokenizer_opt == "Use HF Tokenizer (Recommended)" and not hf_tokenizer_name:
+                    return "Hugging Face Tokenizer Name/Path required if selected."
+
+                if self.finetune_training_thread and self.finetune_training_thread.is_alive():
+                    return "Fine-tuning is already in progress."
+                
+                self.finetune_training_stop_event.clear()
+                tmp_dir = tempfile.mkdtemp()
+                
+                ft_train_p = os.path.join(tmp_dir, "ft_train.jsonl"); shutil.copy(ft_data_f.name, ft_train_p)
+                ft_val_p = None
+                if ft_val_f: ft_val_p = os.path.join(tmp_dir, "ft_val.jsonl"); shutil.copy(ft_val_f.name, ft_val_p)
+                
+                tokenizer_path_for_config = ""
+                use_hf_for_ft_config = False
+                if tokenizer_opt == "Use HF Tokenizer (Recommended)":
+                    tokenizer_path_for_config = hf_tokenizer_name
+                    use_hf_for_ft_config = True
+                else: 
+                    manual_vocab_path = os.path.join(base_model_path, "vocab.json")
+                    if not os.path.exists(manual_vocab_path):
+                        parent_manual_vocab_path = os.path.join(Path(base_model_path).parent, "vocab.json")
+                        if os.path.exists(parent_manual_vocab_path):
+                            manual_vocab_path = parent_manual_vocab_path
+                        else:
+                            shutil.rmtree(tmp_dir)
+                            return f"Error: vocab.json not found in or alongside base model path '{base_model_path}' for manual vocab option."
+                    tokenizer_path_for_config = manual_vocab_path
+                
+                sel_gpus = [int(gid) for gid in g_sel] if g_sel else None
+                dist_training_eff = d_train if sel_gpus and len(sel_gpus) > 1 else False
+
+                cfg = {
+                    "data_config": {
+                        "train_data_path": ft_train_p, 
+                        "val_data_path": ft_val_p,
+                        "tokenizer_path": tokenizer_path_for_config,
+                        "use_hf_tokenizer_for_finetune": use_hf_for_ft_config,
+                        "prompt_template": prompt_template,
+                        "max_length": 512 
+                    },
+                    "model_config": {}, 
+                    "training_config": {
+                        "task_type": "finetune",
+                        "pretrained_model_path_for_finetune": base_model_path,
+                        "output_dir": out_d, "batch_size": batch_s, "learning_rate": learn_r, 
+                        "num_epochs": eps, "eval_every_n_epochs": eval_ep,
+                        "warmup_steps": 0, "gradient_accumulation_steps": 1,
+                        "max_grad_norm": 1.0,
+                        "use_wandb": use_wb, "wandb_project": wb_p if use_wb else None,
+                        "fp16": True, "device": None,
+                        "gpu_memory_fraction": g_mem_f, 
+                        "use_gradient_checkpointing": True, "dynamic_batch_sizing": True,
+                        "gpu_ids": sel_gpus, "distributed_training": dist_training_eff, "local_rank": -1
+                    }
+                }
+                
+                cfg_path = os.path.join(tmp_dir, "run_cfg_finetune.json")
+                with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
+                out_cfg_path = os.path.join(out_d, "run_cfg_finetune.json")
+                os.makedirs(out_d, exist_ok=True)
+                shutil.copy(cfg_path, out_cfg_path)
+
+                def _thread_finetune_job(c_path, t_dir, stop_event):
+                    try:
+                        from src.training.pipeline import train_from_config
+                        train_from_config(c_path, stop_event)
+                    except Exception as e:
+                         logger.error(f"Error in Fine-tuning thread: {e}", exc_info=True)
+                    finally: 
+                        shutil.rmtree(t_dir)
+                        self.finetune_training_thread = None
+
+                self.finetune_training_thread = threading.Thread(target=_thread_finetune_job, args=(cfg_path, tmp_dir, self.finetune_training_stop_event), daemon=True)
+                self.finetune_training_thread.start()
+                return f"Fine-tuning started. Config: {out_cfg_path}. Output: {out_d}."
+
+            def ui_stop_finetuning_handler():
+                if self.finetune_training_thread and self.finetune_training_thread.is_alive():
+                    self.finetune_training_stop_event.set()
+                    return "Stop request sent to Fine-tuning. Please wait for current step to finish."
+                return "No Fine-tuning in progress."
+
+            start_ft_btn.click(ui_start_finetuning_handler,
+                [ft_base_model_path_tb, ft_data_file_up, ft_val_file_up, 
+                 ft_tokenizer_option_dd, ft_hf_tokenizer_name_tb, ft_prompt_template_tb,
+                 ft_batch_size_sl, ft_lr_sl, ft_epochs_sl, ft_eval_epochs_sl,
+                 ft_gpu_select_cbg, ft_dist_train_cb, ft_gpu_mem_frac_sl,
+                 ft_output_dir_tb, ft_wandb_cb, ft_wandb_proj_tb],
+                [ft_status_tb])
+            stop_ft_btn.click(ui_stop_finetuning_handler, outputs=[ft_status_tb])
             
             def ui_start_azr_training_handler(
                 m_s, attn_t, m_m, exp_s, tokenizer_name_hf, seed_f, seed_prob,
@@ -843,4 +1000,4 @@ class ApertisInterface:
             )
             azr_stop_btn.click(ui_stop_azr_training_handler, outputs=[azr_status_tb])
 
-        interface.launch(server_name="0.0.0.0", server_port=self.port, share=self.share, max_threads=40) 
+        interface.launch(server_name="0.0.0.0", server_port=self.port, share=self.share, max_threads=60)
