@@ -7,6 +7,8 @@ import numpy as np
 import sys
 import os
 from pathlib import Path
+import json
+import inspect
 
 import logging
 logger = logging.getLogger(__name__)
@@ -60,6 +62,7 @@ class ApertisConfig:
         vision_heads: int = 12,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        **kwargs
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -116,42 +119,52 @@ class ApertisConfig:
         self.output_attentions = output_attentions
         self.output_hidden_states = output_hidden_states
 
+        for key, value in kwargs.items():
+            if not hasattr(self, key):
+                logger.warning(f"Ignoring unknown config parameter: {key}={value}")
+
+
     @classmethod
-    def from_dict(cls, config_dict):
-        import inspect
+    def from_dict(cls, config_dict: Dict[str, Any]):
         sig = inspect.signature(cls.__init__)
-        valid_keys = {param.name for param in sig.parameters.values() if param.kind == param.POSITIONAL_OR_KEYWORD}
-        filtered_config_dict = {k: v for k, v in config_dict.items() if k in valid_keys}
+        valid_keys = {param.name for param in sig.parameters.values() if param.kind == param.POSITIONAL_OR_KEYWORD or param.kind == param.VAR_KEYWORD}
+        
+        filtered_config_dict = {k: v for k, v in config_dict.items() if k in valid_keys or k == "kwargs"}
+        
         if "ssm_dt_rank" in filtered_config_dict and filtered_config_dict["ssm_dt_rank"] == "auto":
-            hs = filtered_config_dict.get("hidden_size", 768)
+            hs = filtered_config_dict.get("hidden_size", 768) # Default if hidden_size not in dict
             filtered_config_dict["ssm_dt_rank"] = math.ceil(hs / 16)
+        
         return cls(**filtered_config_dict)
     
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return self.__dict__
     
     @classmethod
     def from_pretrained(cls, model_name_or_path: str):
-        import json
         config_file_path_str = ""
         if os.path.isdir(model_name_or_path):
             config_file_path_str = os.path.join(model_name_or_path, "config.json")
         elif os.path.isfile(model_name_or_path) and model_name_or_path.endswith(".json"):
             config_file_path_str = model_name_or_path
-        else:
+        else: # Try as directory even if it doesn't exist yet, might be HF hub name
             config_file_path_str = os.path.join(model_name_or_path, "config.json")
+
         if not os.path.exists(config_file_path_str) and os.path.isdir(model_name_or_path):
+            # Fallback: if path is a dir and config.json is not in it, check parent.
+            # This is useful if model_path is 'models/my_model/pytorch_model.bin' and config is in 'models/my_model/'
             parent_dir_config_file = os.path.join(Path(model_name_or_path).parent, "config.json")
             if os.path.exists(parent_dir_config_file):
                 config_file_path_str = parent_dir_config_file
+        
         if not os.path.exists(config_file_path_str):
-            raise FileNotFoundError(f"Config file not found for '{model_name_or_path}'. Looked for: '{config_file_path_str}'")
+            raise FileNotFoundError(f"Config file not found. Looked for: '{config_file_path_str}' based on input '{model_name_or_path}'")
+
         with open(config_file_path_str, "r", encoding="utf-8") as f:
             config_dict = json.load(f)
         return cls.from_dict(config_dict)
     
     def save_pretrained(self, save_directory: str):
-        import json
         os.makedirs(save_directory, exist_ok=True)
         config_file = os.path.join(save_directory, "config.json")
         with open(config_file, "w", encoding="utf-8") as f:
@@ -566,24 +579,24 @@ class ApertisModel(nn.Module):
     def get_input_embeddings(self): return self.token_embeddings
     def set_input_embeddings(self, embs): self.token_embeddings = embs
     
-    def resize_token_embeddings(self, new_num_tokens: int):
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
         old_embeddings = self.token_embeddings
-        new_embeddings = nn.Embedding(new_num_tokens, self.config.hidden_size, device=old_embeddings.weight.device, dtype=old_embeddings.weight.dtype)
-        self._init_weights(new_embeddings) # Initialize new embeddings
+        new_embeddings = nn.Embedding(new_num_tokens, self.config.hidden_size, self.padding_idx, device=old_embeddings.weight.device, dtype=old_embeddings.weight.dtype)
+        self._init_weights(new_embeddings)
 
-        # Copy old weights
         num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
         new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
         
         self.token_embeddings = new_embeddings
-        self.config.vocab_size = new_num_tokens
-        self.vocab_size = new_num_tokens
-        # Update padding_idx if it's out of bounds for the new vocab size, though it usually isn't.
+        self.config.vocab_size = new_num_tokens # Crucial: Update config
+        self.vocab_size = new_num_tokens # Update model attribute if it exists
+
         if self.padding_idx is not None and self.padding_idx >= new_num_tokens:
             logger.warning(f"Padding idx {self.padding_idx} is out of new vocab size {new_num_tokens}. Setting to 0.")
-            self.padding_idx = 0 # Or handle as error/configurable
+            self.padding_idx = 0
             self.token_embeddings.padding_idx = self.padding_idx
-        logger.info(f"Resized token embeddings to {new_num_tokens} tokens.")
+
+        logger.info(f"Resized token embeddings from {old_embeddings.num_embeddings} to {new_num_tokens} tokens.")
         return self.token_embeddings
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
@@ -598,7 +611,7 @@ class ApertisModel(nn.Module):
                 input_shape[0],1, L_q, L_kv
             )
 
-            if attention_mask is not None: # attention_mask is (B, L_kv_total)
+            if attention_mask is not None: 
                 padding_mask_expanded = attention_mask[:, None, None, :].expand(
                     input_shape[0], 1, L_q, L_kv
                 ).to(torch.bool)
@@ -748,24 +761,29 @@ class ApertisForCausalLM(nn.Module):
     def get_output_embeddings(self): return self.lm_head
     def set_output_embeddings(self, new_lm_head): self.lm_head = new_lm_head
 
-    def resize_token_embeddings(self, new_num_tokens: int):
-        self.model.resize_token_embeddings(new_num_tokens)
-        # If lm_head is not tied or needs separate resizing
-        if not self.config.tie_word_embeddings or self.lm_head.weight is not self.model.token_embeddings.weight:
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Linear:
+        self.model.resize_token_embeddings(new_num_tokens) # This updates model.config.vocab_size
+
+        if not self.config.tie_word_embeddings or self.lm_head.weight.shape[0] != new_num_tokens :
             old_lm_head = self.lm_head
-            self.lm_head = nn.Linear(self.config.hidden_size, new_num_tokens, bias=False, device=old_lm_head.weight.device, dtype=old_lm_head.weight.dtype)
-            self._init_weights(self.lm_head) # Initialize new lm_head weights
-            
+            self.lm_head = nn.Linear(self.config.hidden_size, new_num_tokens, bias=False,
+                                     device=old_lm_head.weight.device, dtype=old_lm_head.weight.dtype)
+            self._init_weights(self.lm_head)
+
             num_tokens_to_copy = min(old_lm_head.out_features, new_num_tokens)
             self.lm_head.weight.data[:num_tokens_to_copy, :] = old_lm_head.weight.data[:num_tokens_to_copy, :]
+            logger.info(f"Resized (untied or mismatched) LM head from {old_lm_head.out_features} to {new_num_tokens} tokens.")
+
         elif self.config.tie_word_embeddings:
-             self.lm_head.weight = self.model.token_embeddings.weight # Re-tie
-             # Update out_features for the tied head (nn.Linear doesn't auto-update this if weight is replaced)
-             self.lm_head.out_features = new_num_tokens
+             self.lm_head.weight = self.model.token_embeddings.weight # Re-tie after ApertisModel resize
+             self.lm_head.out_features = new_num_tokens # Manually update out_features for tied head
+             logger.info(f"Re-tied LM head. New vocab size: {new_num_tokens}.")
 
+        # Ensure model's config reflects the final state of lm_head vocab size
+        if self.config.vocab_size != self.lm_head.out_features:
+             logger.warning(f"Config vocab_size ({self.config.vocab_size}) mismatch with lm_head.out_features ({self.lm_head.out_features}) after resize. Correcting config.")
+             self.config.vocab_size = self.lm_head.out_features
 
-        self.config.vocab_size = new_num_tokens # Update config as well
-        logger.info(f"Resized LM head to {new_num_tokens} tokens.")
         return self.get_output_embeddings()
 
 
@@ -820,9 +838,7 @@ class ApertisForCausalLM(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            current_ignore_index = -100 # Default for fine-tuning where labels include -100
-            # If labels do not contain -100 (e.g. pre-training), use pad_token_id for ignoring padding.
-            # This assumes labels are never -100 during pre-training.
+            current_ignore_index = -100 
             if not (labels == -100).any():
                 current_ignore_index = self.config.pad_token_id
 
@@ -1033,6 +1049,7 @@ def create_apertis_model(
     ssm_d_state: int = 16,
     ssm_dt_rank: Union[int, str] = "auto",
     ssm_conv_kernel: int = 4,
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> ApertisForCausalLM:
     model_configs_presets = {
         "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
@@ -1041,32 +1058,39 @@ def create_apertis_model(
     }
     if model_size not in model_configs_presets:
         raise ValueError(f"Unsupported model_size: {model_size}. Choose from {list(model_configs_presets.keys())}")
-    config_dict = model_configs_presets[model_size].copy()
-    if vocab_size_override is not None: config_dict["vocab_size"] = vocab_size_override
+    
+    final_config_dict = model_configs_presets[model_size].copy()
+    
+    if vocab_size_override is not None: 
+        final_config_dict["vocab_size"] = vocab_size_override
     
     if attention_type_override is not None:
-        config_dict["attention_type"] = attention_type_override
+        final_config_dict["attention_type"] = attention_type_override
     else:
-        config_dict.setdefault("attention_type", "standard_mha")
+        final_config_dict.setdefault("attention_type", "standard_mha")
 
-
-    config_dict.update({
-        "multimodal": multimodal, "use_flash_attention": use_flash_attention,
+    final_config_dict.update({
+        "multimodal": multimodal, 
+        "use_flash_attention": use_flash_attention,
         "use_expert_system": use_expert_system,
         "ssm_d_inner": ssm_d_inner,
         "ssm_d_state": ssm_d_state,
         "ssm_dt_rank": ssm_dt_rank,
         "ssm_conv_kernel": ssm_conv_kernel,
     })
-    if config_dict["hidden_size"] % config_dict["num_attention_heads"] != 0:
-        logger.warning(f"hidden_size {config_dict['hidden_size']} not divisible by num_attention_heads {config_dict['num_attention_heads']}. Adjusting num_attention_heads.")
-        for i in range(config_dict["num_attention_heads"], 0, -1):
-            if config_dict["hidden_size"] % i == 0:
-                config_dict["num_attention_heads"] = i
-                break
-        if config_dict["hidden_size"] % config_dict["num_attention_heads"] != 0:
-             config_dict["num_attention_heads"] = 1
 
-    config = ApertisConfig(**config_dict)
+    if config_overrides:
+        final_config_dict.update(config_overrides)
+
+    if final_config_dict["hidden_size"] % final_config_dict["num_attention_heads"] != 0:
+        logger.warning(f"hidden_size {final_config_dict['hidden_size']} not divisible by num_attention_heads {final_config_dict['num_attention_heads']}. Adjusting num_attention_heads.")
+        for i in range(final_config_dict["num_attention_heads"], 0, -1):
+            if final_config_dict["hidden_size"] % i == 0:
+                final_config_dict["num_attention_heads"] = i
+                break
+        if final_config_dict["hidden_size"] % final_config_dict["num_attention_heads"] != 0:
+             final_config_dict["num_attention_heads"] = 1
+
+    config = ApertisConfig(**final_config_dict)
     model = ApertisForCausalLM(config)
     return model
