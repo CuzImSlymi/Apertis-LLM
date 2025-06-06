@@ -1,8 +1,11 @@
 from .rewards import (
-    LearnabilityReward,
-    AccuracyReward,
+    ClarityReward,
+    ComplexityReward,
     DiversityReward,
-    ComplexityReward
+    AccuracyReward,
+    CoherenceReward,
+    RelevanceReward,
+    StructureReward,
 )
 from .data_construction import (
     TaskGenerator,
@@ -17,10 +20,13 @@ from .utils import (
 )
 
 __all__ = [
-    'LearnabilityReward',
-    'AccuracyReward',
-    'DiversityReward',
+    'ClarityReward',
     'ComplexityReward',
+    'DiversityReward',
+    'AccuracyReward',
+    'CoherenceReward',
+    'RelevanceReward',
+    'StructureReward',
     'TaskGenerator',
     'TaskValidator',
     'SolutionGenerator',

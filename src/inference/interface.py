@@ -16,7 +16,8 @@ import threading
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model
-from src.training.pipeline import YoloStyleTrainingPipeline, ApertisPretrainDataset, get_available_gpus, create_sample_config as create_training_sample_config
+from src.training.pipeline import get_available_gpus
+from src.training import train_from_config
 
 
 logging.basicConfig(
@@ -80,7 +81,6 @@ class ApertisInterface:
             self.launch_web_interface()
 
     def _create_dummy_model_and_vocab_for_ui_startup(self):
-        """Creates a minimal model and vocab if none loaded, so UI can start."""
         logger.info("Creating a dummy model and vocab for UI startup as no model was specified.")
         dummy_config = ApertisConfig(vocab_size=100, hidden_size=64, num_hidden_layers=1, num_attention_heads=1, intermediate_size=128)
         self.model = ApertisForCausalLM(dummy_config)
@@ -110,17 +110,15 @@ class ApertisInterface:
                 self.actual_tokenizer_path_loaded = path_to_check
                 return True
             
-            # Try loading as a Hub ID or a direct file path (less common for AutoTokenizer but worth a try)
-            # This needs to be guarded, as from_pretrained can raise if path_to_check is not a valid ID / local path
-            if not os.path.isdir(path_to_check): # If it's not a directory, it might be a Hub ID
+            if not os.path.isdir(path_to_check):
                 try:
                     self.hf_tokenizer_chat = AutoTokenizer.from_pretrained(path_to_check)
                     logger.info(f"Successfully loaded Hugging Face tokenizer from Hub ID/path: {path_to_check}")
                     self.actual_tokenizer_path_loaded = path_to_check 
                     return True
-                except EnvironmentError: # Handles cases where it's not a valid Hub ID or local file/dir
+                except EnvironmentError:
                     logger.debug(f"'{path_to_check}' is not a local tokenizer directory and failed to load as Hub ID.")
-                    pass # Fall through, it wasn't a Hub ID or directly loadable path
+                    pass
         except ImportError:
             logger.error("Hugging Face Transformers library not found. Cannot load HF tokenizer.")
         except Exception as e:
@@ -138,30 +136,26 @@ class ApertisInterface:
 
         tokenizer_found_and_loaded = False
         potential_tokenizer_base_dir = model_path_or_name
-        if os.path.isfile(model_path_or_name): # If model path is file, tokenizer is likely in same dir
+        if os.path.isfile(model_path_or_name):
             potential_tokenizer_base_dir = os.path.dirname(model_path_or_name)
         
-        # Priority 1: Check the determined base directory for HF tokenizer files
         if os.path.isdir(potential_tokenizer_base_dir):
             logger.info(f"Checking for HF tokenizer in potential base directory: {potential_tokenizer_base_dir}")
             if self._attempt_load_hf_tokenizer(potential_tokenizer_base_dir):
                 tokenizer_found_and_loaded = True
         
-        # Priority 2: If model_path_or_name itself was a different string (e.g. Hub ID, or user *thought* it was tokenizer path)
         if not tokenizer_found_and_loaded and model_path_or_name != potential_tokenizer_base_dir:
             logger.info(f"Base directory tokenizer check failed or paths differ. Checking original path '{model_path_or_name}' as HF tokenizer source.")
             if self._attempt_load_hf_tokenizer(model_path_or_name):
                 tokenizer_found_and_loaded = True
         
-        # --- Model Loading ---
-        self.load_model(model_path_or_name) # This will use self.hf_tokenizer_chat if loaded
+        self.load_model(model_path_or_name)
 
-        # --- Fallback to Manual Vocab if HF Tokenizer wasn't loaded by this point ---
         if self.model and not self.hf_tokenizer_chat:
             manual_vocab_path_to_try = None
-            if vocab_file_override: # User explicitly provided a vocab.json
+            if vocab_file_override:
                 manual_vocab_path_to_try = vocab_file_override
-            elif os.path.isdir(potential_tokenizer_base_dir): # Check for vocab.json alongside model
+            elif os.path.isdir(potential_tokenizer_base_dir):
                 manual_vocab_path_to_try = os.path.join(potential_tokenizer_base_dir, "vocab.json")
             
             if manual_vocab_path_to_try and os.path.exists(manual_vocab_path_to_try):
@@ -194,7 +188,6 @@ class ApertisInterface:
             logger.info(f"Loading model. Input path/name: {model_weights_path_input}")
             config_for_model_instantiation: Optional[ApertisConfig] = None
             
-            # Determine base directory for config.json
             model_config_base_dir = model_weights_path_input
             if os.path.isfile(model_weights_path_input):
                 model_config_base_dir = os.path.dirname(model_weights_path_input)
@@ -206,7 +199,6 @@ class ApertisInterface:
             else:
                 logger.warning(f"config.json not found in {model_config_base_dir}. Will attempt to infer or use defaults if creating new.")
 
-            # Align config_for_model_instantiation with self.hf_tokenizer_chat if it's loaded
             if config_for_model_instantiation and self.hf_tokenizer_chat:
                 logger.info("HF tokenizer is loaded. Aligning model config with its properties.")
                 config_for_model_instantiation.vocab_size = self.hf_tokenizer_chat.vocab_size
@@ -216,11 +208,10 @@ class ApertisInterface:
                 if self.hf_tokenizer_chat.unk_token_id is not None: config_for_model_instantiation.unk_token_id = self.hf_tokenizer_chat.unk_token_id
                 logger.info(f"Model config aligned with HF tokenizer. New vocab_size: {config_for_model_instantiation.vocab_size}")
             
-            # Determine actual model weights file path
             state_dict_path_final = None
             if os.path.isdir(model_weights_path_input):
                 bin_path = os.path.join(model_weights_path_input, "pytorch_model.bin")
-                pt_path = os.path.join(model_weights_path_input, "model.pt") # Legacy
+                pt_path = os.path.join(model_weights_path_input, "model.pt")
                 if os.path.exists(bin_path): state_dict_path_final = bin_path
                 elif os.path.exists(pt_path): state_dict_path_final = pt_path
             elif os.path.isfile(model_weights_path_input) and \
@@ -230,10 +221,9 @@ class ApertisInterface:
             if not config_for_model_instantiation and state_dict_path_final:
                 logger.info(f"No config.json. Attempting to infer config from state_dict: {state_dict_path_final}")
                 config_for_model_instantiation = self._infer_config_from_state_dict(state_dict_path_final)
-                if config_for_model_instantiation and self.hf_tokenizer_chat: # Align inferred config if HF tokenizer exists
+                if config_for_model_instantiation and self.hf_tokenizer_chat:
                     config_for_model_instantiation.vocab_size = self.hf_tokenizer_chat.vocab_size
                     if self.hf_tokenizer_chat.pad_token_id is not None: config_for_model_instantiation.pad_token_id = self.hf_tokenizer_chat.pad_token_id
-                    # ... (bos, eos, unk)
                     logger.info(f"Inferred config aligned with HF tokenizer. Vocab_size: {config_for_model_instantiation.vocab_size}")
 
 
@@ -242,7 +232,6 @@ class ApertisInterface:
                 if state_dict_path_final and os.path.exists(state_dict_path_final):
                     loaded_state_dict = torch.load(state_dict_path_final, map_location=self.device, weights_only=True)
                     
-                    # Check vocab size of embeddings in state_dict
                     emb_weights_key = "model.token_embeddings.weight"
                     lm_head_weights_key = "lm_head.weight"
                     sd_vocab_size = -1
@@ -258,7 +247,7 @@ class ApertisInterface:
                             "This suggests a mismatch between the loaded config/tokenizer and the model weights. "
                             "Attempting to resize model to match state_dict."
                         )
-                        self.model.resize_token_embeddings(sd_vocab_size) # Resize model to match state_dict
+                        self.model.resize_token_embeddings(sd_vocab_size)
                         logger.info(f"Model resized to vocab_size {sd_vocab_size} to match state_dict.")
                     
                     load_result = self.model.load_state_dict(loaded_state_dict, strict=False)
@@ -293,22 +282,20 @@ class ApertisInterface:
         try:
             state_dict = torch.load(pt_path, map_location="cpu", weights_only=True)
             
-            # Infer vocab_size
             vocab_size = 0
             if "model.token_embeddings.weight" in state_dict:
                 vocab_size = state_dict["model.token_embeddings.weight"].shape[0]
-            elif "lm_head.weight" in state_dict: # If tied or older format
+            elif "lm_head.weight" in state_dict:
                 vocab_size = state_dict["lm_head.weight"].shape[0]
-            else: # Fallback if essential layers are missing
+            else:
                 vocab_size = self.hf_tokenizer_chat.vocab_size if self.hf_tokenizer_chat else 32000
             
-            # Infer hidden_size
             hidden_size = 0
             if "model.token_embeddings.weight" in state_dict:
                 hidden_size = state_dict["model.token_embeddings.weight"].shape[1]
-            elif "model.layers.0.attention.q_proj.weight" in state_dict: # More robust
+            elif "model.layers.0.attention.q_proj.weight" in state_dict:
                 hidden_size = state_dict["model.layers.0.attention.q_proj.weight"].shape[1]
-            elif "lm_head.weight" in state_dict: # Fallback
+            elif "lm_head.weight" in state_dict:
                 hidden_size = state_dict["lm_head.weight"].shape[1]
             else: hidden_size = 768
 
@@ -337,14 +324,11 @@ class ApertisInterface:
                 "num_attention_heads":num_attn_heads, "intermediate_size":intermediate_size,
                 "use_expert_system":use_expert_system, "multimodal":multimodal_inferred
             }
-            # Use current interface setting for multimodal if not clearly inferable
             if not multimodal_inferred and hasattr(self, 'multimodal'):
                 conf_params["multimodal"] = self.multimodal
             
-            # Create config with inferred, allowing defaults for others
             conf = ApertisConfig(**conf_params)
             
-            # If HF tokenizer is already loaded, align inferred config's special tokens
             if self.hf_tokenizer_chat:
                 if self.hf_tokenizer_chat.pad_token_id is not None: conf.pad_token_id = self.hf_tokenizer_chat.pad_token_id
                 if self.hf_tokenizer_chat.bos_token_id is not None: conf.bos_token_id = self.hf_tokenizer_chat.bos_token_id
@@ -384,7 +368,7 @@ class ApertisInterface:
                 model_cfg_vocab_size = self.model.config.vocab_size
                 
                 max_id_in_loaded_vocab = 0
-                if self.vocab: max_id_in_loaded_vocab = max(self.vocab.values() or [-1]) # Handle empty self.vocab
+                if self.vocab: max_id_in_loaded_vocab = max(self.vocab.values() or [-1])
                 effective_loaded_vocab_size = max_id_in_loaded_vocab + 1
                 
                 if model_cfg_vocab_size != effective_loaded_vocab_size :
@@ -394,9 +378,7 @@ class ApertisInterface:
                         "Token mapping may be needed if used directly. "
                         "Consider resizing the model or ensuring vocab consistency."
                     )
-                    # For chat, self.tokenize and self.detokenize will handle mapping to model's vocab space.
-                    # No need to create self.token_mapping here as chat methods manage this.
-                    self.token_mapping = None # Or a more explicit mapping could be built if strict alignment is needed
+                    self.token_mapping = None
                 else:
                     logger.info(f"Model config vocab_size matches manual vocab effective size: {model_cfg_vocab_size}")
                     self.token_mapping = None 
@@ -409,12 +391,12 @@ class ApertisInterface:
     def _create_fallback_vocab(self):
         logger.info("Creating minimal manual vocabulary as fallback.")
         self.vocab = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
-        for i in range(4, 100): self.vocab[f"<tok{i}>"] = i # Add some dummy tokens
+        for i in range(4, 100): self.vocab[f"<tok{i}>"] = i
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
-        self.token_mapping = None # No mapping needed for this self-consistent fallback
+        self.token_mapping = None
         self.actual_tokenizer_path_loaded = "Fallback minimal vocab (100 tokens)"
 
-    def tokenize(self, text: str) -> List[int]: # For generating prompt IDs for model
+    def tokenize(self, text: str) -> List[int]:
         if not self.model:
             logger.error("Model not loaded. Cannot tokenize.")
             return []
@@ -422,19 +404,16 @@ class ApertisInterface:
         if self.hf_tokenizer_chat:
             return self.hf_tokenizer_chat.encode(text, add_special_tokens=False)
 
-        if not self.vocab: # Manual vocab not loaded
+        if not self.vocab:
             logger.warning("Manual vocab not loaded for tokenize. Using fallback tokenization.")
-            # Very basic fallback: map words to unk if not in tiny vocab
             base_unk_id = self.model.config.unk_token_id
             return [self.vocab.get(word, base_unk_id) if self.vocab else base_unk_id for word in text.split()]
 
-        # Manual vocab tokenization: map to model's expected ID range
         model_config = self.model.config
         raw_token_ids_from_vocab_file = [
             self.vocab.get(word, self.vocab.get("<unk>", model_config.unk_token_id)) for word in text.split()
         ]
         
-        # Ensure all token IDs are within the model's configured vocab_size
         final_token_ids = []
         for tid in raw_token_ids_from_vocab_file:
             if tid >= model_config.vocab_size:
@@ -443,19 +422,19 @@ class ApertisInterface:
                 final_token_ids.append(tid)
         return final_token_ids
 
-    def detokenize(self, token_ids: List[int]) -> str: # For decoding model output IDs
+    def detokenize(self, token_ids: List[int]) -> str:
         if not self.model:
             return f"[DetokenizeError: Model not loaded. IDs: {token_ids[:5]}...]"
 
         if self.hf_tokenizer_chat:
             return self.hf_tokenizer_chat.decode(token_ids, skip_special_tokens=True)
 
-        if not self.reverse_vocab: # Manual reverse_vocab not available
+        if not self.reverse_vocab:
             return f"[DetokenizeError: Manual Reverse Vocab missing. IDs: {token_ids[:5]}...]"
 
         words = []
         model_config = self.model.config
-        default_unk_str = "<unk>" # String representation of unk from original vocab file
+        default_unk_str = "<unk>"
         if "<unk>" in self.vocab:
             unk_id_in_vocab_file = self.vocab["<unk>"]
             if unk_id_in_vocab_file in self.reverse_vocab:
@@ -465,12 +444,12 @@ class ApertisInterface:
             if model_token_id == model_config.pad_token_id or \
                model_token_id == model_config.bos_token_id or \
                model_token_id == model_config.eos_token_id:
-                continue # Skip special control tokens not meant for display
+                continue
             
             word = self.reverse_vocab.get(model_token_id)
             if word is not None:
                 words.append(word)
-            else: # model_token_id not in reverse_vocab (e.g. if model vocab > file vocab)
+            else:
                 words.append(f"[{default_unk_str.upper()}_ID:{model_token_id}]")
         return " ".join(words)
 
@@ -501,9 +480,9 @@ class ApertisInterface:
         try:
             input_ids_list_for_model: List[int]
             if self.hf_tokenizer_chat:
-                input_ids_list_for_model = self.hf_tokenizer_chat.encode(prompt, add_special_tokens=True) # HF handles BOS
-            else: # Manual vocab
-                tokenized_prompt = self.tokenize(prompt) # Already mapped to model's vocab space
+                input_ids_list_for_model = self.hf_tokenizer_chat.encode(prompt, add_special_tokens=True)
+            else:
+                tokenized_prompt = self.tokenize(prompt)
                 bos_id_for_model = self.model.config.bos_token_id
                 if not tokenized_prompt or tokenized_prompt[0] != bos_id_for_model:
                     input_ids_list_for_model = [bos_id_for_model] + tokenized_prompt
@@ -523,7 +502,7 @@ class ApertisInterface:
             eos_token_id_for_gen = self.model.config.eos_token_id
             pad_token_id_for_gen = self.model.config.pad_token_id
             
-            if self.hf_tokenizer_chat: # Prefer HF tokenizer's special IDs if available
+            if self.hf_tokenizer_chat:
                 if self.hf_tokenizer_chat.eos_token_id is not None: eos_token_id_for_gen = self.hf_tokenizer_chat.eos_token_id
                 if self.hf_tokenizer_chat.pad_token_id is not None: pad_token_id_for_gen = self.hf_tokenizer_chat.pad_token_id
             
@@ -531,14 +510,13 @@ class ApertisInterface:
                 input_ids=input_t, attention_mask=attention_mask_t, pixel_values=pixel_values_t,
                 max_new_tokens=max_length, do_sample=temperature > 0.001,
                 temperature=temperature if temperature > 0.001 else 1.0,
-                top_k=top_k if top_k > 0 else 0, # Pass 0 if disabled
-                top_p=top_p if top_p < 1.0 else 1.0, # Pass 1.0 if disabled
+                top_k=top_k if top_k > 0 else 0,
+                top_p=top_p if top_p < 1.0 else 1.0,
                 use_cache=True,
                 eos_token_id=eos_token_id_for_gen,
                 pad_token_id=pad_token_id_for_gen
             )
             
-            # output_ids includes the prompt. Slice to get only generated part.
             generated_part_ids = output_ids[0, input_t.shape[1]:].tolist()
             
             if self.hf_tokenizer_chat:
@@ -559,7 +537,7 @@ class ApertisInterface:
         for entry in self.chat_history:
             full_prompt_parts.append(f"{entry['role'].capitalize()}: {entry['content']}")
         full_prompt_parts.append(f"User: {message}")
-        full_prompt_parts.append("Assistant:") # Prompt the model for assistant's turn
+        full_prompt_parts.append("Assistant:")
 
         prompt_text_for_model = "\n".join(full_prompt_parts)
 
@@ -667,7 +645,6 @@ class ApertisInterface:
                             ft_eval_epochs_sl = gr.Slider(0, 10, 1, step=1, label="Eval Every N Epochs (0=disable)")
 
                             with gr.Accordion("GPU (Fine-tuning)", open=False):
-                                # Re-fetch available_gpus_list here to ensure it's current if UI reloads
                                 available_gpus_list_ft_re = get_available_gpus()
                                 gpu_md_text_ft_re = "### GPUs:\n" + ("\n".join([f"- {g['id']}: {g['name']} ({g['total_memory']:.1f}GB)" for g in available_gpus_list_ft_re]) or "None detected.")
                                 gr.Markdown(gpu_md_text_ft_re)
@@ -692,31 +669,19 @@ class ApertisInterface:
                 with gr.TabItem("Absolute Zero Reasoner"):
                     with gr.Row():
                         with gr.Column(scale=1):
-                            gr.Markdown("## Absolute Zero Reasoner Training")
-                            gr.Markdown("Train your model using the Absolute Zero Reasoner method.")
+                            gr.Markdown("## 1. AZR Model & Data")
+                            with gr.Accordion("Model Config (for AZR internal model)", open=True):
+                                azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                                azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
+                            with gr.Accordion("Tokenizer & Seed Data", open=True):
+                                azr_tokenizer_name_tb = gr.Textbox(value="gpt2", label="Hugging Face Tokenizer Name", placeholder="e.g., gpt2, meta-llama/Llama-2-7b-hf")
+                                azr_seed_tasks_up = gr.File(label="Seed Tasks (JSONL, optional, fields: 'task', 'type')", file_types=[".jsonl"])
 
-                            gr.Markdown("## Model Config (for AZR internal model)")
-                            azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
-                            azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
-                            azr_multimodal_cb = gr.Checkbox(label="Multimodal (Note: AZR tasks are text-based)")
-                            azr_expert_sys_cb = gr.Checkbox(label="Use Expert System")
-
-                            gr.Markdown("## Tokenizer (for AZR internal model)")
-                            azr_tokenizer_name_tb = gr.Textbox(
-                                value="bert-base-uncased",
-                                label="Hugging Face Tokenizer Name",
-                                placeholder="e.g., bert-base-uncased, gpt2, meta-llama/Llama-2-7b-hf"
-                            )
-
-                            gr.Markdown("## Seed Data (Optional)")
-                            azr_seed_tasks_up = gr.File(label="Seed Tasks (JSONL, optional, fields: 'task', 'type')", file_types=[".jsonl"])
-                            azr_seed_prob_sl = gr.Slider(0.0, 1.0, 0.2, step=0.05, label="Seed Task Probability")
-
-                        with gr.Column(scale=1):
-                            gr.Markdown("## AZR Training Parameters")
-                            azr_iterations_sl = gr.Slider(10, 500, 100, step=10, label="Number of Iterations")
-                            azr_tasks_per_iter_sl = gr.Slider(1, 20, 5, step=1, label="Tasks Per Iteration")
-
+                            gr.Markdown("## 2. Training Parameters")
+                            with gr.Accordion("Main Loop", open=True):
+                                azr_iterations_sl = gr.Slider(10, 1000, 100, step=10, label="Number of Iterations")
+                                azr_tasks_per_iter_sl = gr.Slider(1, 50, 5, step=1, label="Tasks Per Iteration")
+                                azr_checkpoint_interval_sl = gr.Slider(1, 100, 10, step=1, label="Checkpoint Every N Iterations")
                             with gr.Accordion("Task Generation", open=False):
                                 azr_task_types_cbg = gr.CheckboxGroup(["abduction", "deduction", "induction"], value=["abduction", "deduction", "induction"], label="Task Types")
                                 azr_task_dist_abduction_sl = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="Abduction Weight")
@@ -725,33 +690,42 @@ class ApertisInterface:
                                 azr_max_attempts_sl = gr.Slider(1, 10, 3, step=1, label="Max Generation Attempts")
                                 azr_temperature_sl = gr.Slider(0.1, 1.5, 0.7, step=0.05, label="Generation Temperature")
                                 azr_top_p_sl = gr.Slider(0.1, 1.0, 0.9, step=0.05, label="Top-P (1.0 = disable)")
-
-                            with gr.Accordion("Rewards", open=False):
-                                gr.Markdown("### Learnability Reward"); azr_learn_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Weight")
-                                gr.Markdown("### Accuracy Reward"); azr_acc_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Weight"); azr_partial_credit_cb = gr.Checkbox(value=True, label="Allow Partial Credit")
-                                gr.Markdown("### Diversity Reward"); azr_div_weight_sl = gr.Slider(0.0, 2.0, 0.5, step=0.1, label="Weight"); azr_history_size_sl = gr.Slider(1, 50, 10, step=1, label="History Size")
-                                gr.Markdown("### Complexity Reward"); azr_complex_weight_sl = gr.Slider(0.0, 2.0, 0.3, step=0.1, label="Weight"); azr_target_complex_sl = gr.Slider(0.0, 1.0, 0.7, step=0.05, label="Target Complexity"); azr_tolerance_sl = gr.Slider(0.0, 0.5, 0.2, step=0.05, label="Tolerance")
-
-                            with gr.Accordion("Python Executor (for some task/solution validation)", open=False):
+                                azr_seed_prob_sl = gr.Slider(0.0, 1.0, 0.2, step=0.05, label="Seed Task Probability")
+                            with gr.Accordion("Python Executor (for validation)", open=False):
                                 azr_timeout_sl = gr.Slider(1, 30, 5, step=1, label="Execution Timeout (seconds)")
                                 azr_max_output_sl = gr.Slider(1000, 50000, 10000, step=1000, label="Max Output Size (chars)")
 
-                            with gr.Accordion("GPU (AZR Training)", open=False):
-                                # Re-fetch available_gpus_list here
+                        with gr.Column(scale=1):
+                            gr.Markdown("## 3. Reward System")
+                            with gr.Accordion("Task Reward Weights", open=True):
+                                azr_clarity_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Clarity Weight")
+                                azr_complex_weight_sl = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Complexity Weight")
+                                azr_div_weight_sl = gr.Slider(0.0, 2.0, 0.8, step=0.1, label="Diversity Weight")
+                            with gr.Accordion("Solution Reward Weights", open=True):
+                                azr_acc_weight_sl = gr.Slider(0.0, 2.0, 1.5, step=0.1, label="Accuracy Weight")
+                                azr_coherence_weight_sl = gr.Slider(0.0, 2.0, 0.5, step=0.1, label="Coherence Weight")
+                                azr_relevance_weight_sl = gr.Slider(0.0, 2.0, 0.5, step=0.1, label="Relevance Weight")
+                                azr_structure_weight_sl = gr.Slider(0.0, 2.0, 0.5, step=0.1, label="Structure Weight")
+                            with gr.Accordion("Advanced Reward Parameters", open=False):
+                                gr.Markdown("Complexity Target")
+                                azr_target_complex_sl = gr.Slider(0.0, 1.0, 0.7, step=0.05, label="Target Complexity")
+                                azr_tolerance_sl = gr.Slider(0.0, 0.5, 0.15, step=0.05, label="Tolerance")
+                                gr.Markdown("Accuracy Power")
+                                azr_acc_power_sl = gr.Slider(1.0, 3.0, 1.5, step=0.1, label="Partial Credit Power")
+
+                            gr.Markdown("## 4. Execution & Output")
+                            with gr.Accordion("GPU & Logging", open=False):
                                 available_gpus_list_azr_re = get_available_gpus()
                                 gpu_md_text_azr_re = "### GPUs:\n" + ("\n".join([f"- {g['id']}: {g['name']} ({g['total_memory']:.1f}GB)" for g in available_gpus_list_azr_re]) or "None detected.")
                                 gr.Markdown(gpu_md_text_azr_re)
-                                azr_gpu_choices_re = [str(g['id']) for g in available_gpus_list_azr_re]
-
-                                azr_gpu_select_dd = gr.Dropdown(choices=azr_gpu_choices_re + ["cpu"], value=azr_gpu_choices_re[0] if azr_gpu_choices_re else "cpu", label="Select Device (GPU ID or CPU)")
-                                # AZR currently simpler, often single GPU or CPU. No explicit DDP for AZR in this UI.
-                                # azr_gpu_mem_frac_sl = gr.Slider(0.1, 1.0, 0.7, step=0.05, label="GPU Memory Fraction (Informational)")
-
+                                azr_gpu_select_dd = gr.Dropdown(choices=[f"cuda:{g['id']}" for g in available_gpus_list_azr_re] + ["cpu"], value=f"cuda:{available_gpus_list_azr_re[0]['id']}" if available_gpus_list_azr_re else "cpu", label="Select Device")
+                                azr_log_level_dd = gr.Dropdown(["DEBUG", "INFO", "WARNING", "ERROR"], value="INFO", label="Log Level")
+                                azr_wandb_cb = gr.Checkbox(label="Log to W&B")
+                                azr_wandb_proj_tb = gr.Textbox("apertis-azr", label="W&B Project", visible=False)
+                                azr_wandb_cb.change(lambda x: gr.update(visible=x), inputs=[azr_wandb_cb], outputs=[azr_wandb_proj_tb])
+                            
                             azr_output_dir_tb = gr.Textbox("output_azr", label="Output Directory")
-                            azr_wandb_cb = gr.Checkbox(label="Log to W&B")
-                            azr_wandb_proj_tb = gr.Textbox("apertis-azr", label="W&B Project", visible=False)
-                            azr_wandb_cb.change(lambda x: gr.update(visible=x), inputs=[azr_wandb_cb], outputs=[azr_wandb_proj_tb])
-
+                            
                             with gr.Row():
                                 azr_start_btn = gr.Button("Start AZR Training", variant="primary")
                                 azr_stop_btn = gr.Button("Stop AZR Training")
@@ -779,17 +753,15 @@ class ApertisInterface:
             def ui_chat_handler(msg, img, max_new, temp, tk, tp, hist):
                 if not self.model:
                     gr.Warning("No model loaded. Please load a model from the 'Models' tab.")
-                    return hist, "" # Return current history and empty input box
+                    return hist, ""
                 if not msg.strip() and not img: 
                     gr.Info("Please provide a message or an image.")
                     return hist, ""
                 
                 response_from_model = self.chat(msg, img, max_new, temp, tk, tp)
                 
-                # Gradio chatbot expects a list of (user_msg, assistant_msg) tuples
-                # We manage self.chat_history internally. We need to convert it for display.
                 gradio_display_history = []
-                temp_internal_history_for_display = self.chat_history.copy() # Use the updated history
+                temp_internal_history_for_display = self.chat_history.copy()
                 
                 user_turn_text_for_display = None
                 for entry_idx in range(len(temp_internal_history_for_display)):
@@ -797,9 +769,9 @@ class ApertisInterface:
                         user_turn_text_for_display = temp_internal_history_for_display[entry_idx]["content"]
                     elif temp_internal_history_for_display[entry_idx]["role"] == "assistant" and user_turn_text_for_display is not None:
                         gradio_display_history.append( (user_turn_text_for_display, temp_internal_history_for_display[entry_idx]["content"]) )
-                        user_turn_text_for_display = None # Reset for next pair
+                        user_turn_text_for_display = None
 
-                return gradio_display_history, "" # Clear input textbox
+                return gradio_display_history, ""
 
 
             submit_btn_chat.click(ui_chat_handler, [msg_textbox, img_input_chat, max_new_tokens_slider, temp_slider_chat, top_k_slider_chat, top_p_slider_chat, chatbot_ui], [chatbot_ui, msg_textbox])
@@ -807,7 +779,7 @@ class ApertisInterface:
 
             def ui_clear_chat_handler():
                 self.reset_chat()
-                return [], "", None # Clear chatbot, message box, image input
+                return [], "", None
             clear_btn_chat.click(ui_clear_chat_handler, outputs=[chatbot_ui, msg_textbox, img_input_chat])
 
 
@@ -821,7 +793,6 @@ class ApertisInterface:
                 
                 if self.model and hasattr(self.model.config, 'to_dict'):
                     cfg_dict = self.model.config.to_dict()
-                    # Display a few key config items for brevity in UI
                     brief_cfg = {
                         "model_type": cfg_dict.get("model_type"), "vocab_size": cfg_dict.get("vocab_size"),
                         "hidden_size": cfg_dict.get("hidden_size"), "num_hidden_layers": cfg_dict.get("num_hidden_layers"),
@@ -850,18 +821,14 @@ class ApertisInterface:
                     if not out_path_ui: return "Output path for new model files is required."
                     v_size_int = int(v_size_ui) if v_size_ui is not None else 32000
                     
-                    # Create model instance
                     new_model_instance = create_apertis_model(
                         model_size=size_ui, vocab_size_override=v_size_int,
                         multimodal=multi_ui, use_expert_system=expert_ui,
                         attention_type_override=attn_type_ui
                     )
-                    # Save model weights and config.json
                     new_model_instance.save_pretrained(out_path_ui)
                     
-                    # Create a dummy vocab.json consistent with v_size_int
                     dummy_vocab_content = {f"<token_{i}>": i for i in range(v_size_int)}
-                    # Add default special tokens if they fit within vocab_size
                     default_specials = {
                         "<pad>": new_model_instance.config.pad_token_id, 
                         "<bos>": new_model_instance.config.bos_token_id, 
@@ -871,7 +838,7 @@ class ApertisInterface:
                     for tok_str, tok_id in default_specials.items():
                         if tok_id < v_size_int:
                             dummy_vocab_content[tok_str] = tok_id
-                        else: # Should not happen if ApertisConfig defaults are low
+                        else:
                             logger.warning(f"Default special token {tok_str} ID {tok_id} too large for vocab_size {v_size_int}. Not adding to dummy vocab.")
                     
                     with open(os.path.join(out_path_ui, "vocab.json"),"w",encoding="utf-8") as f:
@@ -917,7 +884,7 @@ class ApertisInterface:
                         "data_config": {"train_data_path":train_p, "tokenizer_path":vocab_p_std, "val_data_path":val_p,
                                         "max_length":512, "multimodal":m_m, "image_dir":img_d if m_m else None,
                                         "image_size": 224},
-                        "model_config": { # These are for NEW models for pre-training
+                        "model_config": {
                             "model_size":m_s, "attention_type": attn_t, "multimodal":m_m, "use_expert_system":exp_s
                         },
                         "training_config": {
@@ -943,7 +910,6 @@ class ApertisInterface:
 
                     def _thread_train_job(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
                         try:
-                            from src.training.pipeline import train_from_config
                             status_box_arg.value = f"Pre-training started. Output: {out_d}. Config: {final_cfg_path_in_output}\nFollow logs in console/wandb."
                             train_from_config(c_p_arg, stop_event_arg)
                             if stop_event_arg.is_set():
@@ -957,7 +923,7 @@ class ApertisInterface:
                             shutil.rmtree(t_d_arg)
                             self.standard_training_thread = None
                     
-                    train_status_tb.value = "Initializing pre-training..." # Initial feedback
+                    train_status_tb.value = "Initializing pre-training..."
                     self.standard_training_thread = threading.Thread(target=_thread_train_job, args=(cfg_path, tmp_dir, self.standard_training_stop_event, train_status_tb), daemon=True)
                     self.standard_training_thread.start()
                     return f"Pre-training initiated. Output will be in '{out_d}'. Monitor console/W&B for progress. Copied config to '{final_cfg_path_in_output}'."
@@ -1017,7 +983,7 @@ class ApertisInterface:
                     elif ft_manual_vocab_path_obj :
                         tokenizer_path_for_config_ft = os.path.join(tmp_dir, "ft_manual_vocab.json")
                         shutil.copy(ft_manual_vocab_path_obj.name, tokenizer_path_for_config_ft)
-                    else: # Should be caught by initial checks, but defensive
+                    else:
                         return "Tokenizer configuration error for fine-tuning."
 
                     sel_gpus = [int(gid) for gid in g_sel_ui] if g_sel_ui else None
@@ -1030,7 +996,7 @@ class ApertisInterface:
                             "use_hf_tokenizer_for_finetune": use_hf_for_ft_config,
                             "prompt_template": prompt_template_ui, "max_length": 512
                         },
-                        "model_config": {}, # For FT, base model structure is loaded, but minor overrides can be here
+                        "model_config": {},
                         "training_config": {
                             "task_type": "finetune",
                             "pretrained_model_path_for_finetune": base_model_path_ui,
@@ -1053,7 +1019,6 @@ class ApertisInterface:
 
                     def _thread_finetune_job(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
                         try:
-                            from src.training.pipeline import train_from_config
                             status_box_arg.value = f"Fine-tuning started. Output: {out_d_ui}. Config: {final_cfg_path_in_output_ft}\nFollow logs."
                             train_from_config(c_p_arg, stop_event_arg)
                             if stop_event_arg.is_set(): status_box_arg.value += "\nFine-tuning stopped by user."
@@ -1091,11 +1056,15 @@ class ApertisInterface:
             stop_ft_btn.click(ui_stop_finetuning_handler, outputs=[ft_status_tb])
 
             def ui_start_azr_training_handler(
-                m_s, attn_t, m_m, exp_s, tokenizer_name_hf, seed_f_obj, seed_prob,
-                iterations, tasks_per_iter, task_types_list, abduction_w, deduction_w, induction_w,
-                max_attempts, temperature, top_p_gen, learn_weight, acc_weight, partial_credit,
-                div_weight, history_size, complex_weight, target_complex, tolerance,
-                timeout_exec, max_output_exec, azr_device_select_ui, out_d, use_wb, wb_p
+                m_s, attn_t, tokenizer_name_hf, seed_f_obj,
+                iterations, tasks_per_iter, checkpoint_interval,
+                task_types_list, abduction_w, deduction_w, induction_w,
+                max_attempts, temperature, top_p_gen, seed_prob,
+                timeout_exec, max_output_exec,
+                clarity_w, complex_w, div_w,
+                acc_w, coherence_w, relevance_w, structure_w,
+                target_complex, tolerance, acc_power,
+                azr_device_select_ui, log_level_ui, use_wb, wb_p, out_d
             ):
                 current_status = ""
                 if not tokenizer_name_hf.strip(): current_status += "Hugging Face Tokenizer Name is required for AZR.\n"
@@ -1117,45 +1086,41 @@ class ApertisInterface:
                     task_dist_map = {"abduction": abduction_w, "deduction": deduction_w, "induction": induction_w}
                     final_task_types = [tt for tt in task_types_list if tt in task_dist_map]
                     final_task_dist_weights = [task_dist_map[tt] for tt in final_task_types]
-
-                    if not final_task_types: # Should be caught by initial check
-                        return "No valid task types selected or weights configured for AZR."
                     
                     sum_weights = sum(final_task_dist_weights)
                     if sum_weights > 0:
                         final_task_dist_weights = [w / sum_weights for w in final_task_dist_weights]
-                    else: # All selected task types have 0 weight, distribute equally
+                    elif final_task_types:
                         equal_w = 1.0 / len(final_task_types)
                         final_task_dist_weights = [equal_w] * len(final_task_types)
                     
-                    azr_model_cfg_base = create_apertis_model(model_size=m_s, attention_type_override=attn_t, multimodal=m_m, use_expert_system=exp_s).config.to_dict()
+                    azr_model_cfg_base = create_apertis_model(model_size=m_s, attention_type_override=attn_t).config.to_dict()
 
                     cfg = {
                         "data": {"tokenizer_name": tokenizer_name_hf.strip()},
-                        "model": azr_model_cfg_base, # AZR pipeline will set vocab_size from HF tokenizer
+                        "model": azr_model_cfg_base,
                         "training": {"method": "azr", "output_dir": out_d, "device": azr_device_select_ui},
                         "azr": {
                             "num_iterations": iterations, "tasks_per_iteration": tasks_per_iter,
-                            "checkpoint_interval": 10, "checkpoint_dir": os.path.join(out_d, "azr_checkpoints"),
-                            "force_accept_tasks": True, "force_accept_solutions": True,
-                            "force_accept_threshold": 10, "min_valid_tasks_before_validation": 20,
-                            "log_level": "INFO", "log_file": os.path.join(out_d, "azr_training.log"),
+                            "checkpoint_interval": checkpoint_interval,
+                            "log_level": log_level_ui, "log_file": "azr_training.log",
                             "python_executor": {"timeout": timeout_exec, "max_output_size": max_output_exec},
                             "task_generator": {
                                 "task_types": final_task_types, "task_distribution": final_task_dist_weights,
                                 "max_attempts": max_attempts, "seed_tasks_path": seed_p,
-                                "seed_task_probability": seed_prob,
-                                "base_prompt": "Generate a challenging reasoning problem.",
-                                "max_new_tokens": 100, "temperature": temperature, "top_p": top_p_gen
+                                "seed_task_probability": seed_prob, "max_new_tokens": 100,
+                                "temperature": temperature, "top_p": top_p_gen
                             },
-                            "task_validator": {"min_length": 10, "max_length": 2500, "min_complexity": 0.1, "max_complexity": 1.0, "min_clarity": 0.3},
-                            "solution_generator": {"max_attempts": max_attempts, "base_prompt": "Solve the following problem step by step:", "include_task_type_hint": True, "max_new_tokens": 1024, "temperature": temperature, "top_p": top_p_gen},
-                            "solution_validator": {"min_coherence": 0.3, "min_relevance": 0.3, "min_structure": 0.2},
-                            "learnability_reward": {"weight": learn_weight},
-                            "accuracy_reward": {"weight": acc_weight, "partial_credit": partial_credit},
-                            "diversity_reward": {"weight": div_weight, "history_size": history_size},
-                            "complexity_reward": {"weight": complex_weight, "target_complexity": target_complex, "tolerance": tolerance},
-                            "use_wandb": use_wb, "wandb_project": wb_p if use_wb else "apertis-azr",
+                            "solution_generator": {"max_new_tokens": 1024, "temperature": temperature, "top_p": top_p_gen},
+                            "rewards": {
+                                "clarity": {"weight": clarity_w},
+                                "complexity": {"weight": complex_w, "target_complexity": target_complex, "tolerance": tolerance},
+                                "diversity": {"weight": div_w},
+                                "accuracy": {"weight": acc_w, "partial_credit_power": acc_power},
+                                "coherence": {"weight": coherence_w},
+                                "relevance": {"weight": relevance_w},
+                                "structure": {"weight": structure_w},
+                            },
                         }
                     }
 
@@ -1167,16 +1132,15 @@ class ApertisInterface:
 
                     def _thread_azr_train(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
                         try:
-                            from src.training import train_from_config as azr_entry_train
                             status_box_arg.value = f"AZR Training started. Output: {out_d}. Config: {final_cfg_path_in_output_azr}\nFollow logs."
-                            azr_entry_train(c_p_arg, stop_event_arg) # Uses the training.__init__.py dispatcher
+                            train_from_config(c_p_arg, stop_event_arg)
                             if stop_event_arg.is_set(): status_box_arg.value += "\nAZR Training stopped by user."
                             else: status_box_arg.value += "\nAZR Training completed."
                         except Exception as e_thread_azr:
                             logger.error(f"Error in AZR training thread: {e_thread_azr}", exc_info=True)
                             status_box_arg.value += f"\nError in AZR training thread: {e_thread_azr}"
                         finally:
-                            shutil.rmtree(t_d_arg)
+                            shutil.rmtree(t_d_arg, ignore_errors=True)
                             self.azr_training_thread = None
                     
                     azr_status_tb.value = "Initializing AZR training..."
@@ -1198,16 +1162,15 @@ class ApertisInterface:
             azr_start_btn.click(
                 ui_start_azr_training_handler,
                 [
-                    azr_model_size_dd, azr_attn_type_dd, azr_multimodal_cb, azr_expert_sys_cb,
-                    azr_tokenizer_name_tb, azr_seed_tasks_up, azr_seed_prob_sl,
-                    azr_iterations_sl, azr_tasks_per_iter_sl, azr_task_types_cbg,
-                    azr_task_dist_abduction_sl, azr_task_dist_deduction_sl, azr_task_dist_induction_sl,
-                    azr_max_attempts_sl, azr_temperature_sl, azr_top_p_sl,
-                    azr_learn_weight_sl, azr_acc_weight_sl, azr_partial_credit_cb,
-                    azr_div_weight_sl, azr_history_size_sl, azr_complex_weight_sl,
-                    azr_target_complex_sl, azr_tolerance_sl, azr_timeout_sl, azr_max_output_sl,
-                    azr_gpu_select_dd, azr_output_dir_tb,
-                    azr_wandb_cb, azr_wandb_proj_tb
+                    azr_model_size_dd, azr_attn_type_dd, azr_tokenizer_name_tb, azr_seed_tasks_up,
+                    azr_iterations_sl, azr_tasks_per_iter_sl, azr_checkpoint_interval_sl,
+                    azr_task_types_cbg, azr_task_dist_abduction_sl, azr_task_dist_deduction_sl, azr_task_dist_induction_sl,
+                    azr_max_attempts_sl, azr_temperature_sl, azr_top_p_sl, azr_seed_prob_sl,
+                    azr_timeout_sl, azr_max_output_sl,
+                    azr_clarity_weight_sl, azr_complex_weight_sl, azr_div_weight_sl,
+                    azr_acc_weight_sl, azr_coherence_weight_sl, azr_relevance_weight_sl, azr_structure_weight_sl,
+                    azr_target_complex_sl, azr_tolerance_sl, azr_acc_power_sl,
+                    azr_gpu_select_dd, azr_log_level_dd, azr_wandb_cb, azr_wandb_proj_tb, azr_output_dir_tb
                 ],
                 [azr_status_tb]
             )

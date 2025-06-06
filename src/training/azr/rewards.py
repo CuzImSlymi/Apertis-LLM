@@ -2,171 +2,101 @@ import torch
 import numpy as np
 from typing import Dict, List, Optional, Union, Any
 import logging
+import math
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 
 class BaseReward:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.weight = config.get("weight", 1.0)
         
     def calculate(self, *args, **kwargs) -> float:
-        raise NotImplementedError("Subclasses must implement calculate method")
-
-class LearnabilityReward(BaseReward):
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
-        self.weight = config.get("weight", 1.0)
-        self.min_threshold = config.get("min_threshold", 0.0)
-        self.max_threshold = config.get("max_threshold", 1.0)
-        
-    def calculate(self, task_info: Dict[str, Any]) -> float:
-        """Calculate learnability reward based on task information.
-        
-        Args:
-            task_info: Dictionary containing task information
-            
-        Returns:
-            float: Learnability reward score
-        """
-        # For now, return a simple fixed score
-        # This can be enhanced later with more sophisticated metrics
-        return 0.5 * self.weight
-
-class AccuracyReward(BaseReward):
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
-        self.weight = config.get("weight", 1.0)
-        self.partial_credit = config.get("partial_credit", True)
-        
-    def calculate(self, solution_validation_result: Dict[str, Any]) -> float:
-        """Calculate accuracy reward based on solution validation results.
-        
-        Args:
-            solution_validation_result: Dictionary containing validation results
-            
-        Returns:
-            float: Accuracy reward score
-        """
-        if not solution_validation_result.get("is_valid", False):
-            return 0.0
-            
-        # Extract validation metrics
-        correctness = solution_validation_result.get("correctness", 0.0)
-        
-        if self.partial_credit:
-            # Allow partial credit for partially correct solutions
-            score = correctness
-        else:
-            # Binary reward - only fully correct solutions get reward
-            score = 1.0 if correctness > 0.95 else 0.0
-            
-        # Apply weight
-        return score * self.weight
-
-class DiversityReward(BaseReward):
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
-        self.weight = config.get("weight", 0.5)
-        self.history_size = config.get("history_size", 10)
-        self.task_history = []
-        
-    def calculate(self, task_info: Union[Dict[str, Any], str], previous_tasks: Optional[List[Dict[str, Any]]] = None) -> float:
-        """Calculate diversity reward based on task history.
-        
-        Args:
-            task_info: The current task info (dict) or task text (str)
-            previous_tasks: Optional list of previous tasks
-            
-        Returns:
-            float: Diversity reward score
-        """
-        # Extract task text and type from task_info if it's a dictionary
-        if isinstance(task_info, dict):
-            task_text = task_info.get("task", "")
-            task_type = task_info.get("type", "")
-        else:
-            # For backward compatibility
-            task_text = task_info
-            task_type = "unknown"
-            
-        # Simple n-gram based diversity calculation
-        if not previous_tasks and not self.task_history:
-            if previous_tasks is not None:
-                # If empty list was explicitly provided
-                return self.weight  # Max reward for first task
-            # Otherwise use internal history
-            self.task_history.append((task_text, task_type))
-            return self.weight  # Max reward for first task
-            
-        # Use provided previous tasks if available, otherwise use internal history
-        history = []
-        if previous_tasks is not None:
-            for prev_task_info in previous_tasks:
-                if isinstance(prev_task_info, dict):
-                    prev_text = prev_task_info.get("task", "")
-                    prev_type = prev_task_info.get("type", "")
-                    history.append((prev_text, prev_type))
-                else:
-                    # Handle case where previous tasks might be strings
-                    history.append((prev_task_info, "unknown"))
-        else:
-            history = self.task_history
-            
-        # Calculate similarity to previous tasks
-        similarities = []
-        for prev_text, prev_type in history:
-            # Type similarity (0.3 if same type, 0 if different)
-            type_sim = 0.3 if prev_type == task_type else 0.0
-            
-            # Content similarity based on token overlap (crude approximation)
-            # Handle empty strings or non-string inputs safely
-            if not isinstance(task_text, str) or not isinstance(prev_text, str):
-                content_sim = 0.0
-            else:
-                try:
-                    tokens1 = set(task_text.lower().split())
-                    tokens2 = set(prev_text.lower().split())
-                    if not tokens1 or not tokens2:
-                        content_sim = 0.0
-                    else:
-                        intersection = tokens1.intersection(tokens2)
-                        union = tokens1.union(tokens2)
-                        content_sim = 0.7 * (len(intersection) / len(union))
-                except (AttributeError, TypeError):
-                    # Handle any unexpected errors
-                    logger.warning(f"Error calculating content similarity between '{task_text}' and '{prev_text}'")
-                    content_sim = 0.0
-                
-            similarities.append(type_sim + content_sim)
-            
-        # Update internal history if not using provided previous tasks
-        if previous_tasks is None:
-            self.task_history.append((task_text, task_type))
-            if len(self.task_history) > self.history_size:
-                self.task_history.pop(0)
-            
-        # Diversity is inverse of maximum similarity
-        max_similarity = max(similarities) if similarities else 0.0
-        diversity = 1.0 - max_similarity
-        
-        return diversity * self.weight
+        raise NotImplementedError("Subclasses must implement the calculate method")
 
 class ComplexityReward(BaseReward):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.weight = config.get("weight", 0.3)
         self.target_complexity = config.get("target_complexity", 0.7)
-        self.tolerance = config.get("tolerance", 0.2)
+        self.tolerance = config.get("tolerance", 0.15)
         
-    def calculate(self, task_info: Dict[str, Any]) -> float:
-        """Calculate complexity reward based on task information.
-        
-        Args:
-            task_info: Dictionary containing task information
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        complexity = validation_result.get("complexity", 0.0)
+        reward = math.exp(-((complexity - self.target_complexity) ** 2) / (2 * self.tolerance ** 2))
+        return self.weight * reward
+
+class ClarityReward(BaseReward):
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        clarity = validation_result.get("clarity", 0.0)
+        return self.weight * clarity
+
+class DiversityReward(BaseReward):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.ngram_weights = config.get("ngram_weights", [0.2, 0.4, 0.4])
+
+    def _get_ngrams(self, text: str, n: int) -> set:
+        words = text.lower().split()
+        if len(words) < n:
+            return set()
+        return set(zip(*(words[i:] for i in range(n))))
+
+    def _calculate_jaccard_similarity(self, set1: set, set2: set) -> float:
+        if not set1 and not set2:
+            return 1.0
+        if not set1 or not set2:
+            return 0.0
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        return intersection / union if union > 0 else 0.0
+
+    def calculate(self, task_info: Dict[str, Any], previous_tasks: List[Dict[str, Any]]) -> float:
+        task_text = task_info.get("task", "")
+        if not previous_tasks:
+            return self.weight
+
+        previous_task_texts = [p.get("task", "") for p in previous_tasks]
+        max_similarity = 0.0
+
+        for prev_text in previous_task_texts:
+            total_similarity = 0.0
+            for i, weight in enumerate(self.ngram_weights):
+                n = i + 1
+                ngrams_current = self._get_ngrams(task_text, n)
+                ngrams_prev = self._get_ngrams(prev_text, n)
+                sim = self._calculate_jaccard_similarity(ngrams_current, ngrams_prev)
+                total_similarity += weight * sim
             
-        Returns:
-            float: Complexity reward score
-        """
-        # For now, return a simple fixed score
-        # This can be enhanced later with more sophisticated metrics
-        return 0.5 * self.weight
+            if total_similarity > max_similarity:
+                max_similarity = total_similarity
+        
+        diversity_score = 1.0 - max_similarity
+        return self.weight * diversity_score
+
+class AccuracyReward(BaseReward):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.partial_credit_power = config.get("partial_credit_power", 1.5)
+
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        if not validation_result.get("is_valid", False):
+            return 0.0
+        correctness = validation_result.get("correctness", 0.0)
+        score = correctness ** self.partial_credit_power
+        return self.weight * score
+
+class CoherenceReward(BaseReward):
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        coherence = validation_result.get("coherence", 0.0)
+        return self.weight * coherence
+
+class RelevanceReward(BaseReward):
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        relevance = validation_result.get("relevance", 0.0)
+        return self.weight * relevance
+
+class StructureReward(BaseReward):
+    def calculate(self, validation_result: Dict[str, Any]) -> float:
+        structure = validation_result.get("structure", 0.0)
+        return self.weight * structure
