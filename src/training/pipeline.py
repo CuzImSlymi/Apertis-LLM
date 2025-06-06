@@ -908,16 +908,21 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
 
         else: # Pre-training or fine-tuning from scratch
             logger.info(f"Initializing a new model for {'pre-training' if not is_fine_tuning_mode else 'fine-tuning from scratch'}.")
-            # Start with ApertisConfig defaults, then apply model_cfg_from_file, then ensure vocab/special tokens.
-            current_model_config_obj = ApertisConfig(**model_cfg_from_file) # model_cfg_from_file has structure params
-            current_model_config_obj.vocab_size = final_vocab_size_for_model_config
-            current_model_config_obj.pad_token_id = final_pad_id
-            current_model_config_obj.bos_token_id = final_bos_id
-            current_model_config_obj.eos_token_id = final_eos_id
-            current_model_config_obj.unk_token_id = final_unk_id
-            
-            model_for_trainer = ApertisForCausalLM(current_model_config_obj)
-            logger.info(f"Initialized NEW ApertisForCausalLM with config: {current_model_config_obj.to_dict()}")
+            # Use create_apertis_model to handle 'model_size' and other presets
+            model_for_trainer = create_apertis_model(
+                model_size=model_cfg_from_file.get("model_size", "base"),
+                vocab_size_override=final_vocab_size_for_model_config,
+                attention_type_override=model_cfg_from_file.get("attention_type"),
+                multimodal=model_cfg_from_file.get("multimodal", False),
+                use_expert_system=model_cfg_from_file.get("use_expert_system", False)
+            )
+            # Ensure special token IDs from tokenizer are respected
+            model_for_trainer.config.pad_token_id = final_pad_id
+            model_for_trainer.config.bos_token_id = final_bos_id
+            model_for_trainer.config.eos_token_id = final_eos_id
+            model_for_trainer.config.unk_token_id = final_unk_id
+
+            logger.info(f"Initialized NEW ApertisForCausalLM with config: {model_for_trainer.config.to_dict()}")
         
         logger.info(f"Final model object for trainer has config: {model_for_trainer.config.to_dict()}")
     except Exception as e:
