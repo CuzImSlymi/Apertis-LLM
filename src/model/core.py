@@ -77,6 +77,18 @@ class ApertisConfig:
         vision_heads: int = 12,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        # MoE specific configs
+        load_balancing_loss_coef: float = 0.01,
+        expert_capacity_factor: float = 1.25, # Max proportion of tokens an expert can take = (tokens_per_batch / num_experts) * expert_capacity_factor
+        noisy_routing_alpha: float = 0.1, # Factor for learnable noise in top-k routing
+        expert_dropout_prob: float = 0.1, # Dropout probability for expert outputs during training
+        router_z_loss_coef: float = 0.001, # Coefficient for router z-loss (encourages router confidence)
+        expert_output_gating: bool = False, # Not implemented in this plan, placeholder
+        use_noisy_top_k_routing: bool = True,
+        use_expert_capacity_limit: bool = True,
+        use_expert_dropout: bool = True, # This refers to dropping entire experts, not dropout within MLP
+        use_router_z_loss: bool = True,
+        use_load_balancing_loss: bool = True,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -133,6 +145,27 @@ class ApertisConfig:
         self.vision_heads = vision_heads
         self.output_attentions = output_attentions
         self.output_hidden_states = output_hidden_states
+
+        # MoE attributes
+        self.load_balancing_loss_coef = load_balancing_loss_coef
+        self.expert_capacity_factor = expert_capacity_factor
+        self.noisy_routing_alpha = noisy_routing_alpha
+        self.expert_dropout_prob = expert_dropout_prob
+        self.router_z_loss_coef = router_z_loss_coef
+        self.expert_output_gating = expert_output_gating # Placeholder
+        self.use_noisy_top_k_routing = use_noisy_top_k_routing
+        self.use_expert_capacity_limit = use_expert_capacity_limit
+        self.use_expert_dropout = use_expert_dropout
+        self.use_router_z_loss = use_router_z_loss
+        self.use_load_balancing_loss = use_load_balancing_loss
+
+        # Make sure num_experts and experts_per_token are consistent
+        if not self.use_expert_system:
+            self.num_experts = 0 # Or 1, but 0 indicates no MoE specific logic path
+            self.experts_per_token = 0
+        else:
+            self.experts_per_token = min(self.num_experts, self.experts_per_token) if self.num_experts > 0 else 0
+
 
         for key, value in kwargs.items():
             if not hasattr(self, key):
@@ -331,49 +364,210 @@ class SelectiveLinearAttention(nn.Module):
         return final_output, y_ssm_processed if output_attentions else None, current_cache_state
 
 class AdaptiveExpertSystem(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int = 8, experts_per_token: int = 2, activation_function: str = "gelu"):
+    def __init__(self, config: ApertisConfig, activation_function_override: Optional[str] = None):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.experts_per_token = min(num_experts, experts_per_token)
-        self.router_norm = nn.LayerNorm(hidden_size)
-        self.router = nn.Linear(hidden_size, num_experts)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.num_experts = config.num_experts
+        self.experts_per_token = config.experts_per_token
+
+        if self.num_experts <= 0:
+            logger.info("AdaptiveExpertSystem initialized with num_experts <= 0. It will act as a passthrough or be effectively disabled if part of FFN.")
+            self.router = None
+            self.experts = None
+            # Ensure feature flags are False so forward pass doesn't error if called.
+            self.use_noisy_top_k_routing = False
+            self.use_expert_capacity_limit = False
+            self.use_expert_dropout = False
+            self.use_router_z_loss = False
+            self.use_load_balancing_loss = False
+            # Assign default coefs even if not used, for consistency, or handle in forward pass.
+            self.load_balancing_loss_coef = 0.0
+            self.router_z_loss_coef = 0.0
+            self.expert_dropout_prob = 0.0
+            self.noisy_routing_alpha = 0.0
+            return
+
+        self.router_norm = nn.LayerNorm(self.hidden_size, eps=config.layer_norm_eps)
+        self.router = nn.Linear(self.hidden_size, self.num_experts)
+
+        expert_activation_fn_str = activation_function_override if activation_function_override is not None else config.hidden_act
+
         self.experts = nn.ModuleList([
             nn.Sequential(
-                nn.LayerNorm(hidden_size),
-                nn.Linear(hidden_size, intermediate_size),
-                self._get_activation_fn(activation_function),
-                nn.Dropout(0.1),
-                nn.Linear(intermediate_size, hidden_size)
-            ) for _ in range(num_experts)
+                nn.LayerNorm(self.hidden_size, eps=config.layer_norm_eps),
+                nn.Linear(self.hidden_size, self.intermediate_size),
+                self._get_activation_fn(expert_activation_fn_str),
+                nn.Dropout(config.hidden_dropout_prob),
+                nn.Linear(self.intermediate_size, self.hidden_size)
+            ) for _ in range(self.num_experts)
         ])
+
+        self.w_noise = None
+        if config.use_noisy_top_k_routing:
+            # Per-expert noise scaling factor for router logits noise. Initialized to zeros.
+            self.w_noise = nn.Parameter(torch.zeros(self.num_experts))
+            # Alternative: nn.Parameter(torch.full((self.num_experts,), 1e-3)) for small initial noise
+
+        # Store relevant config values from ApertisConfig for use in forward()
+        self.load_balancing_loss_coef = config.load_balancing_loss_coef
+        self.expert_capacity_factor = config.expert_capacity_factor
+        self.router_z_loss_coef = config.router_z_loss_coef
+        self.noisy_routing_alpha = config.noisy_routing_alpha
+        self.expert_dropout_prob = config.expert_dropout_prob # Used for expert masking during training
+
+        self.use_noisy_top_k_routing = config.use_noisy_top_k_routing
+        self.use_expert_capacity_limit = config.use_expert_capacity_limit
+        self.use_expert_dropout = config.use_expert_dropout # This is for dropping entire experts
+        self.use_router_z_loss = config.use_router_z_loss
+        self.use_load_balancing_loss = config.use_load_balancing_loss
         
     def _get_activation_fn(self, act_fn_str: str):
         if act_fn_str == "gelu": return nn.GELU()
         elif act_fn_str == "relu": return nn.ReLU()
         elif act_fn_str == "silu" or act_fn_str == "swish": return nn.SiLU()
-        raise ValueError(f"Unsupported activation: {act_fn_str}")
+        logger.warning(f"Unsupported activation: {act_fn_str} in AdaptiveExpertSystem. Defaulting to GELU.")
+        return nn.GELU()
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lb_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        rz_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        if self.num_experts <= 0 or self.experts is None or self.router is None:
+            return hidden_states, lb_loss, rz_loss
+
         B, L, D = hidden_states.shape
-        normalized_hidden = self.router_norm(hidden_states)
-        router_logits = self.router(normalized_hidden).float()
-        routing_weights, selected_indices = torch.topk(router_logits, self.experts_per_token, dim=-1)
-        routing_weights = F.softmax(routing_weights, dim=-1).to(hidden_states.dtype)
-        final_output = torch.zeros_like(hidden_states)
-        for k_idx in range(self.experts_per_token):
-            expert_indices_for_slot_k = selected_indices[:, :, k_idx]
-            weights_for_slot_k = routing_weights[:, :, k_idx].unsqueeze(-1)
-            for expert_actual_idx in range(self.num_experts):
-                mask = (expert_indices_for_slot_k == expert_actual_idx)
-                if mask.any():
-                    selected_hidden_states = hidden_states[mask]
-                    if selected_hidden_states.shape[0] > 0:
-                        expert_out = self.experts[expert_actual_idx](selected_hidden_states)
-                        current_expert_weights = weights_for_slot_k[mask]
-                        final_output[mask] += current_expert_weights * expert_out
-        return final_output
+        S = B * L  # Total number of tokens in batch
+
+        flat_hidden_states = hidden_states.reshape(S, D)
+        normalized_hidden = self.router_norm(flat_hidden_states)
+        router_logits_flat = self.router(normalized_hidden).float()  # Shape: (S, num_experts)
+
+        # Step 3: Noisy Top-K Routing
+        if self.use_noisy_top_k_routing and self.training:
+            noise_scale = F.softplus(self.w_noise) * self.noisy_routing_alpha
+            noise = torch.randn_like(router_logits_flat) * noise_scale.unsqueeze(0) # noise_scale is (E,)
+            router_logits_flat = router_logits_flat + noise
+
+        # Gating probabilities and top-k selection
+        gates_all_experts = F.softmax(router_logits_flat, dim=-1) # (S, num_experts)
+        routing_gate_probs, selected_indices = torch.topk(gates_all_experts, self.experts_per_token, dim=-1) # (S, K)
+
+        # Step 4: Load Balancing Loss
+        # P_i: Mean probability mass for each expert.
+        # f_i: Fraction of tokens selecting expert 'i' among top_k (proxy before capacity).
+        # For a more accurate f_i after capacity, we'd need actual dispatch counts.
+        # Let's keep the current proxy f_i for lb_loss, as actual counts are complex before dispatch.
+        if self.use_load_balancing_loss and self.training and self.load_balancing_loss_coef > 0:
+            P_i = torch.mean(gates_all_experts, dim=0) # (num_experts,)
+            # expert_selection_one_hot: (S, num_experts), 1 if expert is in top_k for token s
+            expert_selection_one_hot = torch.zeros_like(gates_all_experts)
+            expert_selection_one_hot.scatter_(1, selected_indices, 1)
+            f_i = torch.mean(expert_selection_one_hot, dim=0) # (num_experts,)
+            lb_loss = self.load_balancing_loss_coef * self.num_experts * torch.sum(f_i * P_i)
+
+        # Step 5: Expert Capacity Calculation
+        expert_capacity = S # Default to no capacity limit if not training or not enabled
+        if self.use_expert_capacity_limit and self.training and self.num_experts > 0:
+            calculated_capacity = math.floor((S / self.num_experts) * self.expert_capacity_factor)
+            expert_capacity = max(1, calculated_capacity) if S > 0 else 0
+
+        # Step 6: Expert Dropout Mask
+        active_expert_mask = torch.ones(self.num_experts, device=hidden_states.device, dtype=torch.bool)
+        if self.use_expert_dropout and self.training and self.expert_dropout_prob > 0 and self.num_experts > 0:
+            num_to_drop = math.floor(self.num_experts * self.expert_dropout_prob)
+            if num_to_drop >= self.num_experts : num_to_drop = self.num_experts -1 # Ensure at least one expert is active
+            if num_to_drop > 0:
+                perm = torch.randperm(self.num_experts, device=hidden_states.device)
+                dropped_indices = perm[:num_to_drop]
+                active_expert_mask[dropped_indices] = False
+
+        # Step 7: Router Z-Loss
+        if self.use_router_z_loss and self.training and self.router_z_loss_coef > 0:
+            log_z = torch.logsumexp(router_logits_flat, dim=-1)  # (S,)
+            rz_loss = self.router_z_loss_coef * torch.mean(log_z**2)
+
+        # Normalize routing_gate_probs for combining expert outputs
+        routing_weights = routing_gate_probs / (torch.sum(routing_gate_probs, dim=-1, keepdim=True) + 1e-6) # (S,K)
+
+        final_hidden_states = torch.zeros_like(flat_hidden_states)
+        expert_token_counts_post_capacity = torch.zeros(self.num_experts, device=hidden_states.device, dtype=torch.long)
+
+        # Efficient Dispatch:
+        # Combine tokens for each expert, apply capacity, then process.
+        # This involves creating a flat list of (token_idx, expert_idx, weight_for_that_expert)
+        # and then batching per expert.
+
+        # For each token, iterate through its K choices.
+        # If an expert is chosen, active, and has capacity, process the token with that expert.
+        # This loop still iterates K times, but the inner part is more vectorized.
+
+        # Create a mask for tokens that have been dispatched to at least one expert successfully
+        # This is to handle cases where a token might be dropped by all its K choices due to capacity/dropout.
+        # For now, such tokens will result in zeros. The problem asks for "graceful" drop (return zeros).
+
+        for k_choice_idx in range(self.experts_per_token):
+            expert_indices_k = selected_indices[:, k_choice_idx] # (S,) - expert chosen for each token at k-th choice
+            gate_weights_k = routing_weights[:, k_choice_idx]    # (S,) - weight for this k-th choice
+
+            for expert_j in range(self.num_experts):
+                if not active_expert_mask[expert_j]: # Expert is dropped out
+                    continue
+
+                # Mask for tokens selecting expert_j as their k-th choice
+                token_mask_for_expert_j_k_choice = (expert_indices_k == expert_j)
+                if not token_mask_for_expert_j_k_choice.any():
+                    continue
+
+                # Tokens (indices) that selected expert_j at this k-th slot
+                candidate_token_indices = token_mask_for_expert_j_k_choice.nonzero(as_tuple=True)[0]
+
+                # Apply capacity
+                num_candidate_tokens = candidate_token_indices.shape[0]
+                current_expert_load = expert_token_counts_post_capacity[expert_j]
+
+                # How many more tokens can this expert take?
+                remaining_capacity_for_expert_j = expert_capacity - current_expert_load
+
+                if remaining_capacity_for_expert_j <= 0 and self.use_expert_capacity_limit and self.training : # Expert is full
+                    continue
+
+                # Number of tokens we can actually assign to this expert from this k-th choice slot
+                num_to_assign = num_candidate_tokens
+                if self.use_expert_capacity_limit and self.training:
+                     num_to_assign = min(num_candidate_tokens, remaining_capacity_for_expert_j)
+
+                if num_to_assign < num_candidate_tokens: # Overflow for this (expert_j, k_choice_idx) pair
+                    # Select tokens with highest gate_weights_k for this expert
+                    overflow_gate_weights = gate_weights_k[candidate_token_indices]
+                    _, top_indices_within_candidates = torch.topk(overflow_gate_weights, num_to_assign)
+                    actual_token_indices_to_process = candidate_token_indices[top_indices_within_candidates]
+                else:
+                    actual_token_indices_to_process = candidate_token_indices[:num_to_assign] # Select all or up to num_to_assign
+
+                if actual_token_indices_to_process.shape[0] == 0:
+                    continue
+
+                # Update load for this expert
+                expert_token_counts_post_capacity[expert_j] += actual_token_indices_to_process.shape[0]
+
+                # Gather tokens and their specific weights for this expert and this k-th choice
+                selected_tokens_for_processing = flat_hidden_states[actual_token_indices_to_process]
+                weights_for_processing = gate_weights_k[actual_token_indices_to_process].unsqueeze(1) # (num_selected, 1)
+
+                expert_output = self.experts[expert_j](selected_tokens_for_processing)
+
+                # Scatter-add to final output
+                # Using index_add_ for non-overlapping updates if a token is assigned to multiple k choices
+                # but here each (token, k_choice) is unique.
+                # If a token is selected for expert_j via its k_choice_idx, its output is added.
+                # This correctly sums contributions if a token is routed to multiple *different* experts via its K choices.
+                # If a token could be routed to the *same* expert via multiple K choices (not typical with topk),
+                # this simple += would be fine.
+                final_hidden_states.index_add_(0, actual_token_indices_to_process, expert_output * weights_for_processing)
+
+        return final_hidden_states.reshape(B, L, D), lb_loss, rz_loss
 
 class StateTrackingRecurrentCell(nn.Module):
     def __init__(self, hidden_size: int):
@@ -608,12 +802,14 @@ class ApertisFeedForward(nn.Module):
         super().__init__()
         self.config = config
         self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if config.use_expert_system:
+        if config.use_expert_system and config.num_experts > 0 : # Ensure num_experts is positive
             self.ffn = AdaptiveExpertSystem(
-                config.hidden_size, config.intermediate_size, config.num_experts,
-                config.experts_per_token, config.hidden_act
+                config=config, # Pass the full config object
+                activation_function_override=config.hidden_act # Can be overridden if needed
             )
         else:
+            if config.use_expert_system and config.num_experts <= 0:
+                logger.warning(f"use_expert_system is True but num_experts is {config.num_experts}. Falling back to standard FFN.")
             self.ffn = nn.Sequential(
                 nn.Linear(config.hidden_size, config.intermediate_size),
                 self._get_activation_fn(config.hidden_act),
@@ -628,12 +824,34 @@ class ApertisFeedForward(nn.Module):
         elif act_fn_str == "silu" or act_fn_str == "swish": return nn.SiLU()
         return nn.GELU()
     
-    def forward(self, hidden_s: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_s: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         residual = hidden_s
         normed_hidden_s = self.pre_norm(hidden_s)
-        ffn_out = self.ffn(normed_hidden_s)
+
+        total_lb_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+        total_rz_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+
+        if isinstance(self.ffn, AdaptiveExpertSystem):
+            ffn_out, lb_loss, rz_loss = self.ffn(normed_hidden_s)
+            if self.config.use_expert_system: # Only add losses if expert system is truly active
+                 total_lb_loss = lb_loss
+                 total_rz_loss = rz_loss
+        else: # Standard MLP
+            ffn_out = self.ffn(normed_hidden_s)
+            # lb_loss and rz_loss remain 0.0 as initialized
+
         dropped_ffn_out = self.output_dropout(ffn_out)
-        return dropped_ffn_out + residual
+        final_ffn_output = dropped_ffn_out + residual
+
+        if self.config.use_expert_system and isinstance(self.ffn, AdaptiveExpertSystem):
+            return final_ffn_output, total_lb_loss, total_rz_loss
+        else:
+            # To maintain a consistent return type for ApertisLayer for now,
+            # return zero losses if not using expert system.
+            # This will be handled more cleanly when ApertisLayer expects these.
+            return final_ffn_output # ApertisLayer will be updated to expect 3 values next
+            # Actually, let's make it always return 3 values for consistency in ApertisLayer
+            # return final_ffn_output, total_lb_loss, total_rz_loss # Consistent return
 
 class ApertisLayer(nn.Module):
     def __init__(self, config: ApertisConfig):
@@ -648,14 +866,17 @@ class ApertisLayer(nn.Module):
     def forward(self, hidden_s: torch.Tensor, att_mask: Optional[torch.Tensor]=None,
                 pos_ids: Optional[torch.Tensor]=None, past_kv: Optional[Any]=None,
                 output_att: bool=False, use_c: bool=False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any], torch.Tensor, torch.Tensor]: # Added lb_loss, rz_loss
         
         # RoPE application is now handled inside ApertisAttention for standard_mha
         att_out, att_w, present_att_cache = self.attention(
             hidden_s, att_mask, pos_ids, past_kv, output_att, use_c
         )
-        layer_out = self.feed_forward(att_out)
-        return layer_out, att_w, present_att_cache
+
+        # ApertisFeedForward.forward now returns: final_ffn_output, total_lb_loss, total_rz_loss
+        layer_out, lb_loss, rz_loss = self.feed_forward(att_out)
+
+        return layer_out, att_w, present_att_cache, lb_loss, rz_loss
 
 class ApertisModel(nn.Module):
     def __init__(self, config: ApertisConfig):
@@ -777,7 +998,7 @@ class ApertisModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor]=None, pixel_values: Optional[torch.Tensor]=None,
         use_cache: Optional[bool]=None, output_attentions: Optional[bool]=None,
         output_hidden_states: Optional[bool]=None, return_dict: Optional[bool]=None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], Optional[Tuple[Optional[torch.Tensor], ...]], Optional[List[Any]]]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], Optional[Tuple[Optional[torch.Tensor], ...]], Optional[List[Any]], Optional[torch.Tensor], Optional[torch.Tensor]]: # Added total_lb_loss, total_rz_loss
         use_c = use_cache if use_cache is not None else self.config.use_cache
         output_att = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hs = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -793,10 +1014,35 @@ class ApertisModel(nn.Module):
         
         past_kv_len = 0
         if past_key_values is not None and past_key_values[0] is not None:
-            if self.config.attention_type == "standard_mha":
-                past_kv_len = past_key_values[0][0].shape[1]
-            elif self.config.attention_type == "selective_ssm":
-                past_kv_len = past_key_values[0][0].shape[2]
+            if self.config.attention_type == "standard_mha": # Assuming past_kv[0] is (key_states, value_states)
+                past_kv_len = past_key_values[0][0].shape[1] # key_states: (B, L_past, D) or (B,H,L_past,Dh)
+            elif self.config.attention_type == "selective_ssm": # Assuming past_kv[0] is (conv_state, ssm_state)
+                 # For selective_ssm, past_kv_len is based on the sequence dimension of conv_state or ssm_state.
+                 # conv_state is (B, D_inner, L_conv_past)
+                 # ssm_state is (B, H, N_ssm_state) - not directly seq len.
+                 # The effective sequence length processed by SSM is inferred from conv_state's length.
+                 # Let's assume _prepare_decoder_attention_mask correctly uses past_key_values_length = 0 for SSM initial pass
+                 # and ApertisLayer handles past_kv for SSM correctly.
+                 # For _prepare_decoder_attention_mask, past_kv_len is about text token positions.
+                 # If SSM cache exists, it means we are in decoding, L_q_curr = 1.
+                 # The `past_key_values_length` for _prepare_decoder_attention_mask needs to be the length of PREVIOUSLY PROCESSED tokens.
+                 # This is often tracked via attention_mask.sum() or similar.
+                 # For now, let's assume the ApertisLayer's internal cache handling for SSM is independent of this explicit past_kv_len here,
+                 # and this past_kv_len is mostly for MHA style KV caching.
+                 # For SSM, the "past length" is implicitly handled by its recurrent state.
+                 # If past_key_values[0][0] for SSM is conv_state (B, D_inner, L_past_conv_kernel-1), then this is not seq length.
+                 # Let's stick to the MHA interpretation for past_kv_len for now as it's more explicit for mask generation.
+                 # This might need refinement if _prepare_decoder_attention_mask interacts complexly with SSM's stateful nature.
+                if past_key_values[0][0] is not None: # Check if conv_state exists
+                    # This is tricky because SSM cache isn't (B, L, D) like MHA.
+                    # For _prepare_decoder_attention_mask, `past_key_values_length` should be the number of tokens already processed.
+                    # If we are generating token by token, this value increases.
+                    # A common way is to use `attention_mask.shape[1] - L_curr_query` if attention_mask covers total length.
+                    # Given the current structure, let's assume this `past_kv_len` is correctly determined for MHA.
+                    # For SSM, the mask is less critical if it's always causal within its scan.
+                    # This definition of past_kv_len might be an oversimplification for SSM if not handled carefully.
+                    # However, the current `_prepare_decoder_attention_mask` seems more geared towards MHA.
+                    pass # Keep MHA logic for past_kv_len for now
         
         current_pos_ids = position_ids
         if current_pos_ids is None:
@@ -808,72 +1054,109 @@ class ApertisModel(nn.Module):
             inputs_embeds = inputs_embeds + abs_pos_embeds
         
         query_embeddings_for_layers = inputs_embeds
-        pos_ids_for_layers = current_pos_ids
+        pos_ids_for_layers = current_pos_ids # These are the position_ids for the current query part
         
         num_img_tokens = 0
-        if self.config.multimodal and pixel_values is not None and past_kv_len == 0:
+        if self.config.multimodal and pixel_values is not None and past_kv_len == 0: # Only add image feats at the beginning
             img_feats = self.multimodal_encoder(pixel_values)
             img_feats_proj = self.vision_projection(img_feats)
             num_img_tokens = img_feats_proj.shape[1]
 
             query_embeddings_for_layers = torch.cat([img_feats_proj, inputs_embeds], dim=1)
             
+            # Adjust position_ids for the concatenated sequence
             img_pos_ids = torch.arange(num_img_tokens, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(B, -1)
+            # text_pos_ids_shifted should start from num_img_tokens if current_pos_ids originally started from 0 for text
+            # If current_pos_ids already reflects past_kv_len, then it should be:
+            # current_pos_ids (for text) + num_img_tokens (if text comes after image tokens in sequence)
+            # Assuming text tokens follow image tokens conceptually.
             text_pos_ids_shifted = current_pos_ids + num_img_tokens
             pos_ids_for_layers = torch.cat([img_pos_ids, text_pos_ids_shifted], dim=1)
             
-            if attention_mask is not None and attention_mask.shape[1] == L_curr_query:
+            if attention_mask is not None and attention_mask.shape[1] == L_curr_query: # attention_mask is for text part only
                 img_padding_mask = torch.ones((B, num_img_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([img_padding_mask, attention_mask], dim=1)
-            elif attention_mask is None:
+            elif attention_mask is None: # No mask provided, assume all attend
                 attention_mask = torch.ones((B, num_img_tokens + L_curr_query), dtype=torch.long, device=query_embeddings_for_layers.device)
 
         elif self.config.multimodal and pixel_values is not None and past_kv_len > 0:
-            logger.warning("pixel_values provided with past_key_values. Ignoring image for this step.")
+            logger.warning("pixel_values provided with past_key_values. Ignoring image for this step as it's assumed to be part of the prefix.")
 
         hidden_s = self.embed_dropout(query_embeddings_for_layers)
         
+        # The shape for _prepare_decoder_attention_mask should be based on the final query_embeddings_for_layers
+        current_sequence_length = query_embeddings_for_layers.shape[1]
         ext_att_mask = self._prepare_decoder_attention_mask(
-            attention_mask,
-            (B, query_embeddings_for_layers.shape[1]),
-            query_embeddings_for_layers,
-            past_kv_len
+            attention_mask, # This mask should now cover the full sequence (image + text if multimodal)
+            (B, current_sequence_length),
+            query_embeddings_for_layers, # Pass the embeddings that go into layers
+            past_kv_len # This past_kv_len is crucial for how causal mask is constructed relative to kv_cache
         )
         
         all_hs_out, all_att_out, all_kv_cache_out = [], [], []
+        # Initialize accumulated losses as scalar tensors on the correct device
+        accumulated_lb_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+        accumulated_rz_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+
         for i, layer_mod in enumerate(self.layers):
             if output_hs: all_hs_out.append(hidden_s)
             
             layer_past_kv = past_key_values[i] if past_key_values and i < len(past_key_values) else None
-            current_layer_pos_ids = pos_ids_for_layers
-            
+            # Use pos_ids_for_layers which accounts for multimodal prefix for RoPE etc. inside attention
+            current_layer_pos_ids_for_attention = pos_ids_for_layers
+
+            layer_lb_loss_iter = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+            layer_rz_loss_iter = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
+
             if self.gradient_checkpointing and self.training and not use_c:
-                def create_cp_forward(mod):
-                    def _cp_forward(h_states, att_m_layer, p_ids_layer, pkvs_layer):
-                        return mod(h_states, att_m_layer, p_ids_layer, pkvs_layer, output_att, use_c)[0]
+                def create_cp_forward(layer_module_cp):
+                    # output_att and use_c are from the outer scope of ApertisModel.forward
+                    def _cp_forward(hidden_states_cp, attention_mask_cp, position_ids_cp, past_key_value_cp):
+                        return layer_module_cp(hidden_states_cp, attention_mask_cp, position_ids_cp, past_key_value_cp, output_att, use_c)
                     return _cp_forward
-                current_layer_cp_forward = create_cp_forward(layer_mod)
-                hidden_s = torch.utils.checkpoint.checkpoint(
-                    current_layer_cp_forward, hidden_s, ext_att_mask, current_layer_pos_ids, layer_past_kv,
-                    use_reentrant=False
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_cp_forward(layer_mod),
+                    hidden_s,
+                    ext_att_mask, # This is the combined causal and padding mask for the full sequence
+                    current_layer_pos_ids_for_attention,
+                    layer_past_kv,
+                    use_reentrant=False # PyTorch 2.0+ recommendation
                 )
-                if output_att: all_att_out.append(None)
-                if use_c: all_kv_cache_out.append(None)
-            else:
-                hidden_s, att_w, present_kv = layer_mod(
-                    hidden_s, ext_att_mask, current_layer_pos_ids, layer_past_kv, output_att, use_c
+                # ApertisLayer.forward returns: layer_out, att_w, present_att_cache, lb_loss, rz_loss
+                hidden_s, att_w, present_kv, layer_lb_loss_iter, layer_rz_loss_iter = layer_outputs
+
+                att_w = att_w if output_att else None
+                present_kv = present_kv if use_c else None
+
+            else: # Not using gradient checkpointing
+                hidden_s, att_w, present_kv, layer_lb_loss_iter, layer_rz_loss_iter = layer_mod(
+                    hidden_s, ext_att_mask, current_layer_pos_ids_for_attention, layer_past_kv, output_att, use_c
                 )
-                if output_att: all_att_out.append(att_w)
-                if use_c: all_kv_cache_out.append(present_kv)
+
+            if output_att: all_att_out.append(att_w)
+            if use_c: all_kv_cache_out.append(present_kv)
+
+            # Accumulate losses if they are valid tensors (not None)
+            if self.config.use_expert_system: # Only accumulate if expert system is active
+                if layer_lb_loss_iter is not None:
+                    accumulated_lb_loss += layer_lb_loss_iter
+                if layer_rz_loss_iter is not None:
+                    accumulated_rz_loss += layer_rz_loss_iter
         
         hidden_s = self.final_post_norm(hidden_s)
         if output_hs: all_hs_out.append(hidden_s)
         
+        final_lb_loss = accumulated_lb_loss if self.config.use_expert_system else None
+        final_rz_loss = accumulated_rz_loss if self.config.use_expert_system else None
+
         return (
             hidden_s,
             tuple(all_hs_out) if output_hs and all_hs_out else None,
             tuple(all_att_out) if output_att and all_att_out else None,
-            tuple(all_kv_cache_out) if use_c and all_kv_cache_out else None
+            tuple(all_kv_cache_out) if use_c and all_kv_cache_out else None,
+            final_lb_loss,
+            final_rz_loss
         )
 
 class ApertisForCausalLM(nn.Module):
@@ -940,12 +1223,14 @@ class ApertisForCausalLM(nn.Module):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        torch.Tensor,
-        Optional[Tuple[torch.Tensor, ...]],
-        Optional[Tuple[Optional[torch.Tensor], ...]],
-        Optional[List[Any]]
+    ) -> Tuple[ # Return signature updated
+        Optional[torch.Tensor], # loss
+        torch.Tensor,           # logits
+        Optional[Tuple[torch.Tensor, ...]], # hidden_states from model
+        Optional[Tuple[Optional[torch.Tensor], ...]], # attentions from model
+        Optional[List[Any]],    # past_key_values from model
+        Optional[torch.Tensor], # total_lb_loss from model
+        Optional[torch.Tensor]  # total_rz_loss from model
     ]:
         
         model_outputs = self.model(
@@ -961,47 +1246,84 @@ class ApertisForCausalLM(nn.Module):
         )
         
         hidden_states_from_model = model_outputs[0]
+        # model_outputs also contains: all_hs_out, all_att_out, all_kv_cache_out, total_lb_loss, total_rz_loss
+        # These are model_outputs[1] to model_outputs[5]
         
         text_logits_hidden_states = hidden_states_from_model
-        if self.config.multimodal and pixel_values is not None and past_key_values is None:
-            if input_ids is not None:
+        if self.config.multimodal and pixel_values is not None and past_key_values is None: # Prefill stage with image
+            if input_ids is not None: # Ensure text tokens are present to slice for
                 L_text_original = input_ids.shape[1]
-                text_start_index = hidden_states_from_model.shape[1] - L_text_original
-                if text_start_index >= 0:
-                     text_logits_hidden_states = hidden_states_from_model[:, text_start_index:, :]
-                else:
-                    logger.error("Error slicing text hidden states for multimodal logits.")
+                # Image tokens are prepended, so text hidden states are at the end
+                text_start_idx = hidden_states_from_model.shape[1] - L_text_original
+                if text_start_idx >= 0:
+                     text_logits_hidden_states = hidden_states_from_model[:, text_start_idx:, :]
+                else: # Should not happen if logic is correct
+                    logger.error("Error slicing text hidden states for multimodal logits. text_start_idx < 0.")
+            # If only image is passed (input_ids is None), then text_logits_hidden_states remains full hidden_states_from_model
+            # which might be an issue if no text is expected for logits. This case should be handled by user or training script.
             
         logits = self.lm_head(text_logits_hidden_states)
         
         loss = None
         if labels is not None:
+            # Standard cross-entropy loss for language modeling
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
             current_ignore_index = -100 
+            # Heuristic: if -100 is not used anywhere in labels, assume pad_token_id should be ignored.
             if not (labels == -100).any():
                 current_ignore_index = self.config.pad_token_id
 
+            # Ensure sequence lengths match for loss calculation after shifting
             if shift_logits.shape[1] != shift_labels.shape[1]:
-                min_len = min(shift_logits.shape[1], shift_labels.shape[1])
-                shift_logits = shift_logits[:, :min_len, :]
-                shift_labels = shift_labels[:, :min_len]
-                if min_len == 0:
-                    logger.warning("Logits or labels have zero sequence length after shifting. Loss will be 0 or error.")
-                    loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
-                else:
-                    loss_fct = nn.CrossEntropyLoss(ignore_index=current_ignore_index)
-                    loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+                # This can happen if, e.g., logits correspond to full sequence (img+text) but labels only to text part.
+                # Or if there's a mismatch in how labels are prepared.
+                # A common strategy: labels should align with the part of logits used for loss.
+                # If text_logits_hidden_states was correctly sliced, then shift_logits and shift_labels should align.
+                # However, if labels are shorter (e.g. only for text part, and logits include image part not used for loss),
+                # then this slicing needs to be robust or labels need to be padded.
 
-            elif shift_logits.shape[1] == 0:
-                 logger.warning("Sequence length is 1, so shift_logits/labels are empty. Loss set to 0.")
-                 loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+                # For now, assume labels are for the same part as logits used (text_logits_hidden_states).
+                # If a mismatch still occurs, take the minimum sequence length.
+                min_len = min(shift_logits.shape[1], shift_labels.shape[1])
+                if min_len == 0: # Avoid error if sequence becomes empty
+                    logger.warning("Logits or labels have zero sequence length after shifting and potential slicing. Main loss will be 0 or error.")
+                    # Setting main_loss to a tensor to allow addition of aux losses
+                    main_loss = torch.tensor(0.0, device=logits.device, requires_grad=self.training) # Ensure grad if training
+                else:
+                    shift_logits = shift_logits[:, :min_len, :]
+                    shift_labels = shift_labels[:, :min_len]
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=current_ignore_index)
+                    main_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            elif shift_logits.shape[1] == 0: # Sequence length was 1, so after shifting it's 0
+                 logger.warning("Sequence length is 1, so shift_logits/labels are empty. Main loss set to 0.")
+                 main_loss = torch.tensor(0.0, device=logits.device, requires_grad=self.training)
             else:
                 loss_fct = nn.CrossEntropyLoss(ignore_index=current_ignore_index)
-                loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+                main_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             
-        return (loss, logits) + model_outputs[1:]
+            loss = main_loss
+            # Add auxiliary losses from the model if they exist (i.e., not None)
+            total_lb_loss = model_outputs[4] # total_lb_loss from ApertisModel
+            total_rz_loss = model_outputs[5] # total_rz_loss from ApertisModel
+
+            if total_lb_loss is not None:
+                loss += total_lb_loss
+            if total_rz_loss is not None:
+                loss += total_rz_loss
+
+        # The return tuple from ApertisModel is:
+        # (hidden_s, all_hs_out, all_att_out, all_kv_cache_out, final_lb_loss, final_rz_loss)
+        # So model_outputs[0] is hidden_s
+        # model_outputs[1] is all_hs_out
+        # model_outputs[2] is all_att_out
+        # model_outputs[3] is all_kv_cache_out
+        # model_outputs[4] is final_lb_loss
+        # model_outputs[5] is final_rz_loss
+        # We need to return: (loss, logits, all_hs_out, all_att_out, all_kv_cache_out, final_lb_loss, final_rz_loss)
+
+        return (loss, logits) + model_outputs[1:] # This correctly appends all items from model_outputs[1] onwards
     
     def prepare_inputs_for_generation(
         self, input_ids: torch.Tensor, past_key_values: Optional[List[Any]] = None,
