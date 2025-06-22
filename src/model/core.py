@@ -9,9 +9,24 @@ import os
 from pathlib import Path
 import json
 import inspect
+from packaging import version
 
 import logging
 logger = logging.getLogger(__name__)
+
+# Flash Attention imports
+try:
+    IS_FLASH_ATTN_AVAILABLE = version.parse(torch.__version__) >= version.parse("2.0.0") and torch.cuda.is_available()
+    if IS_FLASH_ATTN_AVAILABLE:
+        from flash_attn import flash_attn_func
+        # For future use with padding: from flash_attn import flash_attn_varlen_func
+    else:
+        flash_attn_func = None
+except ImportError:
+    logger.info("Flash Attention not available. Install flash-attn for potential speedups.")
+    flash_attn_func = None
+    IS_FLASH_ATTN_AVAILABLE = False
+
 
 if __name__ == '__main__' and __package__ is None:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -421,6 +436,18 @@ class ApertisAttention(nn.Module):
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
         self.attention_dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
+        self.rope = None
+        # Initialize RoPE here if standard MHA is used and RoPE is configured.
+        # This RoPE will be applied *after* Q/K projections.
+        if config.position_embedding_type == "rotary" and config.attention_type == "standard_mha":
+            # The RoPE dimension should match the dimension of Q and K *before* they are split into heads,
+            # which is config.hidden_size as q_proj and k_proj map hidden_size to hidden_size.
+            self.rope = RotaryEmbedding(
+                dim=config.hidden_size, # Applied to Q/K of hidden_size
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta
+            )
+
     def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
@@ -448,33 +475,127 @@ class ApertisAttention(nn.Module):
             key_states = self.k_proj(normed_hidden_s)
             value_states = self.v_proj(normed_hidden_s)
 
-            if use_c and past_kv is not None:
-                key_states = torch.cat([past_kv[0], key_states], dim=1)
-                value_states = torch.cat([past_kv[1], value_states], dim=1)
-            
-            present_cache = (key_states, value_states) if use_c else None
-            
-            query_layer = self._transpose_for_scores(query_states)
-            key_layer = self._transpose_for_scores(key_states)
-            value_layer = self._transpose_for_scores(value_states)
+            # Apply RoPE if configured and available
+            if self.rope is not None:
+                # pos_ids are passed from ApertisLayer forward method
+                query_states = self.rope(query_states, position_ids=pos_ids)
+                key_states = self.rope(key_states, position_ids=pos_ids)
 
-            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+            # Flash Attention V2 path
+            # Conditions for using Flash Attention:
+            # 1. Flash Attention is available (imported successfully)
+            # 2. `use_flash_attention` is True in config
+            # 3. Not using KV cache (`use_c` is False) - FlashAttention is mainly for training.
+            # 4. Attention weights are not requested (`output_att` is False) - FlashAttention does not return them.
+            # 5. `att_mask` is None. FlashAttention's `causal=True` handles decoder masking.
+            #    If `att_mask` is present, it implies padding or other custom masking, which
+            #    `flash_attn_func` with `causal=True` doesn't handle.
+            #    (Step 5 of the plan will look into `_prepare_decoder_attention_mask` interactions)
+            # 6. RoPE is handled at ApertisLayer, so q,k here are already rotated if needed.
+            #    The RoPE application point will be reviewed in Step 4.
 
-            if att_mask is not None:
-                attention_scores = attention_scores + att_mask
+            can_use_flash = (
+                IS_FLASH_ATTN_AVAILABLE and
+                flash_attn_func is not None and
+                self.config.use_flash_attention and
+                not use_c and
+                not output_att and
+                att_mask is None # Crucial: only allow if no explicit mask beyond causal is needed
+                                 # This implies inputs are expected to be unpadded or handled before this point
+                                 # if flash_attn_varlen_func were to be used.
+            )
+
+            if can_use_flash:
+                # Reshape Q, K, V for FlashAttention: (batch_size, seqlen, nheads, head_dim)
+                # Current _transpose_for_scores gives (B, H, L, Dh)
+                # FlashAttention's flash_attn_func expects (B, L, H, Dh)
+                query_layer_flash = self._transpose_for_scores(query_states).permute(0, 2, 1, 3)
+                key_layer_flash = self._transpose_for_scores(key_states).permute(0, 2, 1, 3)
+                value_layer_flash = self._transpose_for_scores(value_states).permute(0, 2, 1, 3)
+
+                # Ensure head_dim is compatible (e.g. divisible by 8, up to 128 for FA v2)
+                # This should be generally true for typical LLM configs.
+                # ApertisConfig ensures hidden_size is divisible by num_attention_heads.
+
+                context_layer = flash_attn_func(
+                    query_layer_flash, key_layer_flash, value_layer_flash,
+                    dropout_p=self.attention_dropout.p if self.training else 0.0,
+                    softmax_scale=None,  # Defaults to 1/sqrt(head_dim)
+                    causal=True          # Handles causal masking for decoder-style models
+                )
+
+                # Reshape output back to (B, L, D_hidden)
+                # context_layer is (B, L, H, Dh)
+                context_layer = context_layer.reshape(B, L_q_curr, self.hidden_size)
+                att_out = self.out_proj(context_layer)
+                att_weights_proxy = None # FlashAttention does not return attention weights
+                present_cache = None     # Not used with FlashAttention path here
+
+            else: # Standard PyTorch Multi-Head Attention path
+                if use_c and past_kv is not None:
+                    # past_kv[0] is key_states, past_kv[1] is value_states from previous steps
+                    # key_states and value_states are (B, L_prev, D) before transpose, (B, H, L_prev, Dh) after
+                    # The q_proj, k_proj, v_proj produce (B, L_q_curr, D)
+                    # We need to ensure shapes are compatible for cat.
+                    # The current code structure of _transpose_for_scores handles (B,L,D) -> (B,H,L,Dh)
+                    # So, if past_kv stores K,V after projection but before transpose:
+                    # past_kv[0] shape: (B, L_past, D_total_kv)
+                    # key_states shape: (B, L_q_curr, D_total_kv)
+                    # This seems to be the intention as past_kv is set from key_states, value_states
+                    # *before* they are transposed by _transpose_for_scores.
+                    # However, the cache is set with key_states, value_states *after* they are computed
+                    # from q_proj etc. but *before* _transpose_for_scores.
+                    # The shapes are (B, L, D).
+                    # So, this cat is correct.
+                    key_states = torch.cat([past_kv[0], key_states], dim=1)
+                    value_states = torch.cat([past_kv[1], value_states], dim=1)
+
+                present_cache = (key_states, value_states) if use_c else None
+
+                query_layer = self._transpose_for_scores(query_states) # (B, H, L_q, Dh)
+                key_layer = self._transpose_for_scores(key_states)     # (B, H, L_kv, Dh)
+                value_layer = self._transpose_for_scores(value_states) # (B, H, L_kv, Dh)
+
+                attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+                attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
+                if att_mask is not None:
+                    # att_mask comes from _prepare_decoder_attention_mask (already combined padding and causal)
+                    attention_scores = attention_scores + att_mask
+                elif L_q_curr > 1: # No att_mask provided (e.g. _prepare_decoder_attention_mask returned None due to no padding)
+                                   # AND current query length > 1. We MUST apply a causal mask for standard MHA.
+                    q_seq_len = L_q_curr
+                    kv_seq_len = key_layer.shape[-2] # This is L_kv_total for the current layer (past + current)
+
+                    # Create boolean causal mask: True where attention is allowed.
+                    # query token q_i (index i in current query block) corresponds to absolute position: (kv_seq_len - q_seq_len) + i
+                    # key token k_j (index j in full key sequence) corresponds to absolute position: j
+                    # Condition for attention: (kv_seq_len - q_seq_len) + i >= j
+                    row_idx = torch.arange(q_seq_len, device=query_layer.device).unsqueeze(-1) # Shape (q_seq_len, 1)
+                    col_idx = torch.arange(kv_seq_len, device=query_layer.device).unsqueeze(0)  # Shape (1, kv_seq_len)
+
+                    causal_mask_bool = (row_idx + (kv_seq_len - q_seq_len)) >= col_idx # Shape (q_seq_len, kv_seq_len)
+
+                    # Convert to additive float mask matching attention_scores shape for broadcasting
+                    # Target shape for addition is (B, H, q_seq_len, kv_seq_len)
+                    # causal_mask_bool is (q_seq_len, kv_seq_len)
+                    additive_causal_mask = torch.zeros_like(causal_mask_bool, dtype=attention_scores.dtype)
+                    additive_causal_mask.masked_fill_(~causal_mask_bool, torch.finfo(attention_scores.dtype).min)
+
+                    attention_scores = attention_scores + additive_causal_mask.unsqueeze(0).unsqueeze(0) # Expand for B, H
+
             
-            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-            att_weights_proxy = attention_probs if output_att else None
+                attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+                att_weights_proxy = attention_probs if output_att else None
             
-            attention_probs = self.attention_dropout(attention_probs)
+                attention_probs = self.attention_dropout(attention_probs)
             
-            context_layer = torch.matmul(attention_probs, value_layer)
-            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-            new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
-            context_layer = context_layer.view(new_context_layer_shape)
+                context_layer = torch.matmul(attention_probs, value_layer) # (B, H, L_q, Dh)
+                context_layer = context_layer.permute(0, 2, 1, 3).contiguous() # (B, L_q, H, Dh)
+                new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,) # (B, L_q, D_hidden)
+                context_layer = context_layer.view(new_context_layer_shape)
             
-            att_out = self.out_proj(context_layer)
+                att_out = self.out_proj(context_layer)
         else:
             raise ValueError(f"Unexpected attention_type in ApertisAttention: {self.config.attention_type}")
 
@@ -529,12 +650,9 @@ class ApertisLayer(nn.Module):
                 output_att: bool=False, use_c: bool=False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Any]]:
         
-        x_for_attn = hidden_s
-        if self.rope and self.config.attention_type == "standard_mha":
-             x_for_attn = self.rope(hidden_s, position_ids=pos_ids)
-
+        # RoPE application is now handled inside ApertisAttention for standard_mha
         att_out, att_w, present_att_cache = self.attention(
-            x_for_attn, att_mask, pos_ids, past_kv, output_att, use_c
+            hidden_s, att_mask, pos_ids, past_kv, output_att, use_c
         )
         layer_out = self.feed_forward(att_out)
         return layer_out, att_w, present_att_cache
@@ -600,8 +718,31 @@ class ApertisModel(nn.Module):
         return self.token_embeddings
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
+        # attention_mask is the raw padding mask (batch_size, total_sequence_length) from inputs.
+        # True for tokens to attend to, False for padding. Could be None if no padding info.
+
+        # Condition for returning None (to enable FlashAttention with causal=True):
+        # 1. No padding mask provided explicitly (attention_mask is None).
+        # OR 2. A padding mask is provided, but it indicates no tokens are actually padded (all True/1s).
+        # This allows FlashAttention to be used for unpadded sequences, including multimodal ones where
+        # image tokens (all attend=True) are concatenated with unpadded text tokens.
+        use_flash_path_signal = False
+        if attention_mask is None:
+            use_flash_path_signal = True
+        elif torch.all(attention_mask.bool()): # Check if all elements are True (no actual padding that requires masking)
+            use_flash_path_signal = True
+
+        if use_flash_path_signal:
+            # If conditions for FlashAttention's simple causal masking are met (no actual padding),
+            # return None. ApertisAttention will use flash_attn_func(causal=True).
+            # The standard MHA path in ApertisAttention will also need to correctly create a
+            # causal mask if it receives None and L_q > 1 (this was addressed in a previous step).
+            return None
+
+        # If attention_mask (padding mask) is provided AND it contains actual padding (some False/0s),
+        # then construct the combined float mask for the standard PyTorch attention path.
+        combined_attention_mask = None # This will be a boolean mask: True means attend.
+        if input_shape[1] > 1: # L_q > 1, typically training or prefill
             L_q = input_shape[1]
             L_kv = past_key_values_length + L_q
             

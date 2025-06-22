@@ -983,10 +983,12 @@ def create_sample_config(output_path: str):
         },
         "model_config": { # These are for NEW models (pre-training) OROVERRIDES for fine-tuning base
             "model_size": "base", # Ignored if fine-tuning from pretrained_model_path
-            "attention_type": "standard_mha",
+            "attention_type": "standard_mha", # Options: "standard_mha", "selective_ssm"
+            "use_flash_attention": False, # Set to true to try using FlashAttention for "standard_mha"
             "multimodal": False,
             "use_expert_system": False
             # Other ApertisConfig params can be added here to override defaults for new models
+            # e.g., "hidden_size", "num_hidden_layers", "num_attention_heads" for custom models
         },
         "training_config": {
             "task_type": "pretrain", # "pretrain" or "finetune"
