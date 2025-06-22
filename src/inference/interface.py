@@ -852,17 +852,17 @@ class ApertisInterface:
                     seq_len_for_mem = 512   # Default seq_len for memory estimation
 
                     arg_idx = 6
-                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # vocab_size_override if present
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.Request): # vocab_size_override if present
                         try: vocab_size_val = int(args[arg_idx])
                         except (ValueError, TypeError): pass # Keep default if not convertible
                         arg_idx +=1
 
-                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # batch_size for mem est
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.Request): # batch_size for mem est
                         try: batch_size_for_mem = int(args[arg_idx])
                         except (ValueError, TypeError): pass
                         arg_idx +=1
 
-                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # seq_len for mem est
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.Request): # seq_len for mem est
                         try: seq_len_for_mem = int(args[arg_idx])
                         except (ValueError, TypeError): pass
                         # arg_idx +=1 # No more args after this for now
