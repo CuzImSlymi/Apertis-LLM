@@ -1,4 +1,4 @@
-version: '3'
+version: '3.8' # Updated to a version that robustly supports deploy.resources
 services:
   apertis:
     build:
@@ -13,6 +13,16 @@ services:
     # Add environment variables to help with Python module path
     environment:
       - PYTHONPATH=/app
+      # Add NVIDIA runtime environment variables if needed by flash-attn or torch
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1 # Request 1 GPU, can be 'all' or a specific count
+              capabilities: [gpu]
     # Add healthcheck to ensure the service is running properly
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7860" , "||", "exit", "1"]
