@@ -970,16 +970,13 @@ class ApertisInterface:
                     return "Stop request sent to Pre-training. Please wait for current step/epoch to finish."
                 return "No Pre-training in progress or thread already completed."
 
-            start_train_btn.click(ui_start_training_handler,
-                                 [model_size_train_dd, attn_type_train_dd, multimodal_train_cb, expert_sys_train_cb,
-                                  train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
-                                  batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
-                                  chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
-                                  gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb],
-                                 [train_status_tb])
+            # Removed the first start_train_btn.click call that used ui_start_training_handler
+            # It is now superseded by the call below using ui_start_training_handler_updated
             stop_train_btn.click(ui_stop_training_handler, outputs=[train_status_tb])
 
             # Update the signature and logic for ui_start_training_handler
+            # The old handler ui_start_training_handler and its .click() registration were removed.
+            # This is the new handler.
             def ui_start_training_handler_updated(
                 m_s, attn_t, flash_attn_t_cb_val, # Added flash_attn_t_cb_val
                 m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
@@ -1284,21 +1281,8 @@ class ApertisInterface:
                     return "Stop request sent to AZR Training. Please wait for current iteration to finish."
                 return "No AZR Training in progress or thread already completed."
 
-            azr_start_btn.click(
-                ui_start_azr_training_handler,
-                [
-                    azr_model_size_dd, azr_attn_type_dd, azr_tokenizer_name_tb, azr_seed_tasks_up,
-                    azr_iterations_sl, azr_tasks_per_iter_sl, azr_checkpoint_interval_sl,
-                    azr_task_types_cbg, azr_task_dist_abduction_sl, azr_task_dist_deduction_sl, azr_task_dist_induction_sl,
-                    azr_max_attempts_sl, azr_temperature_sl, azr_top_p_sl, azr_seed_prob_sl,
-                    azr_timeout_sl, azr_max_output_sl,
-                    azr_clarity_weight_sl, azr_complex_weight_sl, azr_div_weight_sl,
-                    azr_acc_weight_sl, azr_coherence_weight_sl, azr_relevance_weight_sl, azr_structure_weight_sl,
-                    azr_target_complex_sl, azr_tolerance_sl, azr_acc_power_sl,
-                    azr_gpu_select_dd, azr_log_level_dd, azr_wandb_cb, azr_wandb_proj_tb, azr_output_dir_tb
-                ],
-                [azr_status_tb]
-            )
+            # Removed the first azr_start_btn.click call that used ui_start_azr_training_handler
+            # It is now superseded by the call below using ui_start_azr_training_handler_updated
             azr_stop_btn.click(ui_stop_azr_training_handler, outputs=[azr_status_tb])
 
 
