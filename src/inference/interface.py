@@ -574,17 +574,36 @@ class ApertisInterface:
                     with gr.Row():
                         with gr.Column(scale=1):
                             gr.Markdown("## Model Config")
-                            model_size_train_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                            # Updated model size list
+                            new_model_size_list = ["50M", "100M", "250M", "500M", "750M", "1B", "1.3B", "3B", "7B", "13B", "30B", "70B"]
+                            model_size_train_dd = gr.Dropdown(new_model_size_list, value="1B", label="Base Model Size")
                             attn_type_train_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
-                            flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+                            flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True) # Visible by default
                             multimodal_train_cb = gr.Checkbox(label="Multimodal")
                             expert_sys_train_cb = gr.Checkbox(label="Use Expert System")
 
+                            # MoE Controls (initially hidden)
+                            with gr.Group(visible=False) as moe_options_group_train:
+                                gr.Markdown("### MoE Configuration")
+                                num_experts_train_sl = gr.Slider(1, 64, value=8, step=1, label="Number of Experts (Total)")
+                                experts_per_token_train_sl = gr.Slider(1, 8, value=2, step=1, label="Active Experts per Token")
+
+                            # Parameter and Memory Display
+                            param_display_train_md = gr.Markdown("Params: N/A | Memory: N/A")
+
                             def _toggle_flash_attn_visibility_train(attn_type_val):
-                                if attn_type_val == "standard_mha":
-                                    return gr.update(visible=True)
-                                return gr.update(visible=False, value=False)
-                            attn_type_train_dd.change(_toggle_flash_attn_visibility_train, inputs=[attn_type_train_dd], outputs=[flash_attn_train_cb])
+                                # Flash attention only for standard_mha
+                                return gr.update(visible=(attn_type_val == "standard_mha"), value=False if attn_type_val != "standard_mha" else gr.UNCHANGED)
+
+                            attn_type_train_dd.change(
+                                _toggle_flash_attn_visibility_train,
+                                inputs=[attn_type_train_dd],
+                                outputs=[flash_attn_train_cb]
+                            )
+
+                            def _toggle_moe_visibility_train(use_moe_val):
+                                return gr.update(visible=use_moe_val)
+                            expert_sys_train_cb.change(_toggle_moe_visibility_train, inputs=[expert_sys_train_cb], outputs=[moe_options_group_train])
 
                             gr.Markdown("## Data (Pre-training)")
                             train_file_up = gr.File(label="Train Data (JSONL, field: 'text')", file_types=[".jsonl"])
@@ -678,14 +697,30 @@ class ApertisInterface:
                         with gr.Column(scale=1):
                             gr.Markdown("## 1. AZR Model & Data")
                             with gr.Accordion("Model Config (for AZR internal model)", open=True):
-                                azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                                new_model_size_list_azr = ["50M", "100M", "250M", "500M", "750M", "1B", "1.3B", "3B", "7B", "13B", "30B", "70B"]
+                                azr_model_size_dd = gr.Dropdown(new_model_size_list_azr, value="1B", label="Base Model Size")
                                 azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
-                                azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+                                azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True) # Visible by default
+                                # Adding expert system checkbox for AZR model config
+                                azr_expert_sys_cb = gr.Checkbox(label="Use Expert System (for AZR model)")
+
+                                # MoE Controls for AZR (initially hidden)
+                                with gr.Group(visible=False) as moe_options_group_azr:
+                                    gr.Markdown("### MoE Configuration (AZR Model)")
+                                    num_experts_azr_sl = gr.Slider(1, 64, value=8, step=1, label="Number of Experts (Total)")
+                                    experts_per_token_azr_sl = gr.Slider(1, 8, value=2, step=1, label="Active Experts per Token")
+
+                                # Parameter and Memory Display for AZR model
+                                param_display_azr_md = gr.Markdown("Params: N/A | Memory: N/A")
+
                                 def _toggle_flash_attn_visibility_azr(attn_type_val):
-                                    if attn_type_val == "standard_mha":
-                                        return gr.update(visible=True)
-                                    return gr.update(visible=False, value=False)
+                                    return gr.update(visible=(attn_type_val == "standard_mha"), value=False if attn_type_val != "standard_mha" else gr.UNCHANGED)
                                 azr_attn_type_dd.change(_toggle_flash_attn_visibility_azr, inputs=[azr_attn_type_dd], outputs=[azr_flash_attn_cb])
+
+                                def _toggle_moe_visibility_azr(use_moe_val):
+                                    return gr.update(visible=use_moe_val)
+                                azr_expert_sys_cb.change(_toggle_moe_visibility_azr, inputs=[azr_expert_sys_cb], outputs=[moe_options_group_azr])
+
                             with gr.Accordion("Tokenizer & Seed Data", open=True):
                                 azr_tokenizer_name_tb = gr.Textbox(value="gpt2", label="Hugging Face Tokenizer Name", placeholder="e.g., gpt2, meta-llama/Llama-2-7b-hf")
                                 azr_seed_tasks_up = gr.File(label="Seed Tasks (JSONL, optional, fields: 'task', 'type')", file_types=[".jsonl"])
@@ -754,26 +789,183 @@ class ApertisInterface:
                             model_info_load_tb = gr.Textbox(label="Loaded Model Info", interactive=False, lines=10, autoscroll=True)
                         with gr.Column(scale=1):
                             gr.Markdown("## Create New Model (for Pre-training)")
-                            new_model_size_dd = gr.Dropdown(["small","base","large"], value="base", label="Model Size")
+                            new_model_size_list_create = ["50M", "100M", "250M", "500M", "750M", "1B", "1.3B", "3B", "7B", "13B", "30B", "70B"]
+                            new_model_size_dd = gr.Dropdown(new_model_size_list_create, value="1B", label="Model Size")
                             new_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
+                            new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True) # Visible by default
                             new_multimodal_cb = gr.Checkbox(label="Multimodal")
                             new_expert_cb = gr.Checkbox(label="Use Expert System")
-                            new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+
+                            # MoE Controls for Create New Model (initially hidden)
+                            with gr.Group(visible=False) as moe_options_group_create:
+                                gr.Markdown("### MoE Configuration (New Model)")
+                                num_experts_create_sl = gr.Slider(1, 64, value=8, step=1, label="Number of Experts (Total)")
+                                experts_per_token_create_sl = gr.Slider(1, 8, value=2, step=1, label="Active Experts per Token")
+
                             new_vocab_size_num = gr.Number(32000, label="Vocab Size (for manual vocab)", precision=0)
                             new_model_out_tb = gr.Textbox("models/new_apertis_model", label="Save Path for New Model Files")
+
+                            # Parameter and Memory Display for new model
+                            param_display_create_md = gr.Markdown("Params: N/A | Memory: N/A")
+
                             create_model_btn_ui = gr.Button("Create & Save New Model Files")
                             create_model_status_tb = gr.Textbox(label="Creation Status", interactive=False, lines=3)
 
             def _toggle_flash_attn_visibility_new_model(attn_type_val):
-                if attn_type_val == "standard_mha":
-                    return gr.update(visible=True)
-                return gr.update(visible=False, value=False) # Hide and reset to False
+                return gr.update(visible=(attn_type_val == "standard_mha"), value=False if attn_type_val != "standard_mha" else gr.UNCHANGED)
 
             new_attn_type_dd.change(
                 _toggle_flash_attn_visibility_new_model,
                 inputs=[new_attn_type_dd],
                 outputs=[new_flash_attn_cb]
             )
+
+            def _toggle_moe_visibility_create(use_moe_val):
+                return gr.update(visible=use_moe_val)
+            new_expert_cb.change(_toggle_moe_visibility_create, inputs=[new_expert_cb], outputs=[moe_options_group_create])
+
+
+            # Centralized function to update parameter/memory display
+            # It needs all relevant inputs from a given tab
+            def update_param_memory_display(*args):
+                # args: model_size, attn_type, use_flash_attn, use_expert_system,
+                #       num_experts, experts_per_token, vocab_size (optional, for create new)
+                #       batch_size_ui (for memory est), seq_len_ui (for memory est)
+
+                # Determine which set of inputs we got based on length or specific None values
+                # This is a bit fragile; named arguments to a Python function called by Gradio
+                # via .change() is cleaner if possible, or pass a dict.
+                # For now, make it flexible.
+
+                try:
+                    # Common args
+                    model_size_val = args[0]
+                    # attn_type_val = args[1] # Not directly used in param count, but good to have
+                    # use_flash_attn_val = args[2] # Not used in param count
+                    use_expert_system_val = args[3]
+                    num_experts_val = args[4]
+                    experts_per_token_val = args[5]
+
+                    # Defaults for optional/context-specific args
+                    vocab_size_val = 32000 # Default vocab size
+                    batch_size_for_mem = 4  # Default batch for memory estimation
+                    seq_len_for_mem = 512   # Default seq_len for memory estimation
+
+                    arg_idx = 6
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # vocab_size_override if present
+                        try: vocab_size_val = int(args[arg_idx])
+                        except (ValueError, TypeError): pass # Keep default if not convertible
+                        arg_idx +=1
+
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # batch_size for mem est
+                        try: batch_size_for_mem = int(args[arg_idx])
+                        except (ValueError, TypeError): pass
+                        arg_idx +=1
+
+                    if len(args) > arg_idx and args[arg_idx] is not None and not isinstance(args[arg_idx], gr.utils.Request): # seq_len for mem est
+                        try: seq_len_for_mem = int(args[arg_idx])
+                        except (ValueError, TypeError): pass
+                        # arg_idx +=1 # No more args after this for now
+
+                    _presets = {
+                        "50M": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 1376},
+                        "100M": {"hidden_size": 768, "num_hidden_layers": 10, "num_attention_heads": 12, "intermediate_size": 2048},
+                        "250M": {"hidden_size": 1024, "num_hidden_layers": 12, "num_attention_heads": 16, "intermediate_size": 2816},
+                        "500M": {"hidden_size": 1280, "num_hidden_layers": 16, "num_attention_heads": 20, "intermediate_size": 3584},
+                        "750M": {"hidden_size": 1536, "num_hidden_layers": 18, "num_attention_heads": 24, "intermediate_size": 4096},
+                        "1B": {"hidden_size": 1536, "num_hidden_layers": 24, "num_attention_heads": 24, "intermediate_size": 4352},
+                        "1.3B": {"hidden_size": 2048, "num_hidden_layers": 18, "num_attention_heads": 32, "intermediate_size": 5632},
+                        "3B": {"hidden_size": 2560, "num_hidden_layers": 26, "num_attention_heads": 40, "intermediate_size": 6912},
+                        "7B": {"hidden_size": 3200, "num_hidden_layers": 36, "num_attention_heads": 50, "intermediate_size": 8704},
+                        "13B": {"hidden_size": 4096, "num_hidden_layers": 40, "num_attention_heads": 64, "intermediate_size": 11008},
+                        "30B": {"hidden_size": 5120, "num_hidden_layers": 48, "num_attention_heads": 80, "intermediate_size": 13824},
+                        "70B": {"hidden_size": 6144, "num_hidden_layers": 64, "num_attention_heads": 96, "intermediate_size": 16384},
+                    }
+                    base_dims = _presets.get(model_size_val, _presets["1B"]) # Default to 1B if somehow invalid
+
+                    cfg_for_count = ApertisConfig(
+                        vocab_size=int(vocab_size_val),
+                        hidden_size=base_dims["hidden_size"],
+                        num_hidden_layers=base_dims["num_hidden_layers"],
+                        num_attention_heads=base_dims["num_attention_heads"],
+                        intermediate_size=base_dims["intermediate_size"],
+                        use_expert_system=bool(use_expert_system_val),
+                        num_experts=int(num_experts_val) if use_expert_system_val else 0,
+                        experts_per_token=int(experts_per_token_val) if use_expert_system_val else 0,
+                        # other params like attention_type can be added if they affect param count significantly
+                    )
+
+                    params_info = cfg_for_count.count_parameters()
+                    mem_info = cfg_for_count.estimate_memory_usage(batch_size=int(batch_size_for_mem), seq_len=int(seq_len_for_mem))
+
+                    total_p = params_info['total_parameters']
+                    active_p = params_info['active_parameters']
+
+                    param_str = f"{total_p/1e9:.2f}B" if total_p >= 1e9 else f"{total_p/1e6:.1f}M"
+                    active_param_str = f"{active_p/1e9:.2f}B" if active_p >= 1e9 else f"{active_p/1e6:.1f}M"
+
+                    display_text = f"Total Params: {param_str}"
+                    if use_expert_system_val and cfg_for_count.num_experts > 0 and cfg_for_count.experts_per_token > 0 :
+                        # Calculate the size of one expert's FFN part per layer more directly
+                        # H*I + I*H for one FFN
+                        single_expert_ffn_params_total = (cfg_for_count.hidden_size * cfg_for_count.intermediate_size +
+                                                          cfg_for_count.intermediate_size * cfg_for_count.hidden_size) * cfg_for_count.num_hidden_layers
+
+                        expert_size_str = f"{single_expert_ffn_params_total / 1e9:.2f}B" if single_expert_ffn_params_total >=1e9 else f"{single_expert_ffn_params_total/1e6:.1f}M"
+                        # Format for MoE display: "Total: 8B | Active: 1.3B | Experts: 6x1.3B" (example)
+                        # Here, expert_size_str is total params for ONE expert across ALL layers.
+                        # The "X x YB" usually means NumTotalExperts x SizeOfOneExpertFFN (for all layers)
+                        # Or sometimes NumActiveExperts x SizeOfOneExpertFFN
+                        # Let's use: NumTotalExperts x SizeOfOneExpertFFN_all_layers
+                        display_text = f"Total: {param_str} | Active: {active_param_str} | Experts: {cfg_for_count.num_experts}x{expert_size_str}"
+
+                    display_text += f"\nMem Est (B={batch_size_for_mem}, S={seq_len_for_mem}, FP16): Train {mem_info['training_gb']:.1f}GB | Infer {mem_info['inference_gb']:.1f}GB"
+                    return display_text
+                except Exception as e:
+                    logger.error(f"Error updating param/memory display: {e}", exc_info=True)
+                    return "Error calculating params/memory."
+
+            # Wire up the param/memory display updates
+            # For Pre-training Tab
+            pretrain_param_inputs = [
+                model_size_train_dd, attn_type_train_dd, flash_attn_train_cb, expert_sys_train_cb,
+                num_experts_train_sl, experts_per_token_train_sl,
+                gr.Number(value=32000, visible=False), # Placeholder for vocab_size_override (not directly editable here)
+                batch_size_train_sl, # Pass the training batch size slider
+                gr.Number(value=512, visible=False) # Placeholder for seq_len for memory (can make this a UI input if needed)
+            ]
+            # Listen to changes on components that affect parameter or memory calculation
+            comps_to_listen_pretrain = [model_size_train_dd, expert_sys_train_cb, num_experts_train_sl, experts_per_token_train_sl, batch_size_train_sl]
+            for comp in comps_to_listen_pretrain: # Iterate through the actual Gradio components
+                 if comp: # Check if component is not None (it shouldn't be for these)
+                    comp.change(update_param_memory_display, inputs=pretrain_param_inputs, outputs=[param_display_train_md])
+
+            # For AZR Tab
+            azr_param_inputs = [
+                azr_model_size_dd, azr_attn_type_dd, azr_flash_attn_cb, azr_expert_sys_cb,
+                num_experts_azr_sl, experts_per_token_azr_sl,
+                gr.Number(value=32000, visible=False), # vocab (AZR uses HF tokenizer, so this is for consistency)
+                gr.Number(value=1, visible=False),   # batch for mem (AZR generation is usually B=1)
+                gr.Number(value=512, visible=False) # seq_len for mem
+            ]
+            comps_to_listen_azr = [azr_model_size_dd, azr_expert_sys_cb, num_experts_azr_sl, experts_per_token_azr_sl]
+            for comp in comps_to_listen_azr:
+                 if comp:
+                    comp.change(update_param_memory_display, inputs=azr_param_inputs, outputs=[param_display_azr_md])
+
+            # For Create New Model Tab
+            create_model_param_inputs = [
+                new_model_size_dd, new_attn_type_dd, new_flash_attn_cb, new_expert_cb,
+                num_experts_create_sl, experts_per_token_create_sl,
+                new_vocab_size_num, # Vocab size is an input here
+                gr.Number(value=1, visible=False),   # batch for mem (default for creation display)
+                gr.Number(value=512, visible=False) # seq_len for mem
+            ]
+            comps_to_listen_create = [new_model_size_dd, new_expert_cb, num_experts_create_sl, experts_per_token_create_sl, new_vocab_size_num]
+            for comp in comps_to_listen_create: # Iterate through actual components
+                if comp:
+                    comp.change(update_param_memory_display, inputs=create_model_param_inputs, outputs=[param_display_create_md])
+
 
             def ui_chat_handler(msg, img, max_new, temp, tk, tp, hist):
                 if not self.model:

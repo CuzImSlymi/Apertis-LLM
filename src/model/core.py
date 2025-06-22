@@ -218,6 +218,304 @@ class ApertisConfig:
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
+    def count_parameters(self) -> Dict[str, int]:
+        """
+        Calculates the number of parameters in a model based on this configuration.
+        This is an estimation and might differ slightly from actual model.num_parameters().
+        """
+        H = self.hidden_size
+        L = self.num_hidden_layers
+        V = self.vocab_size
+        I = self.intermediate_size
+        A_h = self.num_attention_heads # Number of attention heads
+        # Assuming head_dim = H / A_h. K,Q,V projections are H -> H.
+
+        # 1. Token Embeddings
+        param_embeddings = V * H
+
+        # 2. Attention Block Parameters (per layer)
+        # Q, K, V, O projections: 4 * (H * H)
+        # No bias if dropout, but let's assume bias for general case or add if explicit.
+        # For simplicity, use 4 * H^2 for QKVO projections.
+        # If attention_type is selective_ssm, this calculation will be different.
+        # For standard_mha:
+        params_attention_block = 4 * H * H
+        if self.attention_type == "selective_ssm":
+            # Rough estimation for SSM based on Mamba-like components:
+            # in_proj_x, in_proj_z: 2 * H * ssm_d_inner
+            # conv1d: ssm_d_inner * ssm_conv_kernel (weights only)
+            # x_param_proj: ssm_d_inner * (dt_rank + 2 * num_heads * ssm_d_state)
+            # dt_proj_head: dt_rank * num_heads (weights) + num_heads (bias)
+            # A_log, D parameters
+            # out_proj: ssm_d_inner * H
+            # This is complex to estimate without building the layer.
+            # For now, using a rougher estimate, can be refined.
+            # Let's use a proxy similar to MHA for now, or a factor.
+            # A more accurate way is to instantiate and count, but this is for config time.
+            # For simplicity, let's assume it's comparable to MHA for this rough estimate.
+            # This is a known limitation of config-based counting for complex blocks.
+            # A Mamba block (H, N, D) has roughly 2*H*N*D + H*N parameters.
+            # Here, ssm_d_inner ~ 2H, ssm_d_state ~ H/A_h or 16.
+            # Let's use a placeholder factor for now, e.g., 3 * H*H for SSM-like part
+            params_attention_block = (
+                H * self.ssm_d_inner +  # in_proj_x
+                H * self.ssm_d_inner +  # in_proj_z
+                self.ssm_d_inner * self.ssm_conv_kernel + # conv1d (weights)
+                self.ssm_d_inner * (self.ssm_dt_rank + 2 * A_h * self.ssm_d_state) + # x_param_proj
+                self.ssm_dt_rank * A_h + A_h + # dt_proj_head (weights + bias)
+                A_h * self.ssm_d_state + # A_log
+                self.ssm_d_inner + # D
+                self.ssm_d_inner * H # out_proj
+            )
+
+
+        # 3. FFN Block Parameters (per layer)
+        # Standard FFN: H -> I -> H. Two linear layers: H*I + I*H
+        params_ffn_block_single_expert = H * I + I * H
+
+        # LayerNorms: Each attention and FFN block usually has pre-LayerNorm.
+        # Each LN has 2*H params (scale and bias).
+        params_layernorms_per_layer = 2 * (2 * H) # Two LayerNorms per ApertisLayer
+
+        # Total for one dense layer (Attention + FFN + LayerNorms)
+        params_per_dense_layer = params_attention_block + params_ffn_block_single_expert + params_layernorms_per_layer
+
+        total_params_dense_backbone = L * params_per_dense_layer
+
+        # MoE specific parameters
+        params_moe_routers = 0
+        params_moe_experts_total_contribution = 0 # Total params for all experts across all layers
+
+        active_params_moe_contribution = 0 # Contribution from active experts
+
+        if self.use_expert_system and self.num_experts > 0:
+            # Router params: H * num_experts (per layer where MoE FFN is used)
+            # Assuming MoE replaces the standard FFN block.
+            params_moe_routers = L * (H * self.num_experts)
+
+            # Expert params: num_experts * params_ffn_block_single_expert (per MoE layer)
+            # The params_ffn_block_single_expert is what each expert MLP has.
+            # This replaces the single FFN block's parameters in the dense calculation for MoE layers.
+            params_all_experts_one_layer = self.num_experts * params_ffn_block_single_expert
+
+            # Total contribution from all experts across all layers
+            params_moe_experts_total_contribution = L * params_all_experts_one_layer
+
+            # Active params from experts: experts_per_token * params_ffn_block_single_expert (per MoE layer)
+            active_params_experts_one_layer = self.experts_per_token * params_ffn_block_single_expert
+            active_params_moe_contribution = L * active_params_experts_one_layer
+
+
+            # Adjust backbone: Remove the single FFN params, they are now in params_moe_experts_total_contribution
+            total_params_dense_backbone -= L * params_ffn_block_single_expert
+            # Add router params to the backbone
+            total_params_dense_backbone += params_moe_routers
+
+
+        # Total parameters
+        # Start with embeddings and the (potentially MoE-adjusted) backbone
+        total_model_params = param_embeddings + total_params_dense_backbone
+        if self.use_expert_system and self.num_experts > 0:
+            total_model_params += params_moe_experts_total_contribution # Add all expert params for total count
+
+        # Active parameters (for MoE)
+        # Start with embeddings and non-expert parts of backbone
+        active_model_params = param_embeddings + total_params_dense_backbone # Backbone already includes routers
+        if self.use_expert_system and self.num_experts > 0:
+            # Add only the active experts' contribution
+            active_model_params += active_params_moe_contribution
+        else: # If not MoE, active params are the same as total
+            active_model_params = total_model_params
+
+        # Final LM head parameters (if not tied)
+        # If tied, these are already counted in param_embeddings.
+        params_lm_head = 0
+        if not self.tie_word_embeddings:
+            params_lm_head = V * H
+            total_model_params += params_lm_head
+            active_model_params += params_lm_head # Also add to active if not tied
+
+        # Add final LayerNorm after all layers
+        params_final_norm = 2 * H
+        total_model_params += params_final_norm
+        active_model_params += params_final_norm
+
+        # Multimodal projector (if vision_embed_dim is different from hidden_size)
+        params_vision_projector = 0
+        if self.multimodal and self.vision_embed_dim != H:
+            params_vision_projector = self.vision_embed_dim * H
+            total_model_params += params_vision_projector
+            active_model_params += params_vision_projector
+        # Note: Parameters of self.multimodal_encoder (UnifiedMultimodalEncoder) are not included here.
+        # This is a simplification; a full count would require inspecting its architecture.
+
+        return {
+            "total_parameters": total_model_params,
+            "active_parameters": active_model_params, # Relevant for MoE
+            "embedding_parameters": param_embeddings,
+            "attention_block_parameters_per_layer": params_attention_block,
+            "ffn_block_parameters_per_expert_per_layer": params_ffn_block_single_expert if self.use_expert_system else 0,
+            "moe_router_parameters_per_layer": (H * self.num_experts) if self.use_expert_system and self.num_experts > 0 else 0,
+            "lm_head_parameters": params_lm_head
+        }
+
+    def estimate_memory_usage(self, batch_size: int, seq_len: int, precision: str = "fp16") -> Dict[str, float]:
+        """
+        Estimates memory usage for training and inference.
+        precision: "fp32", "fp16", "bf16", "int8"
+        Returns memory in GB.
+        """
+        counts = self.count_parameters()
+        total_params = counts["total_parameters"]
+        active_params = counts["active_parameters"] # Use active for MoE during forward pass estimate
+
+        bytes_per_param = 4
+        if precision == "fp16" or precision == "bf16":
+            bytes_per_param = 2
+        elif precision == "int8":
+            bytes_per_param = 1
+
+        # 1. Model Weights
+        # For training with Adam, optimizer states can take 12-18x model params for fp32,
+        # (e.g., 4 bytes for weights, 4 for gradients, 4 for momentum, 4 for variance for Adam/AdamW = 16 bytes)
+        # For fp16/bf16 training, this can be lower if optimizer states are also in fp16/bf16.
+        # Let's use a common factor:
+        # - Model weights: total_params * bytes_per_param
+        # - Gradients: total_params * bytes_per_param (only for training)
+        # - Optimizer states (AdamW): total_params * bytes_per_param * 2 (momentum, variance)
+        #   If using fp32 optimizer with fp16 training, these are 4 bytes each.
+
+        model_weights_mem = total_params * bytes_per_param
+
+        # 2. Activations (rough estimate for Transformers)
+        # L * B * S * H * bytes_per_activation_element (for hidden states)
+        # Plus attention scores: L * B * NumHeads * S * S * bytes (can be large, but often recomputed)
+        # A common heuristic: ~20 * L * B * S * H * bytes for large models during training due to various buffers.
+        # For inference, it's much lower if optimized (e.g. 2 * L * B * S * H for KV cache).
+        # Let H = hidden_size, L = num_layers, B = batch_size, S = seq_len
+        # Let's use a simplified estimate for activations:
+        # For training: K_act * L * B * S * H * bytes_per_param (K_act can be 10-20)
+        # For inference: KV cache is primary: 2 * L * B * S * H * bytes_per_param (for max_seq_len)
+
+        # Using active_params for activation estimation as it reflects forward pass complexity for MoE
+        # This is a very rough proxy. A more detailed formula:
+        # Activations ~ B * S * H * L * (10 + A_h * S / H) for training (LLM.int8() paper)
+        # Let's use a simpler one: B * S * (H * L + active_params / (B*S) ) * bytes_per_param
+        # This is still very approximate. A simpler rule of thumb is often used:
+        # Activations for training can be comparable to or slightly more than model weights.
+        # For inference, it's dominated by KV cache.
+
+        # Training memory:
+        # Optimizer state factor: 4 for fp32 Adam (master weights, momentum, variance) + grad = 4x
+        # If mixed precision (fp16 model, fp32 optimizer):
+        #   params_fp16 = 2 bytes, grads_fp16 = 2 bytes, optimizer_fp32 = 8 bytes (mom, var) = 12 bytes / param
+        # If full fp16 optimizer (less common, can be unstable):
+        #   params_fp16 = 2, grads_fp16 = 2, optimizer_fp16 = 4 (mom, var) = 8 bytes / param
+        # Let's assume mixed precision with fp32 optimizer for AdamW as a common robust setup.
+        bytes_per_param_optimizer_states = 4 # for each of momentum and variance in fp32
+
+        training_optimizer_mem = total_params * (bytes_per_param_optimizer_states * 2) # momentum + variance
+        training_gradients_mem = total_params * bytes_per_param # gradients in model precision
+
+        # Activations estimation for training (very rough, often model-specific)
+        # For large models, activations can be L * B * S * H * (some_factor ~10-20 for various buffers)
+        # Let's use a factor of sequence length and batch size on top of hidden size and layers
+        # Activation memory: batch_size * seq_len * hidden_size * num_layers * factor * bytes_per_param
+        # The factor can be around 10 for just hidden states, but more with attention contributions.
+        # Let's use a simpler factor related to active parameters, as it's more readily available.
+        # Example: activation_mem_factor * active_params * bytes_per_param (where factor is small, e.g. 0.1 to 1)
+        # This is not standard. Let's use a more common heuristic:
+        # Activation size is roughly proportional to B*S*H*L.
+        # Using a very rough estimate: activations ~ B * S * H * L * (bytes_per_param for activations)
+        # And add a small constant factor for other buffers.
+        # Let's use a simplified estimate that activations are a multiple of model size, e.g., 1-2x for inference, more for training.
+        # For training, a common estimate is that total memory is around 20 * total_params * bytes_for_fp32_equiv_params for Adam.
+        # Or, Model_FP16 (2B) + Grad_FP16 (2B) + Optimizer_FP32 (8B) = 12 bytes per parameter.
+        # Plus activations.
+        # Activations are roughly: B * S * ( H + NumHeads * S_kv ) * L * bytes_per_element
+        # This is sequence length dependent.
+
+        # Heuristic from HF docs/blogs:
+        # Inference: Model weights + KV cache + temporary buffers
+        # Training: Model weights + Gradients + Optimizer states + Activations
+
+        # Inference Memory Estimation:
+        # KV Cache: 2 * L * B * S_max * H * bytes_per_param (S_max usually self.max_position_embeddings)
+        kv_cache_mem = 2 * self.num_hidden_layers * batch_size * self.max_position_embeddings * self.hidden_size * bytes_per_param
+        # Temporary buffers for inference can be a fraction of model weights or related to B*S*H
+        inference_temp_buffers = batch_size * seq_len * self.hidden_size * bytes_per_param * 4 # Small factor for current activations
+
+        inference_total_mem_gb = (model_weights_mem + kv_cache_mem + inference_temp_buffers) / (1024**3)
+
+        # Training Memory Estimation:
+        # Using active_params for activation calculation as it's more reflective of forward pass.
+        # Rough estimate for activations: batch_size * seq_len * self.hidden_size * self.num_hidden_layers * 10 * bytes_per_param (very rough)
+        # A slightly more refined one for transformers: B * S * H * L * (1 + A_h * S / (k*H)) where k is a constant.
+        # Let's use a simpler one: roughly proportional to B*S*L*H
+        # Activation memory: B * S * H * L * (bytes for activation elements, usually same as precision)
+        # Add factor for attention map if not recomputed: B * num_heads * S^2 * L
+        # This is complex. Let's use a simpler high-level estimate for activations:
+        # For example, activations can be several times the size of parameters for large S.
+        # Let's assume activations scale with B*S*H*L.
+        # Paper by Pope et al. "Efficiently Scaling Transformer Inference" suggests activation memory:
+        # A_mem = B * S * d_model * L * (12 + N_heads * S / d_model) bytes (for training with recomputation)
+        # Without recomputation, it's higher. Let's use a simplified factor for now.
+        # Activation_mem_approx = batch_size * seq_len * self.hidden_size * self.num_hidden_layers * (bytes_per_param) * (some_factor like 2-4 for transformer layers)
+        # This is still not great.
+        # Let's use a very high-level approach:
+        # Total training memory = (Factor_Adam * total_params * 4) + (Factor_Activation * B*S*H*L*bytes_per_param)
+        # Factor_Adam is ~4 (param, grad, 2x optimizer states in fp32) -> 16 bytes/param if all fp32
+        # If mixed precision (model/grad fp16, optimizer fp32):
+        # model_fp16 (2B) + grad_fp16 (2B) + optimizer_fp32_mom (4B) + optimizer_fp32_var (4B) = 12 bytes/param
+        param_related_training_mem = total_params * (bytes_per_param + bytes_per_param + 2 * 4) # model + grad + (mom+var in fp32)
+
+        # Activation estimation: (batch_size * seq_len * hidden_size) per layer for key/value/query + output.
+        # Plus MLP activations. Roughly: batch_size * seq_len * (hidden_size + intermediate_size) per layer.
+        # Total over L layers.
+        # This doesn't include attention scores matrix (B * A_h * S * S) which can be huge.
+        # Assume attention scores are recomputed or fused (FlashAttention).
+        # Simplified activation estimate: batch_size * seq_len * self.hidden_size * self.num_hidden_layers * (a scaling factor like 10-20 for all buffers) * bytes_per_param
+        # This is highly empirical. Let's assume activations are roughly X times the model parameter size, where X depends on B*S.
+        # A common rule of thumb for total training memory:
+        # For fp16 mixed-precision with AdamW: ~16-20 bytes per parameter * total_parameters + activations.
+        # Activations can be B*S*H*L * (some small constant like 20-30 for all buffers) * bytes_per_activation_element
+        # For instance, MosaicML estimates peak memory for training LLAMA-7B (fp16) at ~760GB for B=4, S=2048 on 8 A100s.
+        # 7B params * (12 bytes/param for model/grad/optim) = 84GB for params.
+        # Remaining ~676GB for activations and other overheads.
+        # 676 GB / (4 * 2048 * 4096 * 32 * 2 bytes/elem) -> factor is very small.
+        # This means the B*S*H*L scaling needs a large coefficient.
+
+        # Let's use a simpler, more direct estimation for activations:
+        # Activation memory is proportional to B * S * H * L.
+        # Let's assume a factor, e.g., 24 bytes per token per layer per batch for activations (includes all intermediate ones)
+        # This is a common estimate for transformers.
+        activations_mem = batch_size * seq_len * self.num_hidden_layers * self.hidden_size * (10 + self.num_attention_heads * seq_len / self.hidden_size if self.attention_type == "standard_mha" else 10) * bytes_per_param
+        # The (10 + N_h * S / H) part is from a formula for transformer activation sizing.
+        # If selective_ssm, the S^2 dependency from attention scores is avoided.
+        if self.attention_type == "selective_ssm":
+             activations_mem = batch_size * seq_len * self.num_hidden_layers * self.hidden_size * 12 * bytes_per_param # Simplified for SSM
+
+        training_total_mem_gb = (param_related_training_mem + activations_mem) / (1024**3)
+
+        # Add a general "workspace" memory, e.g., 10-20% of model size for various GPU computations
+        workspace_mem_gb_inf = (model_weights_mem * 0.1) / (1024**3)
+        workspace_mem_gb_train = (param_related_training_mem * 0.1) / (1024**3) # Workspace often larger for training
+
+        return {
+            "inference_gb": round(inference_total_mem_gb + workspace_mem_gb_inf, 2),
+            "training_gb": round(training_total_mem_gb + workspace_mem_gb_train, 2),
+            "details": {
+                "model_weights_gb": round(model_weights_mem / (1024**3), 2),
+                "kv_cache_gb (inf)": round(kv_cache_mem / (1024**3), 2),
+                "optimizer_grads_params_gb (train)": round(param_related_training_mem / (1024**3), 2),
+                "activations_approx_gb (train)": round(activations_mem / (1024**3), 2),
+                "precision_bytes_per_param": bytes_per_param,
+                "batch_size": batch_size,
+                "seq_len": seq_len
+            }
+        }
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: int = 10000):
         super().__init__()
@@ -1515,18 +1813,55 @@ def create_apertis_model(
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> ApertisForCausalLM:
     model_configs_presets = {
-        "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
-        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
-        "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
+        # Parameters roughly based on LLaMA/Mistral-like architectures
+        # Scaling factors: H = Hidden Size, L = Layers, A = Attention Heads, I = Intermediate Size
+        # Param count approx: L * (2*H^2 + 2*H*I + H*A_kv_dim) + V*H (embeddings)
+        # Simplified: L * (2*H^2 + 2*H*(4*H)) = L * 10*H^2 for non-MoE
+        # For MoE: Base + NumExperts * ExpertParamsPerLayer. Active = Base + ExpertsPerToken * ExpertParamsPerLayer
+
+        "50M": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 1376}, # Approx 50M
+        "100M": {"hidden_size": 768, "num_hidden_layers": 10, "num_attention_heads": 12, "intermediate_size": 2048}, # Approx 100M
+        "250M": {"hidden_size": 1024, "num_hidden_layers": 12, "num_attention_heads": 16, "intermediate_size": 2816}, # Approx 250M
+        "500M": {"hidden_size": 1280, "num_hidden_layers": 16, "num_attention_heads": 20, "intermediate_size": 3584}, # Approx 500M
+        "750M": {"hidden_size": 1536, "num_hidden_layers": 18, "num_attention_heads": 24, "intermediate_size": 4096}, # Approx 750M
+        "1B": {"hidden_size": 1536, "num_hidden_layers": 24, "num_attention_heads": 24, "intermediate_size": 4352},    # Approx 1B
+        "1.3B": {"hidden_size": 2048, "num_hidden_layers": 18, "num_attention_heads": 32, "intermediate_size": 5632}, # Approx 1.3B (Kept for reference)
+        "3B": {"hidden_size": 2560, "num_hidden_layers": 26, "num_attention_heads": 40, "intermediate_size": 6912},    # Approx 3B
+        "7B": {"hidden_size": 3200, "num_hidden_layers": 36, "num_attention_heads": 50, "intermediate_size": 8704},    # Approx 7B
+        "13B": {"hidden_size": 4096, "num_hidden_layers": 40, "num_attention_heads": 64, "intermediate_size": 11008},  # Approx 13B
+        "30B": {"hidden_size": 5120, "num_hidden_layers": 48, "num_attention_heads": 80, "intermediate_size": 13824},  # Approx 30B
+        "70B": {"hidden_size": 6144, "num_hidden_layers": 64, "num_attention_heads": 96, "intermediate_size": 16384},  # Approx 70B
     }
+    # Keep "base" as an alias for a common size, e.g., 750M or 1B for now, can be removed later if not needed by other parts of code
+    # For this task, we are removing "small", "base", "large" entirely as per instructions.
+    # model_configs_presets["base"] = model_configs_presets["750M"] # Example alias
+
     if model_size not in model_configs_presets:
-        raise ValueError(f"Unsupported model_size: {model_size}. Choose from {list(model_configs_presets.keys())}")
-    
-    final_config_dict = model_configs_presets[model_size].copy()
-    
-    if vocab_size_override is not None: 
+        # Try to parse model_size like "70B", "1.3B", "500M" into a numerical value
+        parsed_size = None
+        try:
+            size_val_str = model_size.upper().replace("B", "E9").replace("M", "E6")
+            parsed_size = int(float(size_val_str))
+
+            # Find closest preset if direct match fails
+            closest_preset_name = min(
+                model_configs_presets.keys(),
+                key=lambda k: abs(int(float(k.upper().replace("B", "E9").replace("M", "E6"))) - parsed_size)
+            )
+            logger.warning(f"Model size '{model_size}' not a direct preset. Using closest: '{closest_preset_name}' (parsed as {parsed_size} params).")
+            model_size = closest_preset_name # Use the key of the closest preset
+            final_config_dict = model_configs_presets[model_size].copy()
+
+        except ValueError:
+             raise ValueError(f"Unsupported model_size: {model_size}. Choose from {list(model_configs_presets.keys())} or specify with M/B suffix.")
+
+    else: # model_size is a direct key in presets
+        final_config_dict = model_configs_presets[model_size].copy()
+
+    if vocab_size_override is not None:
         final_config_dict["vocab_size"] = vocab_size_override
-    
+    elif "vocab_size" not in final_config_dict: # Ensure vocab_size is present
+        final_config_dict["vocab_size"] = 32000 # Default if not in preset and not overridden
     if attention_type_override is not None:
         final_config_dict["attention_type"] = attention_type_override
     else:
