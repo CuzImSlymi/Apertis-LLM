@@ -15,7 +15,7 @@ import threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model
+from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model, estimate_model_parameters # Added estimate_model_parameters
 from src.training.pipeline import get_available_gpus
 from src.training import train_from_config
 
@@ -574,7 +574,8 @@ class ApertisInterface:
                     with gr.Row():
                         with gr.Column(scale=1):
                             gr.Markdown("## Model Config")
-                            model_size_train_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                            # model_size_train_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                            model_param_count_train_tb = gr.Textbox(value="125M", label="Target Parameter Count (e.g., 7B, 350M, 125000000)")
                             attn_type_train_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                             multimodal_train_cb = gr.Checkbox(label="Multimodal")
@@ -678,7 +679,8 @@ class ApertisInterface:
                         with gr.Column(scale=1):
                             gr.Markdown("## 1. AZR Model & Data")
                             with gr.Accordion("Model Config (for AZR internal model)", open=True):
-                                azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                                # azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
+                                azr_param_count_tb = gr.Textbox(value="125M", label="Target Parameter Count (AZR Model, e.g., 1B, 250M)")
                                 azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                                 azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                                 def _toggle_flash_attn_visibility_azr(attn_type_val):
@@ -754,7 +756,8 @@ class ApertisInterface:
                             model_info_load_tb = gr.Textbox(label="Loaded Model Info", interactive=False, lines=10, autoscroll=True)
                         with gr.Column(scale=1):
                             gr.Markdown("## Create New Model (for Pre-training)")
-                            new_model_size_dd = gr.Dropdown(["small","base","large"], value="base", label="Model Size")
+                            # new_model_size_dd = gr.Dropdown(["small","base","large"], value="base", label="Model Size")
+                            new_model_param_count_tb = gr.Textbox(value="125M", label="Target Parameter Count (e.g., 1.5B, 500M)")
                             new_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             new_multimodal_cb = gr.Checkbox(label="Multimodal")
                             new_expert_cb = gr.Checkbox(label="Use Expert System")
@@ -762,7 +765,7 @@ class ApertisInterface:
                             new_vocab_size_num = gr.Number(32000, label="Vocab Size (for manual vocab)", precision=0)
                             new_model_out_tb = gr.Textbox("models/new_apertis_model", label="Save Path for New Model Files")
                             create_model_btn_ui = gr.Button("Create & Save New Model Files")
-                            create_model_status_tb = gr.Textbox(label="Creation Status", interactive=False, lines=3)
+                            create_model_status_tb = gr.Textbox(label="Creation Status", interactive=False, lines=5) # Increased lines
 
             def _toggle_flash_attn_visibility_new_model(attn_type_val):
                 if attn_type_val == "standard_mha":
@@ -823,11 +826,18 @@ class ApertisInterface:
                     brief_cfg = {
                         "model_type": cfg_dict.get("model_type"), "vocab_size": cfg_dict.get("vocab_size"),
                         "hidden_size": cfg_dict.get("hidden_size"), "num_hidden_layers": cfg_dict.get("num_hidden_layers"),
+                        "num_attention_heads": cfg_dict.get("num_attention_heads"), "intermediate_size": cfg_dict.get("intermediate_size"),
                         "multimodal": cfg_dict.get("multimodal"), "attention_type": cfg_dict.get("attention_type"),
+                        "use_expert_system": cfg_dict.get("use_expert_system"), "num_experts": cfg_dict.get("num_experts"),
                         "pad_token_id":cfg_dict.get("pad_token_id"), "bos_token_id":cfg_dict.get("bos_token_id"),
                         "eos_token_id":cfg_dict.get("eos_token_id"), "unk_token_id":cfg_dict.get("unk_token_id"),
                     }
                     info_parts.append("\nModel Config (Brief):\n" + json.dumps(brief_cfg, indent=2))
+                    try:
+                        estimated_params = estimate_model_parameters(self.model.config)
+                        info_parts.append(f"\nEstimated Parameters: {estimated_params:,} (~{estimated_params/1e6:.2f}M)")
+                    except Exception as est_e:
+                        info_parts.append(f"\nCould not estimate parameters: {est_e}")
                 else:
                     info_parts.append("\nFailed to load model or model has no config.")
 
@@ -843,22 +853,35 @@ class ApertisInterface:
 
             load_model_btn_ui.click(ui_load_model_handler, [model_path_load_tb, vocab_path_load_tb], [model_info_load_tb])
 
-            def ui_create_model_handler(size_ui, attn_type_ui, multi_ui, expert_ui, flash_attn_ui, v_size_ui, out_path_ui):
+            def ui_create_model_handler(param_count_str_ui, attn_type_ui, multi_ui, expert_ui, flash_attn_ui, v_size_ui, out_path_ui): # Changed size_ui to param_count_str_ui
                 try:
                     if not out_path_ui: return "Output path for new model files is required."
-                    v_size_int = int(v_size_ui) if v_size_ui is not None else 32000
+                    if not param_count_str_ui: return "Target parameter count is required."
+
+                    v_size_int = int(v_size_ui) if v_size_ui is not None else 32000 # Default vocab size if not specified
                     
-                    # Determine effective use_flash_attention: only if attn_type is standard_mha
                     effective_flash_attn = flash_attn_ui if attn_type_ui == "standard_mha" else False
 
                     new_model_instance = create_apertis_model(
-                        model_size=size_ui, vocab_size_override=v_size_int,
-                        multimodal=multi_ui, use_expert_system=expert_ui,
+                        target_param_count=param_count_str_ui, # Use param_count_str_ui
+                        vocab_size_override=v_size_int,
+                        multimodal=multi_ui,
+                        use_expert_system=expert_ui,
                         attention_type_override=attn_type_ui,
-                        use_flash_attention=effective_flash_attn # Pass the new flag
+                        use_flash_attention=effective_flash_attn
                     )
                     new_model_instance.save_pretrained(out_path_ui)
                     
+                    # Estimate and display actual parameters
+                    actual_params = estimate_model_parameters(new_model_instance.config)
+                    config_details_str = (
+                        f"  Hidden Size: {new_model_instance.config.hidden_size}\n"
+                        f"  Num Layers: {new_model_instance.config.num_hidden_layers}\n"
+                        f"  Num Heads: {new_model_instance.config.num_attention_heads}\n"
+                        f"  Intermediate Size: {new_model_instance.config.intermediate_size}\n"
+                        f"  Vocab Size: {new_model_instance.config.vocab_size}"
+                    )
+
                     dummy_vocab_content = {f"<token_{i}>": i for i in range(v_size_int)}
                     default_specials = {
                         "<pad>": new_model_instance.config.pad_token_id, 
@@ -874,19 +897,21 @@ class ApertisInterface:
                     
                     with open(os.path.join(out_path_ui, "vocab.json"),"w",encoding="utf-8") as f:
                         json.dump(dummy_vocab_content, f, indent=2)
-                        
-                    return f"Model files (pytorch_model.bin, config.json) and a basic vocab.json (with {v_size_int} tokens) " \
-                           f"created at '{out_path_ui}'.\n" \
-                           "IMPORTANT: For actual use, replace the dummy vocab.json with a real one, or ensure your " \
-                           "training/inference pipeline loads an appropriate Hugging Face tokenizer."
+
+                    return (f"Model files created at '{out_path_ui}'.\n"
+                            f"Target Params: {param_count_str_ui}\n"
+                            f"Estimated Actual Params: {actual_params:,} (~{actual_params/1e6:.2f}M)\n"
+                            f"Config Details:\n{config_details_str}\n"
+                            "Basic vocab.json created. Replace with a real one or use HF tokenizer for training.")
+
                 except Exception as e:
                     logger.error(f"Error creating model: {e}", exc_info=True)
                     return f"Error: {str(e)}"
             create_model_btn_ui.click(ui_create_model_handler,
-                                     [new_model_size_dd, new_attn_type_dd, new_multimodal_cb, new_expert_cb, new_flash_attn_cb, new_vocab_size_num, new_model_out_tb],
+                                     [new_model_param_count_tb, new_attn_type_dd, new_multimodal_cb, new_expert_cb, new_flash_attn_cb, new_vocab_size_num, new_model_out_tb], # Changed new_model_size_dd
                                      [create_model_status_tb])
 
-            def ui_start_training_handler(
+            def ui_start_training_handler( # This is the old one, will be replaced by _updated version logic
                 m_s, attn_t, m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
                 
@@ -978,11 +1003,12 @@ class ApertisInterface:
             # The old handler ui_start_training_handler and its .click() registration were removed.
             # This is the new handler.
             def ui_start_training_handler_updated(
-                m_s, attn_t, flash_attn_t_cb_val, # Added flash_attn_t_cb_val
+                param_count_str, attn_t, flash_attn_t_cb_val, # Changed m_s to param_count_str
                 m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
 
                 current_status = ""
+                if not param_count_str: current_status += "Target parameter count is required.\n" # Added check
                 if not tr_f_obj: current_status += "Training data file is required.\n"
                 if not voc_f_std_obj: current_status += "Vocabulary file (.json) is required for pre-training.\n"
                 if m_m and not img_d: current_status += "Image directory is required for multimodal pre-training.\n"
@@ -1009,10 +1035,11 @@ class ApertisInterface:
                         "data_config": {"train_data_path":train_p, "tokenizer_path":vocab_p_std, "val_data_path":val_p,
                                         "max_length":512, "multimodal":m_m, "image_dir":img_d if m_m else None,
                                         "image_size": 224},
-                        "model_config": {
-                            "model_size":m_s, "attention_type": attn_t,
-                            "use_flash_attention": effective_flash_attn_train, # Added here
+                        "model_config": { # Changed model_size to target_param_count
+                            "target_param_count": param_count_str, "attention_type": attn_t,
+                            "use_flash_attention": effective_flash_attn_train,
                             "multimodal":m_m, "use_expert_system":exp_s
+                            # vocab_size_override can be added here if needed, or handled by training pipeline
                         },
                         "training_config": {
                             "task_type": "pretrain",
@@ -1061,7 +1088,7 @@ class ApertisInterface:
 
             # Update the click handler to use the new function and pass the new checkbox value
             start_train_btn.click(ui_start_training_handler_updated, # Use updated handler
-                                 [model_size_train_dd, attn_type_train_dd, flash_attn_train_cb, # Added flash_attn_train_cb
+                                 [model_param_count_train_tb, attn_type_train_dd, flash_attn_train_cb, # Changed model_size_train_dd
                                   multimodal_train_cb, expert_sys_train_cb,
                                   train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
                                   batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
@@ -1288,7 +1315,7 @@ class ApertisInterface:
 
             # Update ui_start_azr_training_handler signature and logic
             def ui_start_azr_training_handler_updated(
-                m_s, attn_t, flash_attn_azr_cb_val, # Added flash_attn_azr_cb_val
+                param_count_str_azr, attn_t, flash_attn_azr_cb_val, # Changed m_s to param_count_str_azr
                 tokenizer_name_hf, seed_f_obj,
                 iterations, tasks_per_iter, checkpoint_interval,
                 task_types_list, abduction_w, deduction_w, induction_w,
@@ -1330,10 +1357,14 @@ class ApertisInterface:
                     effective_flash_attn_azr = flash_attn_azr_cb_val if attn_t == "standard_mha" else False
                     # Create a base config for the AZR model, then convert to dict
                     # This ensures that if create_apertis_model has defaults, they are picked up.
+                    if not param_count_str_azr: # Add check for empty param count for AZR
+                        current_status += "Target Parameter Count for AZR model is required.\n"
+                    if current_status: return current_status.strip()
+
                     temp_model_for_config = create_apertis_model(
-                        model_size=m_s,
+                        target_param_count=param_count_str_azr, # Changed model_size to target_param_count
                         attention_type_override=attn_t,
-                        use_flash_attention=effective_flash_attn_azr # Pass it here
+                        use_flash_attention=effective_flash_attn_azr
                     )
                     azr_model_cfg_base = temp_model_for_config.config.to_dict()
 
@@ -1400,7 +1431,7 @@ class ApertisInterface:
             azr_start_btn.click(
                 ui_start_azr_training_handler_updated, # use updated handler
                 [
-                    azr_model_size_dd, azr_attn_type_dd, azr_flash_attn_cb, # Added azr_flash_attn_cb
+                    azr_param_count_tb, azr_attn_type_dd, azr_flash_attn_cb, # Changed azr_model_size_dd
                     azr_tokenizer_name_tb, azr_seed_tasks_up,
                     azr_iterations_sl, azr_tasks_per_iter_sl, azr_checkpoint_interval_sl,
                     azr_task_types_cbg, azr_task_dist_abduction_sl, azr_task_dist_deduction_sl, azr_task_dist_induction_sl,
