@@ -577,7 +577,7 @@ class ApertisInterface:
                             # model_size_train_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
                             model_param_count_train_tb = gr.Textbox(value="125M", label="Target Parameter Count (e.g., 7B, 350M, 125000000)")
                             attn_type_train_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
-                            flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+                            flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True)
                             multimodal_train_cb = gr.Checkbox(label="Multimodal")
                             expert_sys_train_cb = gr.Checkbox(label="Use Expert System")
 
@@ -699,7 +699,7 @@ class ApertisInterface:
                                 # azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
                                 azr_param_count_tb = gr.Textbox(value="125M", label="Target Parameter Count (AZR Model, e.g., 1B, 250M)")
                                 azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
-                                azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+                                azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True)
                                 def _toggle_flash_attn_visibility_azr(attn_type_val):
                                     if attn_type_val == "standard_mha":
                                         return gr.update(visible=True)
@@ -795,7 +795,7 @@ class ApertisInterface:
                                 new_use_router_z_loss_cb = gr.Checkbox(value=True, label="Use Router Z-Loss")
                                 new_use_load_balancing_loss_cb = gr.Checkbox(value=True, label="Use Load Balancing Loss")
 
-                            new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
+                            new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True)
                             new_vocab_size_num = gr.Number(32000, label="Vocab Size (for manual vocab)", precision=0)
                             new_model_out_tb = gr.Textbox("models/new_apertis_model", label="Save Path for New Model Files")
                             create_model_btn_ui = gr.Button("Create & Save New Model Files")
