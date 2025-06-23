@@ -908,13 +908,32 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
 
         else: # Pre-training or fine-tuning from scratch
             logger.info(f"Initializing a new model for {'pre-training' if not is_fine_tuning_mode else 'fine-tuning from scratch'}.")
-            # Use create_apertis_model to handle 'model_size' and other presets
+            # Use create_apertis_model to handle 'target_param_count' and other presets
+            target_param_count_from_config = model_cfg_from_file.get("target_param_count", "125M")
+            if "model_size" in model_cfg_from_file:
+                logger.warning("Found 'model_size' in model_config. It is deprecated. Please use 'target_param_count' (e.g., '125M', '1.5B').")
+                # Potentially map old model_size to a target_param_count if desired, or just use default.
+                # For now, if model_size is present but target_param_count is not, we'll use the default "125M".
+                # If target_param_count IS present, it will take precedence over model_size.
+                if not model_cfg_from_file.get("target_param_count"):
+                    logger.info(f"Using default target_param_count '{target_param_count_from_config}' due to deprecated 'model_size' and no 'target_param_count' found.")
+
             model_for_trainer = create_apertis_model(
-                model_size=model_cfg_from_file.get("model_size", "base"),
+                target_param_count=target_param_count_from_config,
                 vocab_size_override=final_vocab_size_for_model_config,
                 attention_type_override=model_cfg_from_file.get("attention_type"),
                 multimodal=model_cfg_from_file.get("multimodal", False),
-                use_expert_system=model_cfg_from_file.get("use_expert_system", False)
+                use_expert_system=model_cfg_from_file.get("use_expert_system", False),
+                # Pass other relevant args from model_cfg_from_file if create_apertis_model accepts them
+                # e.g., num_experts_target_override, experts_per_token_target_override, ssm parameters, config_overrides
+                num_experts_target_override=model_cfg_from_file.get("num_experts"), # ApertisConfig uses num_experts
+                experts_per_token_target_override=model_cfg_from_file.get("experts_per_token"),
+                use_flash_attention=model_cfg_from_file.get("use_flash_attention", False), # Pass this through
+                ssm_d_inner=model_cfg_from_file.get("ssm_d_inner"),
+                ssm_d_state=model_cfg_from_file.get("ssm_d_state", 16), # Default from ApertisConfig
+                ssm_dt_rank=model_cfg_from_file.get("ssm_dt_rank", "auto"), # Default from ApertisConfig
+                ssm_conv_kernel=model_cfg_from_file.get("ssm_conv_kernel", 4), # Default from ApertisConfig
+                config_overrides=model_cfg_from_file.get("config_overrides") # Pass general overrides
             )
             # Ensure special token IDs from tokenizer are respected
             model_for_trainer.config.pad_token_id = final_pad_id
@@ -981,14 +1000,20 @@ def create_sample_config(output_path: str):
             "image_dir": None, # For multimodal pre-training
             "image_size": 224 # For multimodal pre-training
         },
-        "model_config": { # These are for NEW models (pre-training) OROVERRIDES for fine-tuning base
-            "model_size": "base", # Ignored if fine-tuning from pretrained_model_path
+        "model_config": { # These are for NEW models (pre-training) OR OVERRIDES for fine-tuning base
+            "target_param_count": "125M", # Target parameter count (e.g., "10M", "1.5B"). Ignored if fine-tuning from pretrained_model_path.
             "attention_type": "standard_mha", # Options: "standard_mha", "selective_ssm"
             "use_flash_attention": False, # Set to true to try using FlashAttention for "standard_mha"
             "multimodal": False,
-            "use_expert_system": False
+            "use_expert_system": False,
+            "num_experts": 8, # Used if use_expert_system is True
+            "experts_per_token": 2, # Used if use_expert_system is True
+            # "config_overrides": { # Optional: Directly override specific ApertisConfig values AFTER parameter-based calculation
+            #    "hidden_size": 768, 
+            #    "num_hidden_layers": 12
+            # }
             # Other ApertisConfig params can be added here to override defaults for new models
-            # e.g., "hidden_size", "num_hidden_layers", "num_attention_heads" for custom models
+            # e.g., "vocab_size", "max_position_embeddings"
         },
         "training_config": {
             "task_type": "pretrain", # "pretrain" or "finetune"
