@@ -105,15 +105,22 @@ def train_command(args):
 
 def create_model_command(args):
     """Handle the create-model command."""
-    from src.model.core import create_apertis_model
+    from src.model.core import create_apertis_model, estimate_model_parameters # Import estimate_model_parameters
     
     # Create model
-    logger.info(f"Creating {args.size} model (multimodal: {args.multimodal})")
+    logger.info(f"Creating model with target parameters: {args.target_params} (multimodal: {args.multimodal})")
+    # Default vocab size for CLI creation, can be overridden by a more sophisticated config if needed in future
+    default_vocab_size_cli = 32000
+    if args.vocab_size:
+        default_vocab_size_cli = args.vocab_size
+
     model = create_apertis_model(
-        model_size=args.size,
+        target_param_count=args.target_params, # Use target_params
+        vocab_size_override=default_vocab_size_cli,
         multimodal=args.multimodal,
         use_flash_attention=args.flash_attention,
         use_expert_system=args.expert_system,
+        # CLI could expose more overrides like num_experts_target_override if needed
     )
     
     # Create output directory
@@ -136,10 +143,24 @@ def create_model_command(args):
             json.dump(minimal_vocab, f, indent=2)
     
     logger.info(f"Model created successfully at {args.output_dir}")
+
+    actual_params = estimate_model_parameters(model.config)
+    config_details = model.config.to_dict()
+
     print(f"Model created successfully!")
+    print(f"- Target Parameters: {args.target_params}")
+    print(f"- Estimated Actual Parameters: {actual_params:,} (~{actual_params/1e6:.2f}M)")
     print(f"- Model saved to: {model_path}")
     print(f"- Config saved to: {config_path}")
-    print(f"- Minimal vocabulary saved to: {vocab_path}")
+    print(f"  - Hidden Size: {config_details.get('hidden_size')}")
+    print(f"  - Num Layers: {config_details.get('num_hidden_layers')}")
+    print(f"  - Num Heads: {config_details.get('num_attention_heads')}")
+    print(f"  - Intermediate Size: {config_details.get('intermediate_size')}")
+    print(f"  - Vocab Size: {config_details.get('vocab_size')}")
+    if config_details.get('use_expert_system'):
+        print(f"  - Experts: {config_details.get('num_experts')}, Per Token: {config_details.get('experts_per_token')}")
+    print(f"- Minimal vocabulary (for vocab size {model.config.vocab_size}) saved to: {vocab_path}")
+
 
 def create_config_command(args):
     """Handle the create-config command."""
@@ -186,12 +207,13 @@ def main():
     train_parser.add_argument("--config", type=str, required=True, help="Path to training configuration file")
     
     # Create model command
-    create_model_parser = subparsers.add_parser("create-model", help="Create a new Apertis model")
-    create_model_parser.add_argument("--size", type=str, default="base", choices=["small", "base", "large"], help="Model size")
+    create_model_parser = subparsers.add_parser("create-model", help="Create a new Apertis model based on target parameter count")
+    create_model_parser.add_argument("--target-params", type=str, default="125M", help="Target parameter count (e.g., 10M, 125M, 1.5B, 7B, 70B)")
+    create_model_parser.add_argument("--vocab-size", type=int, help="Override default vocabulary size for the new model")
     create_model_parser.add_argument("--multimodal", action="store_true", help="Enable multimodal capabilities")
-    create_model_parser.add_argument("--flash-attention", action="store_true", help="Use flash attention")
-    create_model_parser.add_argument("--expert-system", action="store_true", help="Use adaptive expert system")
-    create_model_parser.add_argument("--output-dir", type=str, default="models/new_model", help="Output directory")
+    create_model_parser.add_argument("--flash-attention", action="store_true", help="Use flash attention (if supported by attention type)")
+    create_model_parser.add_argument("--expert-system", action="store_true", help="Use adaptive expert system (MoE)")
+    create_model_parser.add_argument("--output-dir", type=str, default="models/new_param_model", help="Output directory for model files")
     
     # Create config command
     create_config_parser = subparsers.add_parser("create-config", help="Create a sample training configuration")

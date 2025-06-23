@@ -1557,3 +1557,397 @@ def create_apertis_model(
     config = ApertisConfig(**final_config_dict)
     model = ApertisForCausalLM(config)
     return model
+
+# --- New functions for parameter-based scaling ---
+
+def parse_param_count(param_str: Union[str, int]) -> int:
+    """
+    Parses a parameter count string (e.g., "10M", "1.5B") into an integer.
+    Also accepts integers directly.
+    """
+    if isinstance(param_str, int):
+        if param_str < 1_000_000: # Assuming numbers less than 1M are direct counts
+             logger.warning(f"Interpreting direct integer {param_str} as raw parameter count. If you meant millions or billions, use M or B suffix.")
+        return param_str
+
+    s = str(param_str).strip().upper()
+    if not s:
+        raise ValueError("Parameter string cannot be empty.")
+
+    multiplier = 1
+    if s.endswith('K'):
+        multiplier = 1_000
+        s = s[:-1]
+    elif s.endswith('M'):
+        multiplier = 1_000_000
+        s = s[:-1]
+    elif s.endswith('B'):
+        multiplier = 1_000_000_000
+        s = s[:-1]
+
+    try:
+        val = float(s)
+    except ValueError:
+        raise ValueError(f"Invalid numeric value in parameter string: '{param_str}'")
+
+    return int(val * multiplier)
+
+def _calculate_params_for_dims(
+    vocab_size: int, hidden_size: int, num_layers: int, intermediate_size: int,
+    tie_word_embeddings: bool = True, use_expert_system: bool = False, num_experts: int = 0
+) -> int:
+    """Helper to estimate parameters for given dimensions."""
+    params = 0
+    # Embeddings
+    params += vocab_size * hidden_size
+    if not tie_word_embeddings: # LM head
+        params += vocab_size * hidden_size
+
+    # Attention blocks (Q,K,V,O projections per layer)
+    params += num_layers * (4 * hidden_size * hidden_size)
+
+    # FFN blocks
+    if use_expert_system and num_experts > 0:
+        # Each expert has a standard FFN structure
+        ffn_params_per_expert = 2 * hidden_size * intermediate_size # (up_proj + down_proj)
+        params += num_layers * num_experts * ffn_params_per_expert
+        # Router parameters (simplified: one linear layer per FFN block)
+        params += num_layers * (hidden_size * num_experts)
+    else:
+        params += num_layers * (2 * hidden_size * intermediate_size) # (up_proj + down_proj)
+
+    # LayerNorms (approx, simplified: 2 per layer: attn pre-norm, ffn pre-norm) + final norm
+    # Each LayerNorm has 2*hidden_size params (weight + bias)
+    params += (2 * num_layers + 1) * (2 * hidden_size)
+
+    return params
+
+def calculate_model_dimensions(
+    target_params_str: Union[str, int],
+    vocab_size: int,
+    use_expert_system: bool = False,
+    num_experts_target: int = 8, # Desired number of experts if MoE
+    # experts_per_token_target: int = 2, # Not directly used in param count, but good for config
+    min_hidden_size: int = 256,
+    max_hidden_size: int = 8192, # Max practical hidden size to search
+    min_layers: int = 2,
+    max_layers: int = 128, # Max practical layers
+    head_dim_preference: int = 64,
+    intermediate_multiple_of: int = 256, # For FFN intermediate size, often multiple of 256
+    intermediate_ratio: float = 4.0, # Standard ratio for FFN intermediate size
+    tie_word_embeddings: bool = True,
+) -> Dict[str, Any]:
+    """
+    Calculates model dimensions (hidden_size, num_hidden_layers, num_attention_heads, intermediate_size)
+    to approximately match a target parameter count.
+    Prioritizes finding a suitable hidden_size and num_layers.
+    """
+    target_params = parse_param_count(target_params_str)
+    if not (10_000_000 <= target_params <= 70_000_000_000):
+        logger.warning(f"Target parameters {target_params_str} ({target_params}) is outside the typical 10M-70B range. Results may be suboptimal.")
+
+    best_config = None
+    min_diff = float('inf')
+
+    # Heuristic: Start with a reasonable hidden_size and adjust layers, then vice-versa
+    # This is a simplified search. More sophisticated methods (e.g., geometric progression for h, L) could be used.
+
+    # Iterate through potential number of layers
+    for l in range(min_layers, max_layers + 1, 2): # Iterate layers by steps of 2 for smoother scaling
+        # Estimate hidden_size needed for this many layers
+        # Simplified formula: P_core = 12*L*h^2 for non-MoE, P_core_moe = L * (4h^2 + E * 8h^2) for MoE
+        # P_approx = P_core + 2*V*h (embeddings)
+        # For non-MoE: target_params - 2*V*h_est ~ 12*L*h^2 => h ~ sqrt((target_params - 2*V*h_est) / (12*L))
+        # For MoE: target_params - 2*V*h_est ~ L*(4*h^2 + E*intermediate_ratio*h*hidden_size)
+        # This becomes complex to solve directly for h. Iterative approach is better.
+
+        # Iterate through potential hidden sizes (multiples of head_dim_preference or some step)
+        current_h = min_hidden_size
+        while current_h <= max_hidden_size:
+            h = current_h
+
+            # Ensure h is multiple of some sensible value, e.g., 64 or head_dim_preference
+            # And also ensure num_attention_heads can be derived cleanly
+            if h % head_dim_preference != 0:
+                h = ((h // head_dim_preference) + 1) * head_dim_preference
+            if h == 0 : h = head_dim_preference # Avoid h=0
+            if h > max_hidden_size: break
+
+
+            num_attention_heads = h // head_dim_preference
+            if num_attention_heads == 0: num_attention_heads = 1 # Ensure at least 1 head
+            if h % num_attention_heads != 0: # Should not happen if h is multiple of head_dim_preference
+                h = num_attention_heads * head_dim_preference # Adjust h to be divisible
+
+            intermediate_size_raw = int(h * intermediate_ratio)
+            # Make intermediate_size a multiple of `intermediate_multiple_of`
+            intermediate_size = ((intermediate_size_raw + intermediate_multiple_of -1) // intermediate_multiple_of) * intermediate_multiple_of
+            if intermediate_size == 0 : intermediate_size = intermediate_multiple_of
+
+
+            current_params = _calculate_params_for_dims(
+                vocab_size, h, l, intermediate_size,
+                tie_word_embeddings, use_expert_system, num_experts_target if use_expert_system else 0
+            )
+
+            diff = abs(current_params - target_params)
+
+            if diff < min_diff:
+                min_diff = diff
+                best_config = {
+                    "hidden_size": h,
+                    "num_hidden_layers": l,
+                    "num_attention_heads": num_attention_heads,
+                    "intermediate_size": intermediate_size,
+                    "calculated_params": current_params,
+                    "target_params": target_params,
+                    "param_diff": diff
+                }
+
+            # Heuristic to step hidden_size:
+            # If current_params < target_params, we need to increase h.
+            # If current_params > target_params, we might have overshot for this L, try next L or break.
+            if current_params > target_params and diff > min_diff: # If we're over and getting worse
+                 break # Stop increasing h for this L, as it will only get further
+
+            # Step hidden_size. Make step larger for larger h.
+            step_h = max(head_dim_preference, h // 16)
+            current_h += step_h
+            if current_h > max_hidden_size and best_config is None: # Ensure we try at least one max_hidden_size
+                current_h = max_hidden_size
+
+
+    if not best_config:
+        # Fallback: if no config found (e.g., target_params too small/large for constraints)
+        # Try to generate a small default config
+        logger.warning(f"Could not find a good configuration for {target_params_str}. Using a fallback small config.")
+        h = min_hidden_size
+        l_fallback = min_layers
+        num_attention_heads_fallback = max(1, h // head_dim_preference)
+        intermediate_size_fallback = int(h * intermediate_ratio)
+        intermediate_size_fallback = ((intermediate_size_fallback + intermediate_multiple_of -1) // intermediate_multiple_of) * intermediate_multiple_of
+        calculated_fallback_params = _calculate_params_for_dims(
+            vocab_size, h, l_fallback, intermediate_size_fallback,
+            tie_word_embeddings, use_expert_system, num_experts_target if use_expert_system else 0
+        )
+        return {
+            "hidden_size": h,
+            "num_hidden_layers": l_fallback,
+            "num_attention_heads": num_attention_heads_fallback,
+            "intermediate_size": intermediate_size_fallback,
+            "calculated_params": calculated_fallback_params,
+            "target_params": target_params,
+            "param_diff": abs(calculated_fallback_params - target_params),
+            "備考": "Fallback configuration"
+        }
+
+    logger.info(f"Calculated dimensions for target ~{target_params/1e6:.2f}M params: "
+                f"H={best_config['hidden_size']}, L={best_config['num_hidden_layers']}, A={best_config['num_attention_heads']}, I={best_config['intermediate_size']}. "
+                f"Resulted in {best_config['calculated_params']/1e6:.2f}M params (Diff: {best_config['param_diff']}).")
+    return best_config
+
+def estimate_model_parameters(config: ApertisConfig) -> int:
+    """
+    Estimates the total number of parameters in an Apertis model given its configuration.
+    """
+    # Embedding parameters
+    embedding_params = config.vocab_size * config.hidden_size
+
+    # LM head parameters (if not tied)
+    lm_head_params = 0
+    if not config.tie_word_embeddings:
+        lm_head_params = config.vocab_size * config.hidden_size
+
+    # Transformer layer parameters
+    layer_params = 0
+    # Attention sublayer
+    # Q, K, V projections: 3 * hidden_size * hidden_size
+    # Output projection: hidden_size * hidden_size
+    attention_params_per_layer = 4 * config.hidden_size * config.hidden_size
+
+    # Feed-forward sublayer
+    ffn_params_per_layer = 0
+    if config.use_expert_system and config.num_experts > 0:
+        # Each expert has its own FFN weights
+        ffn_params_one_expert = 2 * config.hidden_size * config.intermediate_size # up_proj + down_proj
+        ffn_params_per_layer = config.num_experts * ffn_params_one_expert
+        # Add router parameters: hidden_size * num_experts for the linear layer in router
+        ffn_params_per_layer += config.hidden_size * config.num_experts
+    else:
+        ffn_params_per_layer = 2 * config.hidden_size * config.intermediate_size # up_proj + down_proj
+
+    layer_params = config.num_hidden_layers * (attention_params_per_layer + ffn_params_per_layer)
+
+    # LayerNorm parameters (approximate)
+    # Each LayerNorm has 2 * hidden_size parameters (weight and bias)
+    # Typically 2 LayerNorms per transformer layer (before attention, before FFN)
+    # Plus one final LayerNorm after all layers.
+    layernorm_params = (2 * config.num_hidden_layers + 1) * (2 * config.hidden_size)
+
+    # Absolute position embeddings (if used)
+    abs_pos_params = 0
+    if config.position_embedding_type == "absolute":
+        abs_pos_params = config.max_position_embeddings * config.hidden_size
+
+    # Multimodal parameters (simplified, as UnifiedMultimodalEncoder can be complex)
+    # This is a rough estimate, true calculation would need to inspect multimodal_encoder internals.
+    multimodal_params = 0
+    if config.multimodal:
+        # Vision projection layer
+        if config.vision_embed_dim != config.hidden_size:
+            multimodal_params += config.vision_embed_dim * config.hidden_size # Linear projection
+        # A rough estimate for a small vision tower or adapter.
+        # This is highly dependent on the actual vision_layers, vision_heads etc.
+        # For simplicity, let's add a placeholder amount or assume it's part of vision_embed_dim complexity.
+        # A more accurate count would require instantiating UnifiedMultimodalEncoder or knowing its formula.
+        # Placeholder: e.g., 50M for a typical ViT adapter.
+        # For now, this part is an underestimation if a large vision model is part of the encoder.
+        # The current UnifiedMultimodalEncoder in the provided code doesn't seem to have its own large backbone.
+        # It seems to imply pixel_values are already embeddings from a vision model.
+        # If UnifiedMultimodalEncoder itself contains a ViT:
+        # Roughly: vision_layers * (4 * vision_embed_dim^2 (attn) + 2 * vision_embed_dim * (4*vision_embed_dim) (FFN))
+        # This part is complex and depends on the specifics of UnifiedMultimodalEncoder.
+        # The current `UnifiedMultimodalEncoder` is not defined in `core.py`, so we assume it's a simple projector or adapter.
+        pass
+
+
+    total_params = (
+        embedding_params + lm_head_params + layer_params + layernorm_params +
+        abs_pos_params + multimodal_params
+    )
+
+    return total_params
+
+# --- End of new functions ---
+
+def create_apertis_model(
+    target_param_count: Union[str, int] = "125M", # Changed from model_size
+    vocab_size_override: Optional[int] = None,
+    multimodal: bool = False,
+    use_flash_attention: bool = False,
+    use_expert_system: bool = False,
+    num_experts_target_override: Optional[int] = None, # Allow overriding calculated/default num_experts
+    experts_per_token_target_override: Optional[int] = None,
+    attention_type_override: Optional[str] = None,
+    ssm_d_inner: Optional[int] = None,
+    ssm_d_state: int = 16,
+    ssm_dt_rank: Union[int, str] = "auto",
+    ssm_conv_kernel: int = 4,
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> ApertisForCausalLM:
+    # model_configs_presets = { # This is now replaced by calculation
+    #     "small": {"hidden_size": 512, "num_hidden_layers": 8, "num_attention_heads": 8, "intermediate_size": 2048},
+    #     "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072},
+    #     "large": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "intermediate_size": 4096},
+    # }
+    # if model_size not in model_configs_presets: # Remove this check
+    #     raise ValueError(f"Unsupported model_size: {model_size}. Choose from {list(model_configs_presets.keys())}")
+
+    # final_config_dict = model_configs_presets[model_size].copy() # Replace this
+
+    # Determine vocab_size: override > config_overrides > default
+    # The default ApertisConfig vocab_size is 32000.
+    # We need a vocab_size to pass to calculate_model_dimensions.
+    # If config_overrides has vocab_size, use that. Otherwise, use default.
+    # vocab_size_override will be applied *after* calculation if provided.
+
+    temp_config_for_vocab = ApertisConfig(**(config_overrides or {}))
+    vocab_size_for_calculation = temp_config_for_vocab.vocab_size
+    if vocab_size_override is not None: # If override is present, it's the final truth for calculation too.
+        vocab_size_for_calculation = vocab_size_override
+
+    calculated_dims = calculate_model_dimensions(
+        target_params_str=target_param_count,
+        vocab_size=vocab_size_for_calculation, # Use a sensible default or allow override
+        use_expert_system=use_expert_system,
+        num_experts_target=num_experts_target_override if num_experts_target_override is not None else 8, # Default if MoE
+    )
+
+    final_config_dict = {
+        "hidden_size": calculated_dims["hidden_size"],
+        "num_hidden_layers": calculated_dims["num_hidden_layers"],
+        "num_attention_heads": calculated_dims["num_attention_heads"],
+        "intermediate_size": calculated_dims["intermediate_size"],
+    }
+    logger.info(f"Target parameters: {target_param_count}. Calculated config: {final_config_dict}")
+    logger.info(f"Smart calculator estimated: {calculated_dims.get('calculated_params', 'N/A')} params "
+                f"(diff: {calculated_dims.get('param_diff', 'N/A')})")
+
+    if vocab_size_override is not None:
+        final_config_dict["vocab_size"] = vocab_size_override
+    elif "vocab_size" not in final_config_dict: # Ensure vocab_size is set
+        final_config_dict["vocab_size"] = vocab_size_for_calculation
+
+    if attention_type_override is not None:
+        final_config_dict["attention_type"] = attention_type_override
+    else:
+        final_config_dict.setdefault("attention_type", "standard_mha")
+
+    final_config_dict.update({
+        "multimodal": multimodal,
+        "use_flash_attention": use_flash_attention, # This will be passed to ApertisConfig
+        "use_expert_system": use_expert_system,
+        # If use_expert_system is true, num_experts and experts_per_token should be set.
+        # ApertisConfig has defaults (8, 2). We can override them here if needed.
+        "ssm_d_inner": ssm_d_inner,
+        "ssm_d_state": ssm_d_state,
+        "ssm_dt_rank": ssm_dt_rank,
+        "ssm_conv_kernel": ssm_conv_kernel,
+    })
+
+    if use_expert_system:
+        if num_experts_target_override is not None:
+            final_config_dict["num_experts"] = num_experts_target_override
+        else: # use default from ApertisConfig or what was used in calculation
+            final_config_dict.setdefault("num_experts", calculated_dims.get("num_experts", 8))
+
+        if experts_per_token_target_override is not None:
+            final_config_dict["experts_per_token"] = experts_per_token_target_override
+        else:
+            final_config_dict.setdefault("experts_per_token", calculated_dims.get("experts_per_token", 2))
+
+
+    if config_overrides:
+        # Config_overrides should take precedence over calculated dimensions if there's a conflict,
+        # but calculated dimensions form the base.
+        base_calculated_config = final_config_dict.copy()
+        base_calculated_config.update(config_overrides) # User overrides can trump calculated ones
+        final_config_dict = base_calculated_config
+
+    # Ensure hidden_size is divisible by num_attention_heads after all overrides
+    if final_config_dict["hidden_size"] % final_config_dict["num_attention_heads"] != 0:
+        logger.warning(
+            f"Final hidden_size {final_config_dict['hidden_size']} not divisible by "
+            f"num_attention_heads {final_config_dict['num_attention_heads']}. "
+            f"Adjusting num_attention_heads for divisibility by trying factors or setting to 1."
+        )
+        h_final = final_config_dict["hidden_size"]
+        current_heads = final_config_dict["num_attention_heads"]
+
+        # Try to maintain head_dim if possible, by adjusting heads to make h_final divisible
+        preferred_head_dim = h_final // current_heads if current_heads > 0 else 64 # Estimate original target head_dim
+        if preferred_head_dim == 0: preferred_head_dim = 64
+
+        if h_final % preferred_head_dim == 0 and h_final // preferred_head_dim > 0 :
+            final_config_dict["num_attention_heads"] = h_final // preferred_head_dim
+        else: # Fallback: find largest factor or set to 1
+            found_factor = False
+            for i in range(min(current_heads, h_final), 0, -1):
+                if h_final % i == 0:
+                    final_config_dict["num_attention_heads"] = i
+                    found_factor = True
+                    break
+            if not found_factor:
+                 final_config_dict["num_attention_heads"] = 1
+        logger.info(f"Adjusted num_attention_heads to {final_config_dict['num_attention_heads']}")
+
+
+    config = ApertisConfig(**final_config_dict)
+
+    # Log the actual parameters of the configured model
+    actual_params = estimate_model_parameters(config)
+    logger.info(f"Model configured with H={config.hidden_size}, L={config.num_hidden_layers}, A={config.num_attention_heads}, I={config.intermediate_size}, V={config.vocab_size}.")
+    logger.info(f"Estimated actual parameters for this configuration: {actual_params/1e6:.2f}M. Target was ~{parse_param_count(target_param_count)/1e6:.2f}M.")
+
+    model = ApertisForCausalLM(config)
+    return model
