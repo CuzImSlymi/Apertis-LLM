@@ -843,15 +843,9 @@ class ApertisFeedForward(nn.Module):
         dropped_ffn_out = self.output_dropout(ffn_out)
         final_ffn_output = dropped_ffn_out + residual
 
-        if self.config.use_expert_system and isinstance(self.ffn, AdaptiveExpertSystem):
-            return final_ffn_output, total_lb_loss, total_rz_loss
-        else:
-            # To maintain a consistent return type for ApertisLayer for now,
-            # return zero losses if not using expert system.
-            # This will be handled more cleanly when ApertisLayer expects these.
-            return final_ffn_output # ApertisLayer will be updated to expect 3 values next
-            # Actually, let's make it always return 3 values for consistency in ApertisLayer
-            # return final_ffn_output, total_lb_loss, total_rz_loss # Consistent return
+        # Always return three values.
+        # total_lb_loss and total_rz_loss are correctly 0.0 if not updated by a real expert system call.
+        return final_ffn_output, total_lb_loss, total_rz_loss
 
 class ApertisLayer(nn.Module):
     def __init__(self, config: ApertisConfig):
