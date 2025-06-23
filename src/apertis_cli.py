@@ -109,18 +109,37 @@ def create_model_command(args):
     
     # Create model
     logger.info(f"Creating model with target parameters: {args.target_params} (multimodal: {args.multimodal})")
-    # Default vocab size for CLI creation, can be overridden by a more sophisticated config if needed in future
-    default_vocab_size_cli = 32000
-    if args.vocab_size:
-        default_vocab_size_cli = args.vocab_size
+
+    default_vocab_size_cli = args.vocab_size if args.vocab_size is not None else 32000
+
+    config_overrides = {}
+    if args.expert_system:
+        config_overrides["num_experts"] = args.num_experts
+        config_overrides["experts_per_token"] = args.experts_per_token
+        config_overrides["load_balancing_loss_coef"] = args.load_balancing_loss_coef
+        config_overrides["expert_capacity_factor"] = args.expert_capacity_factor
+        config_overrides["noisy_routing_alpha"] = args.noisy_routing_alpha
+        config_overrides["expert_dropout_prob"] = args.expert_dropout_prob
+        config_overrides["router_z_loss_coef"] = args.router_z_loss_coef
+        config_overrides["use_noisy_top_k_routing"] = args.use_noisy_top_k_routing
+        config_overrides["use_expert_capacity_limit"] = args.use_expert_capacity_limit
+        config_overrides["use_expert_dropout"] = args.use_expert_dropout
+        config_overrides["use_router_z_loss"] = args.use_router_z_loss
+        config_overrides["use_load_balancing_loss"] = args.use_load_balancing_loss
+        # Ensure experts_per_token is not greater than num_experts if both are provided
+        if "num_experts" in config_overrides and "experts_per_token" in config_overrides:
+            if config_overrides["experts_per_token"] > config_overrides["num_experts"]:
+                logger.warning(f"Experts per token ({config_overrides['experts_per_token']}) > num_experts ({config_overrides['num_experts']}). Clamping experts_per_token.")
+                config_overrides["experts_per_token"] = config_overrides["num_experts"]
+
 
     model = create_apertis_model(
-        target_param_count=args.target_params, # Use target_params
+        target_param_count=args.target_params,
         vocab_size_override=default_vocab_size_cli,
         multimodal=args.multimodal,
         use_flash_attention=args.flash_attention,
         use_expert_system=args.expert_system,
-        # CLI could expose more overrides like num_experts_target_override if needed
+        config_overrides=config_overrides
     )
     
     # Create output directory
@@ -212,9 +231,24 @@ def main():
     create_model_parser.add_argument("--vocab-size", type=int, help="Override default vocabulary size for the new model")
     create_model_parser.add_argument("--multimodal", action="store_true", help="Enable multimodal capabilities")
     create_model_parser.add_argument("--flash-attention", action="store_true", help="Use flash attention (if supported by attention type)")
-    create_model_parser.add_argument("--expert-system", action="store_true", help="Use adaptive expert system (MoE)")
     create_model_parser.add_argument("--output-dir", type=str, default="models/new_param_model", help="Output directory for model files")
-    
+
+    # MoE specific arguments for create-model
+    moe_group = create_model_parser.add_argument_group('MoE Configuration (used if --expert-system is specified)')
+    moe_group.add_argument("--expert-system", action="store_true", help="Use adaptive expert system (MoE)")
+    moe_group.add_argument("--num-experts", type=int, default=8, help="Number of experts")
+    moe_group.add_argument("--experts-per-token", type=int, default=2, help="Number of experts to route each token to (top-k)")
+    moe_group.add_argument("--load-balancing-loss-coef", type=float, default=0.01, help="Coefficient for MoE load balancing loss")
+    moe_group.add_argument("--expert-capacity-factor", type=float, default=1.25, help="Capacity factor for experts")
+    moe_group.add_argument("--noisy-routing-alpha", type=float, default=0.1, help="Alpha for noisy routing")
+    moe_group.add_argument("--expert-dropout-prob", type=float, default=0.1, help="Dropout probability for entire experts")
+    moe_group.add_argument("--router-z-loss-coef", type=float, default=0.001, help="Coefficient for router z-loss")
+    moe_group.add_argument("--use-noisy-top-k-routing", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable noisy top-k routing (True/False)")
+    moe_group.add_argument("--use-expert-capacity-limit", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable expert capacity limits (True/False)")
+    moe_group.add_argument("--use-expert-dropout", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable expert dropout (True/False)")
+    moe_group.add_argument("--use-router-z-loss", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable router z-loss (True/False)")
+    moe_group.add_argument("--use-load-balancing-loss", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable load balancing loss (True/False)")
+
     # Create config command
     create_config_parser = subparsers.add_parser("create-config", help="Create a sample training configuration")
     create_config_parser.add_argument("--output", type=str, default="config.json", help="Output file path")
