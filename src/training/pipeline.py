@@ -1005,12 +1005,24 @@ def create_sample_config(output_path: str):
             "attention_type": "standard_mha", # Options: "standard_mha", "selective_ssm"
             "use_flash_attention": False, # Set to true to try using FlashAttention for "standard_mha"
             "multimodal": False,
-            "use_expert_system": False,
-            "num_experts": 8, # Used if use_expert_system is True
-            "experts_per_token": 2, # Used if use_expert_system is True
+            # MoE specific configurations
+            "use_expert_system": False, # Master switch for MoE
+            "num_experts": 8,
+            "experts_per_token": 2,
+            "load_balancing_loss_coef": 0.01,
+            "expert_capacity_factor": 1.25,
+            "noisy_routing_alpha": 0.1,
+            "expert_dropout_prob": 0.1, # For dropping entire experts
+            "router_z_loss_coef": 0.001,
+            "use_noisy_top_k_routing": True,
+            "use_expert_capacity_limit": True,
+            "use_expert_dropout": True, # For dropping entire experts
+            "use_router_z_loss": True,
+            "use_load_balancing_loss": True,
             # "config_overrides": { # Optional: Directly override specific ApertisConfig values AFTER parameter-based calculation
-            #    "hidden_size": 768, 
-            #    "num_hidden_layers": 12
+            #    "hidden_size": 768,
+            #    "num_hidden_layers": 12,
+            #    "intermediate_size": 3072, # Can be overridden for experts if not using global FFN intermediate
             # }
             # Other ApertisConfig params can be added here to override defaults for new models
             # e.g., "vocab_size", "max_position_embeddings"

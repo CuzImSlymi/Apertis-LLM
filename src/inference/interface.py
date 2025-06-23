@@ -580,7 +580,21 @@ class ApertisInterface:
                             flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                             multimodal_train_cb = gr.Checkbox(label="Multimodal")
                             expert_sys_train_cb = gr.Checkbox(label="Use Expert System")
-                            num_experts_train_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts", visible=False)
+
+                            with gr.Group(visible=False) as train_moe_options_group:
+                                gr.Markdown("### MoE Configuration (Pre-training)")
+                                num_experts_train_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts")
+                                experts_per_token_train_sl = gr.Number(value=2, minimum=1, maximum=8, precision=0, label="Experts Per Token (Top-K)")
+                                load_balancing_loss_coef_train_sl = gr.Slider(0.0, 0.1, value=0.01, step=0.001, label="Load Balancing Loss Coef")
+                                expert_capacity_factor_train_sl = gr.Slider(1.0, 3.0, value=1.25, step=0.05, label="Expert Capacity Factor")
+                                noisy_routing_alpha_train_sl = gr.Slider(0.0, 1.0, value=0.1, step=0.01, label="Noisy Routing Alpha")
+                                expert_dropout_prob_train_sl = gr.Slider(0.0, 0.5, value=0.1, step=0.01, label="Expert Dropout Probability")
+                                router_z_loss_coef_train_sl = gr.Slider(0.0, 0.01, value=0.001, step=0.0001, label="Router Z-Loss Coef")
+                                use_noisy_top_k_routing_train_cb = gr.Checkbox(value=True, label="Use Noisy Top-K Routing")
+                                use_expert_capacity_limit_train_cb = gr.Checkbox(value=True, label="Use Expert Capacity Limit")
+                                use_expert_dropout_train_cb = gr.Checkbox(value=True, label="Use Expert Dropout")
+                                use_router_z_loss_train_cb = gr.Checkbox(value=True, label="Use Router Z-Loss")
+                                use_load_balancing_loss_train_cb = gr.Checkbox(value=True, label="Use Load Balancing Loss")
 
                             def _toggle_flash_attn_visibility_train(attn_type_val):
                                 if attn_type_val == "standard_mha":
@@ -588,9 +602,7 @@ class ApertisInterface:
                                 return gr.update(visible=False, value=False)
                             attn_type_train_dd.change(_toggle_flash_attn_visibility_train, inputs=[attn_type_train_dd], outputs=[flash_attn_train_cb])
 
-                            def _toggle_num_experts_visibility_train(expert_sys_enabled):
-                                return gr.update(visible=expert_sys_enabled)
-                            expert_sys_train_cb.change(_toggle_num_experts_visibility_train, inputs=[expert_sys_train_cb], outputs=[num_experts_train_sl])
+                            expert_sys_train_cb.change(lambda x: gr.update(visible=x), inputs=[expert_sys_train_cb], outputs=[train_moe_options_group])
 
                             gr.Markdown("## Data (Pre-training)")
                             train_file_up = gr.File(label="Train Data (JSONL, field: 'text')", file_types=[".jsonl"])
@@ -766,17 +778,33 @@ class ApertisInterface:
                             new_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             new_multimodal_cb = gr.Checkbox(label="Multimodal")
                             new_expert_cb = gr.Checkbox(label="Use Expert System")
-                            new_num_experts_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts (if enabled)", visible=False)
+
+                            # MoE specific parameters for "Create New Model" tab
+                            with gr.Group(visible=False) as new_moe_options_group:
+                                gr.Markdown("### MoE Configuration")
+                                new_num_experts_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts")
+                                new_experts_per_token_sl = gr.Number(value=2, minimum=1, maximum=8, precision=0, label="Experts Per Token (Top-K)")
+                                new_load_balancing_loss_coef_sl = gr.Slider(0.0, 0.1, value=0.01, step=0.001, label="Load Balancing Loss Coef")
+                                new_expert_capacity_factor_sl = gr.Slider(1.0, 3.0, value=1.25, step=0.05, label="Expert Capacity Factor")
+                                new_noisy_routing_alpha_sl = gr.Slider(0.0, 1.0, value=0.1, step=0.01, label="Noisy Routing Alpha")
+                                new_expert_dropout_prob_sl = gr.Slider(0.0, 0.5, value=0.1, step=0.01, label="Expert Dropout Probability")
+                                new_router_z_loss_coef_sl = gr.Slider(0.0, 0.01, value=0.001, step=0.0001, label="Router Z-Loss Coef")
+                                new_use_noisy_top_k_routing_cb = gr.Checkbox(value=True, label="Use Noisy Top-K Routing")
+                                new_use_expert_capacity_limit_cb = gr.Checkbox(value=True, label="Use Expert Capacity Limit")
+                                new_use_expert_dropout_cb = gr.Checkbox(value=True, label="Use Expert Dropout")
+                                new_use_router_z_loss_cb = gr.Checkbox(value=True, label="Use Router Z-Loss")
+                                new_use_load_balancing_loss_cb = gr.Checkbox(value=True, label="Use Load Balancing Loss")
+
                             new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                             new_vocab_size_num = gr.Number(32000, label="Vocab Size (for manual vocab)", precision=0)
                             new_model_out_tb = gr.Textbox("models/new_apertis_model", label="Save Path for New Model Files")
                             create_model_btn_ui = gr.Button("Create & Save New Model Files")
-                            create_model_status_tb = gr.Textbox(label="Creation Status", interactive=False, lines=5) # Increased lines
+            create_model_status_tb = gr.Textbox(label="Creation Status", interactive=False, lines=5)
 
             def _toggle_flash_attn_visibility_new_model(attn_type_val):
                 if attn_type_val == "standard_mha":
                     return gr.update(visible=True)
-                return gr.update(visible=False, value=False) # Hide and reset to False
+                return gr.update(visible=False, value=False)
 
             new_attn_type_dd.change(
                 _toggle_flash_attn_visibility_new_model,
@@ -784,9 +812,9 @@ class ApertisInterface:
                 outputs=[new_flash_attn_cb]
             )
 
-            def _toggle_num_experts_visibility_new_model(expert_sys_enabled):
-                return gr.update(visible=expert_sys_enabled)
-            new_expert_cb.change(_toggle_num_experts_visibility_new_model, inputs=[new_expert_cb], outputs=[new_num_experts_sl])
+            # Visibility for MoE options group in "Create New Model" tab
+            new_expert_cb.change(lambda x: gr.update(visible=x), inputs=[new_expert_cb], outputs=[new_moe_options_group])
+
 
             def ui_chat_handler(msg, img, max_new, temp, tk, tp, hist):
                 if not self.model:
@@ -824,8 +852,6 @@ class ApertisInterface:
             def ui_load_model_handler(m_path_ui, v_path_override_ui):
                 if not m_path_ui:
                     return "Please provide a model path or name."
-                # Note: Loading an existing model will use the 'use_flash_attention' from its config.json.
-                # There's no UI override here for existing models' flash attention setting during load.
                 self.load_model_and_tokenizer_from_path(m_path_ui, v_path_override_ui if v_path_override_ui else None)
                 
                 info_parts = [f"Attempted to load model using input path/name: {m_path_ui}"]
@@ -838,7 +864,10 @@ class ApertisInterface:
                         "hidden_size": cfg_dict.get("hidden_size"), "num_hidden_layers": cfg_dict.get("num_hidden_layers"),
                         "num_attention_heads": cfg_dict.get("num_attention_heads"), "intermediate_size": cfg_dict.get("intermediate_size"),
                         "multimodal": cfg_dict.get("multimodal"), "attention_type": cfg_dict.get("attention_type"),
-                        "use_expert_system": cfg_dict.get("use_expert_system"), "num_experts": cfg_dict.get("num_experts"),
+                        "use_expert_system": cfg_dict.get("use_expert_system"),
+                        "num_experts": cfg_dict.get("num_experts"),
+                        "experts_per_token": cfg_dict.get("experts_per_token"),
+                        # Add other MoE params if desired for display
                         "pad_token_id":cfg_dict.get("pad_token_id"), "bos_token_id":cfg_dict.get("bos_token_id"),
                         "eos_token_id":cfg_dict.get("eos_token_id"), "unk_token_id":cfg_dict.get("unk_token_id"),
                     }
@@ -863,41 +892,70 @@ class ApertisInterface:
 
             load_model_btn_ui.click(ui_load_model_handler, [model_path_load_tb, vocab_path_load_tb], [model_info_load_tb])
 
-            def ui_create_model_handler(param_count_str_ui, attn_type_ui, multi_ui, expert_ui, num_experts_ui, flash_attn_ui, v_size_ui, out_path_ui):
+            def ui_create_model_handler(
+                param_count_str_ui, attn_type_ui, multi_ui, expert_ui,
+                num_experts_ui, experts_per_token_ui, load_balancing_loss_coef_ui, expert_capacity_factor_ui,
+                noisy_routing_alpha_ui, expert_dropout_prob_ui, router_z_loss_coef_ui,
+                use_noisy_top_k_routing_ui, use_expert_capacity_limit_ui, use_expert_dropout_ui,
+                use_router_z_loss_ui, use_load_balancing_loss_ui,
+                flash_attn_ui, v_size_ui, out_path_ui
+            ):
                 try:
                     if not out_path_ui: return "Output path for new model files is required."
                     if not param_count_str_ui: return "Target parameter count is required."
 
                     v_size_int = int(v_size_ui) if v_size_ui is not None else 32000
-                    
                     effective_flash_attn = flash_attn_ui if attn_type_ui == "standard_mha" else False
                     
-                    num_experts_val = None
-                    if expert_ui: # Only pass num_experts if expert system is enabled
-                        num_experts_val = int(num_experts_ui) if num_experts_ui is not None else 8 # Default to 8 if not provided by UI for some reason
+                    config_overrides = {}
+                    if expert_ui:
+                        num_experts_val = int(num_experts_ui) if num_experts_ui is not None else 8
                         if not (1 <= num_experts_val <= 64):
                             return "Number of experts must be between 1 and 64."
+                        config_overrides["num_experts"] = num_experts_val
+                        config_overrides["experts_per_token"] = int(experts_per_token_ui) if experts_per_token_ui is not None else 2
+                        config_overrides["load_balancing_loss_coef"] = float(load_balancing_loss_coef_ui)
+                        config_overrides["expert_capacity_factor"] = float(expert_capacity_factor_ui)
+                        config_overrides["noisy_routing_alpha"] = float(noisy_routing_alpha_ui)
+                        config_overrides["expert_dropout_prob"] = float(expert_dropout_prob_ui)
+                        config_overrides["router_z_loss_coef"] = float(router_z_loss_coef_ui)
+                        config_overrides["use_noisy_top_k_routing"] = bool(use_noisy_top_k_routing_ui)
+                        config_overrides["use_expert_capacity_limit"] = bool(use_expert_capacity_limit_ui)
+                        config_overrides["use_expert_dropout"] = bool(use_expert_dropout_ui)
+                        config_overrides["use_router_z_loss"] = bool(use_router_z_loss_ui)
+                        config_overrides["use_load_balancing_loss"] = bool(use_load_balancing_loss_ui)
                     
                     new_model_instance = create_apertis_model(
                         target_param_count=param_count_str_ui,
                         vocab_size_override=v_size_int,
                         multimodal=multi_ui,
                         use_expert_system=expert_ui,
-                        num_experts_target_override=num_experts_val, # Pass the validated value
                         attention_type_override=attn_type_ui,
-                        use_flash_attention=effective_flash_attn
+                        use_flash_attention=effective_flash_attn,
+                        config_overrides=config_overrides
                     )
                     new_model_instance.save_pretrained(out_path_ui)
                     
-                    # Estimate and display actual parameters
                     actual_params = estimate_model_parameters(new_model_instance.config)
+                    cfg = new_model_instance.config.to_dict()
                     config_details_str = (
-                        f"  Hidden Size: {new_model_instance.config.hidden_size}\n"
-                        f"  Num Layers: {new_model_instance.config.num_hidden_layers}\n"
-                        f"  Num Heads: {new_model_instance.config.num_attention_heads}\n"
-                        f"  Intermediate Size: {new_model_instance.config.intermediate_size}\n"
-                        f"  Vocab Size: {new_model_instance.config.vocab_size}"
+                        f"  Hidden Size: {cfg['hidden_size']}\n"
+                        f"  Num Layers: {cfg['num_hidden_layers']}\n"
+                        f"  Num Heads: {cfg['num_attention_heads']}\n"
+                        f"  Intermediate Size: {cfg['intermediate_size']}\n"
+                        f"  Vocab Size: {cfg['vocab_size']}"
                     )
+                    if cfg.get('use_expert_system'):
+                        config_details_str += (
+                            f"\n  MoE Config:\n"
+                            f"    Num Experts: {cfg['num_experts']}\n"
+                            f"    Experts Per Token: {cfg['experts_per_token']}\n"
+                            f"    Load Balancing Coef: {cfg['load_balancing_loss_coef']}\n"
+                            f"    Capacity Factor: {cfg['expert_capacity_factor']}\n"
+                            f"    Noisy Routing Alpha: {cfg['noisy_routing_alpha']}\n"
+                            f"    Expert Dropout: {cfg['expert_dropout_prob']}\n"
+                            f"    Router Z-Loss Coef: {cfg['router_z_loss_coef']}"
+                        )
 
                     dummy_vocab_content = {f"<token_{i}>": i for i in range(v_size_int)}
                     default_specials = {
@@ -907,10 +965,8 @@ class ApertisInterface:
                         "<unk>": new_model_instance.config.unk_token_id
                     }
                     for tok_str, tok_id in default_specials.items():
-                        if tok_id < v_size_int:
-                            dummy_vocab_content[tok_str] = tok_id
-                        else:
-                            logger.warning(f"Default special token {tok_str} ID {tok_id} too large for vocab_size {v_size_int}. Not adding to dummy vocab.")
+                        if tok_id < v_size_int: dummy_vocab_content[tok_str] = tok_id
+                        else: logger.warning(f"Default special token {tok_str} ID {tok_id} too large for vocab_size {v_size_int}. Not adding.")
                     
                     with open(os.path.join(out_path_ui, "vocab.json"),"w",encoding="utf-8") as f:
                         json.dump(dummy_vocab_content, f, indent=2)
@@ -924,9 +980,18 @@ class ApertisInterface:
                 except Exception as e:
                     logger.error(f"Error creating model: {e}", exc_info=True)
                     return f"Error: {str(e)}"
-            create_model_btn_ui.click(ui_create_model_handler,
-                                     [new_model_param_count_tb, new_attn_type_dd, new_multimodal_cb, new_expert_cb, new_num_experts_sl, new_flash_attn_cb, new_vocab_size_num, new_model_out_tb],
-                                     [create_model_status_tb])
+            create_model_btn_ui.click(
+                ui_create_model_handler,
+                [
+                    new_model_param_count_tb, new_attn_type_dd, new_multimodal_cb, new_expert_cb,
+                    new_num_experts_sl, new_experts_per_token_sl, new_load_balancing_loss_coef_sl, new_expert_capacity_factor_sl,
+                    new_noisy_routing_alpha_sl, new_expert_dropout_prob_sl, new_router_z_loss_coef_sl,
+                    new_use_noisy_top_k_routing_cb, new_use_expert_capacity_limit_cb, new_use_expert_dropout_cb,
+                    new_use_router_z_loss_cb, new_use_load_balancing_loss_cb,
+                    new_flash_attn_cb, new_vocab_size_num, new_model_out_tb
+                ],
+                [create_model_status_tb]
+            )
 
             def ui_start_training_handler( # This is the old one, will be replaced by _updated version logic
                 m_s, attn_t, m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
@@ -1021,7 +1086,13 @@ class ApertisInterface:
             # This is the new handler.
             def ui_start_training_handler_updated(
                 param_count_str, attn_t, flash_attn_t_cb_val,
-                m_m, exp_s, num_experts_train_val, # Added num_experts_train_val
+                m_m, exp_s,
+                num_experts_train_val, experts_per_token_train_val,
+                load_balancing_loss_coef_train_val, expert_capacity_factor_train_val,
+                noisy_routing_alpha_train_val, expert_dropout_prob_train_val,
+                router_z_loss_coef_train_val, use_noisy_top_k_routing_train_val,
+                use_expert_capacity_limit_train_val, use_expert_dropout_train_val,
+                use_router_z_loss_train_val, use_load_balancing_loss_train_val,
                 tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
 
@@ -1078,7 +1149,17 @@ class ApertisInterface:
                             shutil.rmtree(tmp_dir)
                             return "Number of experts must be between 1 and 64 for pre-training."
                         cfg["model_config"]["num_experts"] = num_experts_to_pass
-                        # experts_per_token will use default from ApertisConfig if not specified
+                        cfg["model_config"]["experts_per_token"] = int(experts_per_token_train_val)
+                        cfg["model_config"]["load_balancing_loss_coef"] = float(load_balancing_loss_coef_train_val)
+                        cfg["model_config"]["expert_capacity_factor"] = float(expert_capacity_factor_train_val)
+                        cfg["model_config"]["noisy_routing_alpha"] = float(noisy_routing_alpha_train_val)
+                        cfg["model_config"]["expert_dropout_prob"] = float(expert_dropout_prob_train_val)
+                        cfg["model_config"]["router_z_loss_coef"] = float(router_z_loss_coef_train_val)
+                        cfg["model_config"]["use_noisy_top_k_routing"] = bool(use_noisy_top_k_routing_train_val)
+                        cfg["model_config"]["use_expert_capacity_limit"] = bool(use_expert_capacity_limit_train_val)
+                        cfg["model_config"]["use_expert_dropout"] = bool(use_expert_dropout_train_val)
+                        cfg["model_config"]["use_router_z_loss"] = bool(use_router_z_loss_train_val)
+                        cfg["model_config"]["use_load_balancing_loss"] = bool(use_load_balancing_loss_train_val)
 
                     cfg_path = os.path.join(tmp_dir, "run_cfg_pretrain.json");
                     with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
@@ -1113,14 +1194,24 @@ class ApertisInterface:
                     return f"Failed to start pre-training: {e_start}"
 
             # Update the click handler to use the new function and pass the new checkbox value
-            start_train_btn.click(ui_start_training_handler_updated,
-                                 [model_param_count_train_tb, attn_type_train_dd, flash_attn_train_cb,
-                                  multimodal_train_cb, expert_sys_train_cb, num_experts_train_sl, # Added num_experts_train_sl
-                                  train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
-                                  batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
-                                  chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
-                                  gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb],
-                                 [train_status_tb])
+            start_train_btn.click(
+                ui_start_training_handler_updated,
+                [
+                    model_param_count_train_tb, attn_type_train_dd, flash_attn_train_cb,
+                    multimodal_train_cb, expert_sys_train_cb,
+                    num_experts_train_sl, experts_per_token_train_sl,
+                    load_balancing_loss_coef_train_sl, expert_capacity_factor_train_sl,
+                    noisy_routing_alpha_train_sl, expert_dropout_prob_train_sl,
+                    router_z_loss_coef_train_sl, use_noisy_top_k_routing_train_cb,
+                    use_expert_capacity_limit_train_cb, use_expert_dropout_train_cb,
+                    use_router_z_loss_train_cb, use_load_balancing_loss_train_cb,
+                    train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
+                    batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
+                    chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
+                    gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb
+                ],
+                [train_status_tb]
+            )
 
 
             def ui_start_finetuning_handler(
