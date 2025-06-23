@@ -580,12 +580,17 @@ class ApertisInterface:
                             flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                             multimodal_train_cb = gr.Checkbox(label="Multimodal")
                             expert_sys_train_cb = gr.Checkbox(label="Use Expert System")
+                            num_experts_train_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts", visible=False)
 
                             def _toggle_flash_attn_visibility_train(attn_type_val):
                                 if attn_type_val == "standard_mha":
                                     return gr.update(visible=True)
                                 return gr.update(visible=False, value=False)
                             attn_type_train_dd.change(_toggle_flash_attn_visibility_train, inputs=[attn_type_train_dd], outputs=[flash_attn_train_cb])
+
+                            def _toggle_num_experts_visibility_train(expert_sys_enabled):
+                                return gr.update(visible=expert_sys_enabled)
+                            expert_sys_train_cb.change(_toggle_num_experts_visibility_train, inputs=[expert_sys_train_cb], outputs=[num_experts_train_sl])
 
                             gr.Markdown("## Data (Pre-training)")
                             train_file_up = gr.File(label="Train Data (JSONL, field: 'text')", file_types=[".jsonl"])
@@ -761,6 +766,7 @@ class ApertisInterface:
                             new_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             new_multimodal_cb = gr.Checkbox(label="Multimodal")
                             new_expert_cb = gr.Checkbox(label="Use Expert System")
+                            new_num_experts_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts (if enabled)", visible=False)
                             new_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=False)
                             new_vocab_size_num = gr.Number(32000, label="Vocab Size (for manual vocab)", precision=0)
                             new_model_out_tb = gr.Textbox("models/new_apertis_model", label="Save Path for New Model Files")
@@ -777,6 +783,10 @@ class ApertisInterface:
                 inputs=[new_attn_type_dd],
                 outputs=[new_flash_attn_cb]
             )
+
+            def _toggle_num_experts_visibility_new_model(expert_sys_enabled):
+                return gr.update(visible=expert_sys_enabled)
+            new_expert_cb.change(_toggle_num_experts_visibility_new_model, inputs=[new_expert_cb], outputs=[new_num_experts_sl])
 
             def ui_chat_handler(msg, img, max_new, temp, tk, tp, hist):
                 if not self.model:
@@ -853,20 +863,27 @@ class ApertisInterface:
 
             load_model_btn_ui.click(ui_load_model_handler, [model_path_load_tb, vocab_path_load_tb], [model_info_load_tb])
 
-            def ui_create_model_handler(param_count_str_ui, attn_type_ui, multi_ui, expert_ui, flash_attn_ui, v_size_ui, out_path_ui): # Changed size_ui to param_count_str_ui
+            def ui_create_model_handler(param_count_str_ui, attn_type_ui, multi_ui, expert_ui, num_experts_ui, flash_attn_ui, v_size_ui, out_path_ui):
                 try:
                     if not out_path_ui: return "Output path for new model files is required."
                     if not param_count_str_ui: return "Target parameter count is required."
 
-                    v_size_int = int(v_size_ui) if v_size_ui is not None else 32000 # Default vocab size if not specified
+                    v_size_int = int(v_size_ui) if v_size_ui is not None else 32000
                     
                     effective_flash_attn = flash_attn_ui if attn_type_ui == "standard_mha" else False
-
+                    
+                    num_experts_val = None
+                    if expert_ui: # Only pass num_experts if expert system is enabled
+                        num_experts_val = int(num_experts_ui) if num_experts_ui is not None else 8 # Default to 8 if not provided by UI for some reason
+                        if not (1 <= num_experts_val <= 64):
+                            return "Number of experts must be between 1 and 64."
+                    
                     new_model_instance = create_apertis_model(
-                        target_param_count=param_count_str_ui, # Use param_count_str_ui
+                        target_param_count=param_count_str_ui,
                         vocab_size_override=v_size_int,
                         multimodal=multi_ui,
                         use_expert_system=expert_ui,
+                        num_experts_target_override=num_experts_val, # Pass the validated value
                         attention_type_override=attn_type_ui,
                         use_flash_attention=effective_flash_attn
                     )
@@ -908,7 +925,7 @@ class ApertisInterface:
                     logger.error(f"Error creating model: {e}", exc_info=True)
                     return f"Error: {str(e)}"
             create_model_btn_ui.click(ui_create_model_handler,
-                                     [new_model_param_count_tb, new_attn_type_dd, new_multimodal_cb, new_expert_cb, new_flash_attn_cb, new_vocab_size_num, new_model_out_tb], # Changed new_model_size_dd
+                                     [new_model_param_count_tb, new_attn_type_dd, new_multimodal_cb, new_expert_cb, new_num_experts_sl, new_flash_attn_cb, new_vocab_size_num, new_model_out_tb],
                                      [create_model_status_tb])
 
             def ui_start_training_handler( # This is the old one, will be replaced by _updated version logic
@@ -1003,12 +1020,13 @@ class ApertisInterface:
             # The old handler ui_start_training_handler and its .click() registration were removed.
             # This is the new handler.
             def ui_start_training_handler_updated(
-                param_count_str, attn_t, flash_attn_t_cb_val, # Changed m_s to param_count_str
-                m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
+                param_count_str, attn_t, flash_attn_t_cb_val,
+                m_m, exp_s, num_experts_train_val, # Added num_experts_train_val
+                tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
 
                 current_status = ""
-                if not param_count_str: current_status += "Target parameter count is required.\n" # Added check
+                if not param_count_str: current_status += "Target parameter count is required.\n"
                 if not tr_f_obj: current_status += "Training data file is required.\n"
                 if not voc_f_std_obj: current_status += "Vocabulary file (.json) is required for pre-training.\n"
                 if m_m and not img_d: current_status += "Image directory is required for multimodal pre-training.\n"
@@ -1035,11 +1053,11 @@ class ApertisInterface:
                         "data_config": {"train_data_path":train_p, "tokenizer_path":vocab_p_std, "val_data_path":val_p,
                                         "max_length":512, "multimodal":m_m, "image_dir":img_d if m_m else None,
                                         "image_size": 224},
-                        "model_config": { # Changed model_size to target_param_count
+                        "model_config": {
                             "target_param_count": param_count_str, "attention_type": attn_t,
                             "use_flash_attention": effective_flash_attn_train,
-                            "multimodal":m_m, "use_expert_system":exp_s
-                            # vocab_size_override can be added here if needed, or handled by training pipeline
+                            "multimodal":m_m, "use_expert_system":exp_s,
+                            # Add num_experts if expert system is enabled
                         },
                         "training_config": {
                             "task_type": "pretrain",
@@ -1053,6 +1071,14 @@ class ApertisInterface:
                             "gpu_ids":sel_gpus, "distributed_training":dist_training_eff, "local_rank": -1
                         }
                     }
+                    
+                    if exp_s: # If expert system is enabled, add num_experts to model_config
+                        num_experts_to_pass = int(num_experts_train_val) if num_experts_train_val is not None else 8
+                        if not (1 <= num_experts_to_pass <= 64):
+                            shutil.rmtree(tmp_dir)
+                            return "Number of experts must be between 1 and 64 for pre-training."
+                        cfg["model_config"]["num_experts"] = num_experts_to_pass
+                        # experts_per_token will use default from ApertisConfig if not specified
 
                     cfg_path = os.path.join(tmp_dir, "run_cfg_pretrain.json");
                     with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
@@ -1087,9 +1113,9 @@ class ApertisInterface:
                     return f"Failed to start pre-training: {e_start}"
 
             # Update the click handler to use the new function and pass the new checkbox value
-            start_train_btn.click(ui_start_training_handler_updated, # Use updated handler
-                                 [model_param_count_train_tb, attn_type_train_dd, flash_attn_train_cb, # Changed model_size_train_dd
-                                  multimodal_train_cb, expert_sys_train_cb,
+            start_train_btn.click(ui_start_training_handler_updated,
+                                 [model_param_count_train_tb, attn_type_train_dd, flash_attn_train_cb,
+                                  multimodal_train_cb, expert_sys_train_cb, num_experts_train_sl, # Added num_experts_train_sl
                                   train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
                                   batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
                                   chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
