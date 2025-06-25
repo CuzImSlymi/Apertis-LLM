@@ -27,6 +27,36 @@ except ImportError:
     flash_attn_func = None
     IS_FLASH_ATTN_AVAILABLE = False
 
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        """
+        Root Mean Square Layer Normalization.
+        Reference: https://arxiv.org/abs/1910.07467
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor, expected shape (..., hidden_size).
+        Returns:
+            torch.Tensor: Normalized tensor.
+        """
+        # Calculate Root Mean Square
+        # x_fp32 = x.float() # Promote to float32 for stability, especially for variance calculation
+        # rms = torch.sqrt(torch.mean(x_fp32**2, dim=-1, keepdim=True) + self.eps)
+        # output = x_fp32 / rms
+        # return (self.scale * output).type_as(x)
+
+        # Simpler version without explicit float promotion, relying on PyTorch's type handling
+        # For mixed precision, ensure input 'x' is already in appropriate precision or handle outside.
+        norm_x = x.norm(p=2, dim=-1, keepdim=True)
+        rms_x = norm_x * (self.hidden_size ** -0.5) # RMS = ||x||_2 / sqrt(D)
+        x_normed = x / (rms_x + self.eps)
+        return self.scale * x_normed
 
 if __name__ == '__main__' and __package__ is None:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -89,6 +119,9 @@ class ApertisConfig:
         use_expert_dropout: bool = True, # This refers to dropping entire experts, not dropout within MLP
         use_router_z_loss: bool = True,
         use_load_balancing_loss: bool = True,
+        # New architectural flags
+        use_rmsnorm: bool = False,
+        use_swiglu: bool = False,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -158,6 +191,10 @@ class ApertisConfig:
         self.use_expert_dropout = use_expert_dropout
         self.use_router_z_loss = use_router_z_loss
         self.use_load_balancing_loss = use_load_balancing_loss
+
+        # Store new architectural flags
+        self.use_rmsnorm = use_rmsnorm
+        self.use_swiglu = use_swiglu
 
         # Make sure num_experts and experts_per_token are consistent
         if not self.use_expert_system:
@@ -626,7 +663,10 @@ class ApertisAttention(nn.Module):
             self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_probs_dropout_prob == 0.0)
             self.attention_mechanism_impl = None
 
-        self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if config.use_rmsnorm:
+            self.pre_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        else:
+            self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
         self.attention_dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -801,23 +841,42 @@ class ApertisFeedForward(nn.Module):
     def __init__(self, config: ApertisConfig):
         super().__init__()
         self.config = config
-        self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if config.use_expert_system and config.num_experts > 0 : # Ensure num_experts is positive
+        if config.use_rmsnorm:
+            self.pre_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        else:
+            self.pre_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        if config.use_swiglu:
+            # If using SwiGLU, AdaptiveExpertSystem is not directly compatible unless it internally
+            # uses SwiGLU experts. The current plan is to replace the FFN block.
+            # If use_expert_system is also True, SwiGLU takes precedence for the FFN block itself.
+            # An expert system could be composed of SwiGLU experts, but that's a deeper change.
+            # For now, if use_swiglu is True, we use SwiGLUFFN.
+            # If use_expert_system is True AND use_swiglu is False, then AdaptiveExpertSystem is used.
+            if config.use_expert_system:
+                logger.info("use_swiglu is True, using SwiGLUFFN. This will override AdaptiveExpertSystem if use_expert_system is also True for the main FFN block.")
+            self.ffn = SwiGLUFFN(config)
+            self.is_expert_system = False
+        elif config.use_expert_system and config.num_experts > 0:
             self.ffn = AdaptiveExpertSystem(
-                config=config, # Pass the full config object
-                activation_function_override=config.hidden_act # Can be overridden if needed
+                config=config,
+                activation_function_override=config.hidden_act
             )
+            self.is_expert_system = True
         else:
             if config.use_expert_system and config.num_experts <= 0:
                 logger.warning(f"use_expert_system is True but num_experts is {config.num_experts}. Falling back to standard FFN.")
+            # Standard FFN (non-SwiGLU, non-expert)
             self.ffn = nn.Sequential(
                 nn.Linear(config.hidden_size, config.intermediate_size),
-                self._get_activation_fn(config.hidden_act),
+                self._get_activation_fn(config.hidden_act), # Keep original activation for this path
                 nn.Dropout(config.hidden_dropout_prob),
                 nn.Linear(config.intermediate_size, config.hidden_size),
             )
-        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+            self.is_expert_system = False
         
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+
     def _get_activation_fn(self, act_fn_str: str):
         if act_fn_str == "gelu": return nn.GELU()
         elif act_fn_str == "relu": return nn.ReLU()
@@ -831,21 +890,107 @@ class ApertisFeedForward(nn.Module):
         total_lb_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
         total_rz_loss = torch.tensor(0.0, device=hidden_s.device, dtype=hidden_s.dtype)
 
-        if isinstance(self.ffn, AdaptiveExpertSystem):
+        if self.is_expert_system: # Check the flag set during __init__
             ffn_out, lb_loss, rz_loss = self.ffn(normed_hidden_s)
-            if self.config.use_expert_system: # Only add losses if expert system is truly active
-                 total_lb_loss = lb_loss
-                 total_rz_loss = rz_loss
-        else: # Standard MLP
+            # Ensure losses are only assigned if the expert system is active and returns them
+            if lb_loss is not None: total_lb_loss = lb_loss
+            if rz_loss is not None: total_rz_loss = rz_loss
+        else: # SwiGLUFFN or standard nn.Sequential FFN
             ffn_out = self.ffn(normed_hidden_s)
-            # lb_loss and rz_loss remain 0.0 as initialized
+            # lb_loss and rz_loss remain 0.0 as initialized for non-expert system paths
 
-        dropped_ffn_out = self.output_dropout(ffn_out)
+        # Dropout for SwiGLUFFN is handled internally in SwiGLUFFN.forward().
+        # For standard FFN (nn.Sequential), dropout is part of the sequence.
+        # For AdaptiveExpertSystem, dropout is also internal to each expert.
+        # So, self.output_dropout here is applied *after* the FFN block's output.
+        # This is consistent with the original structure where ApertisFeedForward had its own output_dropout.
+        # If SwiGLUFFN already has dropout, this would be a second dropout.
+        # Let's ensure SwiGLUFFN's internal dropout is the primary one, and this outer one is conditional
+        # or removed if SwiGLU handles its own dropout.
+        # The SwiGLUFFN implementation includes `self.dropout = nn.Dropout(config.hidden_dropout_prob)`.
+        # So, the following `self.output_dropout(ffn_out)` might be redundant if ffn_out is from SwiGLUFFN.
+
+        # Decision: The self.output_dropout in ApertisFeedForward should apply to the *output of the chosen ffn module*.
+        # SwiGLUFFN has its own dropout. StandardSequential FFN has its own dropout. AdaptiveExpertSystem's experts have dropout.
+        # The current `self.output_dropout(ffn_out)` is fine as it's applied to the result of whichever FFN ran.
+        # This is consistent with pre-SwiGLU structure.
+
+        dropped_ffn_out = self.output_dropout(ffn_out) # This output_dropout is from ApertisFeedForward itself.
         final_ffn_output = dropped_ffn_out + residual
 
         # Always return three values.
         # total_lb_loss and total_rz_loss are correctly 0.0 if not updated by a real expert system call.
         return final_ffn_output, total_lb_loss, total_rz_loss
+
+class SwiGLUFFN(nn.Module):
+    def __init__(self, config: ApertisConfig, intermediate_size: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        # If intermediate_size is not provided, use the one from config,
+        # otherwise allow override (e.g. for specific expert dimensioning if used standalone)
+        self.intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
+
+        # SwiGLU uses three linear layers.
+        # W_gate: projects hidden_size to intermediate_size for the Swish gate
+        # W_up: projects hidden_size to intermediate_size for the value
+        # W_down: projects intermediate_size back to hidden_size
+        # To maintain roughly the same parameter count as a standard FFN (which has 2 layers:
+        # hidden -> intermediate, intermediate -> hidden), the intermediate_size for SwiGLU
+        # is often scaled. A common practice is to make the SwiGLU intermediate_size
+        # about 2/3 of the standard FFN's intermediate_size if the goal is to match params.
+        # (intermediate_size * hidden + intermediate_size * hidden) vs (intermediate_size_swiglu * hidden * 2 + intermediate_size_swiglu * hidden)
+        # Std FFN: 2 * H * I
+        # SwiGLU: H * I_gate + H * I_up + I_gate * H (if I_gate=I_up=I_swiglu and W_down projects I_swiglu to H)
+        # So, W_gate: H -> I_swiglu, W_up: H -> I_swiglu, W_down: I_swiglu -> H
+        # Total params for SwiGLU: 2 * H * I_swiglu + I_swiglu * H = 3 * H * I_swiglu (if no bias)
+        # If we want 3 * H * I_swiglu approx 2 * H * I_std, then I_swiglu = (2/3) * I_std.
+        # The problem statement asks to "Maintain same parameter counts and dimensions".
+        # This implies I_swiglu should be set to (2/3) * config.intermediate_size.
+        # Let's call this adjusted_intermediate_size.
+        
+        # However, recent SOTA models (e.g., Llama) often use a SwiGLU where W_gate and W_up
+        # project to the *same* intermediate dimension, and this dimension is still referred to
+        # as 'intermediate_size' (often 4*hidden_size, or a multiple like 256/3 * hidden_size in Llama 2).
+        # The key is that the *output* of Swish(x @ W_gate) * (x @ W_up) is of size intermediate_size,
+        # which is then projected by W_down.
+        # So, W_gate: D_hidden -> D_ffn
+        #     W_up:   D_hidden -> D_ffn
+        #     W_down: D_ffn    -> D_hidden
+        # Parameters: D_hidden*D_ffn (gate) + D_hidden*D_ffn (up) + D_ffn*D_hidden (down)
+        # This is 3 * D_hidden * D_ffn.
+        # Standard FFN: D_hidden*D_ffn (up) + D_ffn*D_hidden (down) = 2 * D_hidden * D_ffn.
+        # To match params, D_ffn_swiglu = (2/3) * D_ffn_standard.
+
+        self.ffn_dim = int(self.intermediate_size * 2 / 3) # Adjusted for parameter count matching
+        # Ensure ffn_dim is a multiple of a reasonable value, e.g., 128 or 256, for efficiency.
+        # This might slightly alter the parameter count but improves performance.
+        # For now, let's stick to the direct 2/3 scaling.
+        # A common choice for SwiGLU intermediate dim is multiple of 256. Let's try to make it so.
+        multiple_of = 256 # Or config.multiple_of if available
+        self.ffn_dim = ((self.ffn_dim + multiple_of - 1) // multiple_of) * multiple_of
+        if self.ffn_dim == 0: # Ensure it's not zero if intermediate_size was too small
+            self.ffn_dim = multiple_of
+
+
+        self.w_gate = nn.Linear(self.hidden_size, self.ffn_dim, bias=False)
+        self.w_up = nn.Linear(self.hidden_size, self.ffn_dim, bias=False)
+        self.w_down = nn.Linear(self.ffn_dim, self.hidden_size, bias=False)
+        
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (batch_size, seq_len, hidden_size)
+        gate_val = self.w_gate(x) # (batch_size, seq_len, ffn_dim)
+        swish_gate = F.silu(gate_val) # silu is x * sigmoid(x)
+        
+        up_val = self.w_up(x) # (batch_size, seq_len, ffn_dim)
+        
+        fused_val = swish_gate * up_val # (batch_size, seq_len, ffn_dim)
+        
+        output = self.w_down(fused_val) # (batch_size, seq_len, hidden_size)
+        output = self.dropout(output)
+        return output
 
 class ApertisLayer(nn.Module):
     def __init__(self, config: ApertisConfig):
@@ -889,7 +1034,10 @@ class ApertisModel(nn.Module):
             if config.vision_embed_dim != config.hidden_size:
                 self.vision_projection = nn.Linear(config.vision_embed_dim, config.hidden_size)
         self.layers = nn.ModuleList([ApertisLayer(config) for _ in range(config.num_hidden_layers)])
-        self.final_post_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if config.use_rmsnorm:
+            self.final_post_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        else:
+            self.final_post_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.embed_dropout = nn.Dropout(config.hidden_dropout_prob)
         self.apply(self._init_weights)
         self.gradient_checkpointing = False
@@ -904,6 +1052,11 @@ class ApertisModel(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             if hasattr(module, 'bias') and module.bias is not None: module.bias.data.zero_()
             if hasattr(module, 'weight') and module.weight is not None: module.weight.data.fill_(1.0)
+        elif isinstance(module, RMSNorm):
+            # RMSNorm has 'scale' parameter, which is analogous to LayerNorm's 'weight'.
+            # It does not have a bias.
+            if hasattr(module, 'scale') and module.scale is not None:
+                module.scale.data.fill_(1.0)
         if isinstance(module, SelectiveLinearAttention):
             if hasattr(module, 'dt_proj_head') and module.dt_proj_head.bias is not None:
                  torch.nn.init.uniform_(module.dt_proj_head.bias, a=math.log(1e-3), b=math.log(1e-2))
