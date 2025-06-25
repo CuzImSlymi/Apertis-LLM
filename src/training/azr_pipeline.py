@@ -74,9 +74,19 @@ class AbsoluteZeroReasonerTrainer:
             apertis_config_params["pad_token_id"] = hf_tokenizer.pad_token_id
             apertis_config_params["bos_token_id"] = hf_tokenizer.bos_token_id
             apertis_config_params["eos_token_id"] = hf_tokenizer.eos_token_id
+            if hf_tokenizer.unk_token_id is not None:
+                apertis_config_params["unk_token_id"] = hf_tokenizer.unk_token_id
             
             valid_apertis_params = inspect.signature(ApertisConfig.__init__).parameters.keys()
-            filtered_apertis_params = {k: v for k, v in apertis_config_params.items() if k in valid_apertis_params}
+            # Ensure that only parameters ApertisConfig expects are passed.
+            # Also, model_file_config might contain other ApertisConfig params (e.g. hidden_size).
+            # The apertis_config_params dictionary already contains these from self.model_file_config.copy().
+            # We just need to filter it down to what ApertisConfig's __init__ can accept.
+            
+            filtered_apertis_params = {k: v for k, v in apertis_config_params.items() if k in valid_apertis_params or k == "kwargs"} # include kwargs if ApertisConfig uses it for extra flexibility
+            
+            # Ensure special tokens from tokenizer override any defaults or model_file_config values if they exist
+            # This is already handled by setting them in apertis_config_params before filtering.
 
             model_config_obj = ApertisConfig(**filtered_apertis_params)
             model = ApertisForCausalLM(model_config_obj)

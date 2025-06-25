@@ -84,6 +84,8 @@ class ApertisPretrainDataset(Dataset):
         image_size: int = 224,
         pad_token_id_from_config: int = 0,
         unk_token_id_from_config: int = 3,
+        bos_token_id_from_config: int = 1, # New
+        eos_token_id_from_config: int = 2, # New
     ):
         self.data_path = data_path
         self.vocab = vocab_dict
@@ -96,6 +98,8 @@ class ApertisPretrainDataset(Dataset):
 
         self.pad_token_id_for_data = pad_token_id_from_config
         self.unk_token_id_for_data = unk_token_id_from_config
+        self.bos_token_id_for_data = bos_token_id_from_config # New
+        self.eos_token_id_for_data = eos_token_id_from_config # New
 
         if self.multimodal:
             self.image_transform = transforms.Compose([
@@ -185,6 +189,9 @@ class ApertisPretrainDataset(Dataset):
         attention_mask = (input_ids_tensor != pad_id_to_use).long()
 
         labels = input_ids_tensor.clone()
+        # If model's ignore_index is -100, padding tokens in labels must be set to -100.
+        if pad_id_to_use is not None: # self.pad_token_id_for_data
+            labels[labels == pad_id_to_use] = -100
 
         output = {"input_ids": input_ids_tensor, "attention_mask": attention_mask, "labels": labels}
 
@@ -207,6 +214,7 @@ class ApertisFineTuneDataset(Dataset):
         model_config_eos_token_id: Optional[int] = None,
         model_config_pad_token_id: Optional[int] = None,
         model_config_unk_token_id: Optional[int] = None,
+        model_config_bos_token_id: Optional[int] = None, # New
     ):
         self.data_path = data_path
         self.tokenizer = tokenizer 
@@ -718,12 +726,12 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
 
     actual_hf_tokenizer_object = None
     manual_vocab_dict_loaded = None
-    final_vocab_size_for_model_config = 0
-    final_pad_id, final_bos_id, final_eos_id, final_unk_id = 0, 1, 2, 3 # ApertisConfig defaults
-    
+    # These variables will store the "source of truth" special token IDs from the tokenizer
+    source_vocab_size = 0
+    source_pad_id, source_bos_id, source_eos_id, source_unk_id = 0, 1, 2, 3 # Start with ApertisConfig defaults
+
     # Path to the tokenizer/vocab that will be saved with the model checkpoint
     path_to_tokenizer_to_save_with_model_checkpoint: Optional[str] = None
-
 
     if is_fine_tuning_mode and use_hf_tokenizer_for_ft:
         if not tokenizer_path_in_config:
@@ -732,80 +740,36 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
         try:
             from transformers import AutoTokenizer
             actual_hf_tokenizer_object = AutoTokenizer.from_pretrained(tokenizer_path_in_config)
-            final_vocab_size_for_model_config = actual_hf_tokenizer_object.vocab_size
-            # Use tokenizer's special tokens if available, otherwise ApertisConfig defaults will be used by model.
-            if actual_hf_tokenizer_object.pad_token_id is not None: final_pad_id = actual_hf_tokenizer_object.pad_token_id
-            if actual_hf_tokenizer_object.bos_token_id is not None: final_bos_id = actual_hf_tokenizer_object.bos_token_id
-            if actual_hf_tokenizer_object.eos_token_id is not None: final_eos_id = actual_hf_tokenizer_object.eos_token_id
-            if actual_hf_tokenizer_object.unk_token_id is not None: final_unk_id = actual_hf_tokenizer_object.unk_token_id
-            path_to_tokenizer_to_save_with_model_checkpoint = tokenizer_path_in_config # This could be a Hub ID or local path
-            logger.info(f"Using HF Tokenizer '{tokenizer_path_in_config}' for fine-tuning. Effective vocab_size: {final_vocab_size_for_model_config}")
+            source_vocab_size = actual_hf_tokenizer_object.vocab_size
+            
+            # Use tokenizer's special tokens if available, otherwise keep ApertisConfig defaults
+            # These are now the "source" values from the tokenizer
+            if actual_hf_tokenizer_object.pad_token_id is not None: source_pad_id = actual_hf_tokenizer_object.pad_token_id
+            if actual_hf_tokenizer_object.bos_token_id is not None: source_bos_id = actual_hf_tokenizer_object.bos_token_id
+            if actual_hf_tokenizer_object.eos_token_id is not None: source_eos_id = actual_hf_tokenizer_object.eos_token_id
+            if actual_hf_tokenizer_object.unk_token_id is not None: source_unk_id = actual_hf_tokenizer_object.unk_token_id
+            
+            path_to_tokenizer_to_save_with_model_checkpoint = tokenizer_path_in_config
+            logger.info(f"Using HF Tokenizer '{tokenizer_path_in_config}' for fine-tuning. Extracted vocab_size: {source_vocab_size}, pad_id: {source_pad_id}, bos_id: {source_bos_id}, eos_id: {source_eos_id}, unk_id: {source_unk_id}")
         except Exception as e:
             logger.error(f"Failed to load HF tokenizer '{tokenizer_path_in_config}' for fine-tuning: {e}. Ensure it's a valid path/name.")
             return
     elif tokenizer_path_in_config: # Pre-training with manual vocab OR Fine-tuning with manual vocab
         try:
-            manual_vocab_dict_loaded, final_vocab_size_for_model_config = _load_vocabulary_and_get_size(tokenizer_path_in_config)
+            manual_vocab_dict_loaded, source_vocab_size = _load_vocabulary_and_get_size(tokenizer_path_in_config)
             # For manual vocab, use its own special tokens if defined, otherwise ApertisConfig defaults.
-            if "<pad>" in manual_vocab_dict_loaded: final_pad_id = manual_vocab_dict_loaded["<pad>"]
-            if "<bos>" in manual_vocab_dict_loaded: final_bos_id = manual_vocab_dict_loaded["<bos>"]
-            if "<eos>" in manual_vocab_dict_loaded: final_eos_id = manual_vocab_dict_loaded["<eos>"]
-            if "<unk>" in manual_vocab_dict_loaded: final_unk_id = manual_vocab_dict_loaded["<unk>"]
+            if "<pad>" in manual_vocab_dict_loaded: source_pad_id = manual_vocab_dict_loaded["<pad>"]
+            if "<bos>" in manual_vocab_dict_loaded: source_bos_id = manual_vocab_dict_loaded["<bos>"]
+            if "<eos>" in manual_vocab_dict_loaded: source_eos_id = manual_vocab_dict_loaded["<eos>"]
+            if "<unk>" in manual_vocab_dict_loaded: source_unk_id = manual_vocab_dict_loaded["<unk>"]
             path_to_tokenizer_to_save_with_model_checkpoint = tokenizer_path_in_config
-            logger.info(f"Using manual vocab from '{tokenizer_path_in_config}'. Effective vocab_size: {final_vocab_size_for_model_config}")
+            logger.info(f"Using manual vocab from '{tokenizer_path_in_config}'. Extracted vocab_size: {source_vocab_size}, pad_id: {source_pad_id}, bos_id: {source_bos_id}, eos_id: {source_eos_id}, unk_id: {source_unk_id}")
         except Exception as e:
             logger.error(f"Failed to load manual vocab from '{tokenizer_path_in_config}': {e}")
             return
     else:
         logger.error("tokenizer_path (for manual vocab, or as HF name if use_hf_tokenizer_for_finetune=True) is missing in data_config.")
         return
-
-    # --- Dataset Initialization ---
-    train_ds: Union[ApertisPretrainDataset, ApertisFineTuneDataset]
-    val_ds: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset]] = None
-    try:
-        if is_fine_tuning_mode:
-            dataset_tokenizer_arg = actual_hf_tokenizer_object if actual_hf_tokenizer_object else manual_vocab_dict_loaded
-            train_ds = ApertisFineTuneDataset(
-                data_path=data_cfg.get("train_data_path"), tokenizer=dataset_tokenizer_arg,
-                max_length=data_cfg.get("max_length", 512),
-                prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
-                is_hf_tokenizer=bool(actual_hf_tokenizer_object),
-                model_config_vocab_size=final_vocab_size_for_model_config,
-                model_config_eos_token_id=final_eos_id, model_config_pad_token_id=final_pad_id,
-                model_config_unk_token_id=final_unk_id
-            )
-            if data_cfg.get("val_data_path"):
-                val_ds = ApertisFineTuneDataset(
-                    data_path=data_cfg.get("val_data_path"), tokenizer=dataset_tokenizer_arg,
-                    max_length=data_cfg.get("max_length", 512),
-                    prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
-                    is_hf_tokenizer=bool(actual_hf_tokenizer_object),
-                    model_config_vocab_size=final_vocab_size_for_model_config,
-                    model_config_eos_token_id=final_eos_id, model_config_pad_token_id=final_pad_id,
-                    model_config_unk_token_id=final_unk_id
-                )
-        else: # Pre-training (always uses manual_vocab_dict_loaded)
-            if manual_vocab_dict_loaded is None or final_vocab_size_for_model_config == 0:
-                 logger.error("Manual vocabulary must be provided and valid for pre-training.")
-                 return
-            train_ds = ApertisPretrainDataset(
-                data_path=data_cfg.get("train_data_path"), vocab_dict=manual_vocab_dict_loaded,
-                model_config_vocab_size=final_vocab_size_for_model_config,
-                max_length=data_cfg.get("max_length",512), multimodal=model_cfg_from_file.get("multimodal",False),
-                image_dir=data_cfg.get("image_dir"), image_size=model_cfg_from_file.get("image_size",224),
-                pad_token_id_from_config=final_pad_id, unk_token_id_from_config=final_unk_id
-            )
-            if data_cfg.get("val_data_path"):
-                val_ds = ApertisPretrainDataset(
-                    data_cfg.get("val_data_path"), manual_vocab_dict_loaded,
-                    final_vocab_size_for_model_config,
-                    data_cfg.get("max_length",512), model_cfg_from_file.get("multimodal",False),
-                    data_cfg.get("image_dir"), model_cfg_from_file.get("image_size",224),
-                    pad_token_id_from_config=final_pad_id, unk_token_id_from_config=final_unk_id
-                )
-    except Exception as e:
-        logger.error(f"Error creating datasets: {e}", exc_info=True); return
 
     # --- Model Initialization ---
     model_for_trainer: ApertisForCausalLM
@@ -821,27 +785,27 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             original_vocab_size_from_base_model_config = base_model_config.vocab_size
             
             # Update base model config with tokenizer's reality BEFORE creating model instance
-            base_model_config.vocab_size = final_vocab_size_for_model_config
-            base_model_config.pad_token_id = final_pad_id
-            base_model_config.bos_token_id = final_bos_id
-            base_model_config.eos_token_id = final_eos_id
-            base_model_config.unk_token_id = final_unk_id
+            base_model_config.vocab_size = source_vocab_size
+            base_model_config.pad_token_id = source_pad_id
+            base_model_config.bos_token_id = source_bos_id
+            base_model_config.eos_token_id = source_eos_id
+            base_model_config.unk_token_id = source_unk_id
             
-            # model_cfg_from_file can contain overrides for the base model structure (e.g. multimodal=True for a non-MM base)
-            # This is advanced. Usually, for fine-tuning, model_cfg_from_file would be empty or just for minor tweaks.
+            # model_cfg_from_file can contain overrides for the base model structure
             merged_config_for_ft_model_dict = base_model_config.to_dict()
-            merged_config_for_ft_model_dict.update(model_cfg_from_file) # User overrides on base
+            if model_cfg_from_file: # Apply overrides from config file if any
+                merged_config_for_ft_model_dict.update(model_cfg_from_file) 
             
-            # Ensure final vocab/special tokens are from tokenizer, not overridden by model_cfg_from_file
-            merged_config_for_ft_model_dict["vocab_size"] = final_vocab_size_for_model_config
-            merged_config_for_ft_model_dict["pad_token_id"] = final_pad_id
-            merged_config_for_ft_model_dict["bos_token_id"] = final_bos_id
-            merged_config_for_ft_model_dict["eos_token_id"] = final_eos_id
-            merged_config_for_ft_model_dict["unk_token_id"] = final_unk_id
+            # CRITICAL: Ensure tokenizer-derived special tokens and vocab_size are final, overriding any from model_cfg_from_file
+            merged_config_for_ft_model_dict["vocab_size"] = source_vocab_size
+            merged_config_for_ft_model_dict["pad_token_id"] = source_pad_id
+            merged_config_for_ft_model_dict["bos_token_id"] = source_bos_id
+            merged_config_for_ft_model_dict["eos_token_id"] = source_eos_id
+            merged_config_for_ft_model_dict["unk_token_id"] = source_unk_id
 
             final_config_for_ft_model_instance = ApertisConfig.from_dict(merged_config_for_ft_model_dict)
             model_for_trainer = ApertisForCausalLM(final_config_for_ft_model_instance)
-            logger.info(f"Fine-tuning: Instantiated ApertisForCausalLM with (potentially merged) config. Effective vocab: {model_for_trainer.config.vocab_size}")
+            logger.info(f"Fine-tuning: Instantiated ApertisForCausalLM with config derived from base, updated with tokenizer and overrides. Effective vocab: {model_for_trainer.config.vocab_size}, Pad: {model_for_trainer.config.pad_token_id}, BOS: {model_for_trainer.config.bos_token_id}, EOS: {model_for_trainer.config.eos_token_id}, UNK: {model_for_trainer.config.unk_token_id}")
 
             actual_weights_file = pretrained_model_weights_path
             if os.path.isdir(pretrained_model_weights_path):
@@ -854,53 +818,37 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             logger.info(f"Fine-tuning: Loading state_dict from: {actual_weights_file}")
             state_dict_from_checkpoint = torch.load(actual_weights_file, map_location="cpu", weights_only=True)
 
-            # If vocab size changed from base model to current fine-tuning tokenizer, resize embeddings
-            if original_vocab_size_from_base_model_config != final_vocab_size_for_model_config:
-                logger.info(f"Resizing token embeddings from base model vocab {original_vocab_size_from_base_model_config} to new fine-tuning tokenizer vocab {final_vocab_size_for_model_config}")
-                # Temporarily set model's vocab size to original for loading, then resize.
-                # This is complex because load_state_dict needs exact matches for embedding layers unless strict=False.
-                # A safer approach:
-                # 1. Create model with *final* (tokenizer-aligned) vocab size.
-                # 2. Manually copy compatible parts of embedding/lm_head from checkpoint.
-                # 3. Load the rest of the state_dict with strict=False.
-
-                # Create temporary model with original vocab to extract embeddings correctly
-                temp_base_config_for_load = ApertisConfig.from_dict(base_model_config.to_dict()) # Get a clean copy of original base config
-                temp_base_config_for_load.vocab_size = original_vocab_size_from_base_model_config # Set its vocab to original
+            if original_vocab_size_from_base_model_config != source_vocab_size:
+                logger.info(f"Resizing token embeddings from base model vocab {original_vocab_size_from_base_model_config} to new fine-tuning tokenizer vocab {source_vocab_size}")
+                
+                temp_base_config_for_load = ApertisConfig.from_dict(base_model_config.to_dict()) 
+                temp_base_config_for_load.vocab_size = original_vocab_size_from_base_model_config 
+                # Restore original special tokens for the temp model if they were different, to match checkpoint
+                # This is complex if base checkpoint had different special tokens. Assuming they were default or compatible.
+                # For simplicity, we assume the base model's special token IDs are not needed for the weight loading logic itself,
+                # only its vocab_size for embedding shape.
                 temp_model_for_load = ApertisForCausalLM(temp_base_config_for_load)
-                # Load checkpoint into this temp model (it should match perfectly for embeddings)
                 temp_load_result = temp_model_for_load.load_state_dict(state_dict_from_checkpoint, strict=False)
                 if temp_load_result.missing_keys or temp_load_result.unexpected_keys:
-                     logger.warning(f"Loading into temp model had issues: missing={temp_load_result.missing_keys}, unexpected={temp_load_result.unexpected_keys}")
+                     logger.warning(f"Loading into temp model for resizing had issues: missing={temp_load_result.missing_keys}, unexpected={temp_load_result.unexpected_keys}")
 
-
-                # Now, model_for_trainer has the *final* vocab size. Copy matching embedding parts.
-                num_tokens_to_copy = min(original_vocab_size_from_base_model_config, final_vocab_size_for_model_config)
-                
-                # Input embeddings
+                num_tokens_to_copy = min(original_vocab_size_from_base_model_config, source_vocab_size)
                 model_for_trainer.model.token_embeddings.weight.data[:num_tokens_to_copy, :] = \
                     temp_model_for_load.model.token_embeddings.weight.data[:num_tokens_to_copy, :]
-                
-                # LM head (if not tied or needs explicit copy)
                 if not model_for_trainer.config.tie_word_embeddings:
                     model_for_trainer.lm_head.weight.data[:num_tokens_to_copy, :] = \
                         temp_model_for_load.lm_head.weight.data[:num_tokens_to_copy, :]
-                elif model_for_trainer.config.tie_word_embeddings: # If tied, it will pick up from token_embeddings
+                elif model_for_trainer.config.tie_word_embeddings:
                     model_for_trainer.lm_head.weight = model_for_trainer.model.token_embeddings.weight
-
-
-                # Remove embedding/lm_head keys from state_dict before loading into final model instance
-                # to avoid size mismatches if we load with strict=True later, or just use strict=False.
+                
                 keys_to_delete = []
                 if 'model.token_embeddings.weight' in state_dict_from_checkpoint: keys_to_delete.append('model.token_embeddings.weight')
                 if 'lm_head.weight' in state_dict_from_checkpoint: keys_to_delete.append('lm_head.weight')
                 for key_del in keys_to_delete:
                     if key_del in state_dict_from_checkpoint: del state_dict_from_checkpoint[key_del]
-                
                 load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=False)
-
-            else: # Vocab sizes match, direct load
-                load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=True) # strict=True if no resize needed
+            else: 
+                load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=True)
             
             logger.info(f"Base model state_dict loaded for fine-tuning. Load result: missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
             if load_result.missing_keys: logger.warning(f"Missing keys during FT base model load: {load_result.missing_keys}")
@@ -908,45 +856,107 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
 
         else: # Pre-training or fine-tuning from scratch
             logger.info(f"Initializing a new model for {'pre-training' if not is_fine_tuning_mode else 'fine-tuning from scratch'}.")
-            # Use create_apertis_model to handle 'target_param_count' and other presets
             target_param_count_from_config = model_cfg_from_file.get("target_param_count", "125M")
-            if "model_size" in model_cfg_from_file:
-                logger.warning("Found 'model_size' in model_config. It is deprecated. Please use 'target_param_count' (e.g., '125M', '1.5B').")
-                # Potentially map old model_size to a target_param_count if desired, or just use default.
-                # For now, if model_size is present but target_param_count is not, we'll use the default "125M".
-                # If target_param_count IS present, it will take precedence over model_size.
-                if not model_cfg_from_file.get("target_param_count"):
-                    logger.info(f"Using default target_param_count '{target_param_count_from_config}' due to deprecated 'model_size' and no 'target_param_count' found.")
+            
+            # Prepare config_overrides for create_apertis_model
+            # These will be merged with calculated dimensions inside create_apertis_model
+            # Crucially, pass the tokenizer-derived special token IDs here.
+            config_overrides_for_create = model_cfg_from_file.get("config_overrides", {}).copy()
+            config_overrides_for_create.update({
+                "pad_token_id": source_pad_id,
+                "bos_token_id": source_bos_id,
+                "eos_token_id": source_eos_id,
+                "unk_token_id": source_unk_id
+            })
+            # Other model_cfg_from_file items (like attention_type, multimodal etc.) are passed directly to create_apertis_model params.
 
             model_for_trainer = create_apertis_model(
                 target_param_count=target_param_count_from_config,
-                vocab_size_override=final_vocab_size_for_model_config,
+                vocab_size_override=source_vocab_size, # This is the vocab size from tokenizer
                 attention_type_override=model_cfg_from_file.get("attention_type"),
                 multimodal=model_cfg_from_file.get("multimodal", False),
                 use_expert_system=model_cfg_from_file.get("use_expert_system", False),
-                # Pass other relevant args from model_cfg_from_file if create_apertis_model accepts them
-                # e.g., num_experts_target_override, experts_per_token_target_override, ssm parameters, config_overrides
-                num_experts_target_override=model_cfg_from_file.get("num_experts"), # ApertisConfig uses num_experts
+                num_experts_target_override=model_cfg_from_file.get("num_experts"),
                 experts_per_token_target_override=model_cfg_from_file.get("experts_per_token"),
-                use_flash_attention=model_cfg_from_file.get("use_flash_attention", False), # Pass this through
+                use_flash_attention=model_cfg_from_file.get("use_flash_attention", False),
                 ssm_d_inner=model_cfg_from_file.get("ssm_d_inner"),
-                ssm_d_state=model_cfg_from_file.get("ssm_d_state", 16), # Default from ApertisConfig
-                ssm_dt_rank=model_cfg_from_file.get("ssm_dt_rank", "auto"), # Default from ApertisConfig
-                ssm_conv_kernel=model_cfg_from_file.get("ssm_conv_kernel", 4), # Default from ApertisConfig
-                config_overrides=model_cfg_from_file.get("config_overrides") # Pass general overrides
+                ssm_d_state=model_cfg_from_file.get("ssm_d_state", 16),
+                ssm_dt_rank=model_cfg_from_file.get("ssm_dt_rank", "auto"),
+                ssm_conv_kernel=model_cfg_from_file.get("ssm_conv_kernel", 4),
+                config_overrides=config_overrides_for_create # Pass the dict with special tokens
             )
-            # Ensure special token IDs from tokenizer are respected
-            model_for_trainer.config.pad_token_id = final_pad_id
-            model_for_trainer.config.bos_token_id = final_bos_id
-            model_for_trainer.config.eos_token_id = final_eos_id
-            model_for_trainer.config.unk_token_id = final_unk_id
-
-            logger.info(f"Initialized NEW ApertisForCausalLM with config: {model_for_trainer.config.to_dict()}")
+            # The explicit setting of model_for_trainer.config.pad_token_id = final_pad_id etc. after create_apertis_model is now removed
+            # as create_apertis_model itself handles this via config_overrides.
+            logger.info(f"Initialized NEW ApertisForCausalLM. Config used by model: vocab_size={model_for_trainer.config.vocab_size}, pad_token_id={model_for_trainer.config.pad_token_id}, bos_token_id={model_for_trainer.config.bos_token_id}, eos_token_id={model_for_trainer.config.eos_token_id}, unk_token_id={model_for_trainer.config.unk_token_id}")
         
-        logger.info(f"Final model object for trainer has config: {model_for_trainer.config.to_dict()}")
+        # logger.info(f"Final model object for trainer has config: {model_for_trainer.config.to_dict()}") # Already logged by create_apertis_model or above
     except Exception as e:
         logger.error(f"Error creating model for training: {e}", exc_info=True); return
 
+    # --- Dataset Initialization (now uses model_for_trainer.config for special tokens) ---
+    train_ds: Union[ApertisPretrainDataset, ApertisFineTuneDataset]
+    val_ds: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset]] = None
+    try:
+        # Get special token IDs from the *actual model configuration* that was just finalized
+        cfg_pad = model_for_trainer.config.pad_token_id
+        cfg_bos = model_for_trainer.config.bos_token_id # Will be used in ApertisPretrainDataset
+        cfg_eos = model_for_trainer.config.eos_token_id
+        cfg_unk = model_for_trainer.config.unk_token_id
+        cfg_vocab_size = model_for_trainer.config.vocab_size
+
+        if is_fine_tuning_mode:
+            dataset_tokenizer_arg = actual_hf_tokenizer_object if actual_hf_tokenizer_object else manual_vocab_dict_loaded
+            train_ds = ApertisFineTuneDataset(
+                data_path=data_cfg.get("train_data_path"), tokenizer=dataset_tokenizer_arg,
+                max_length=data_cfg.get("max_length", 512),
+                prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
+                is_hf_tokenizer=bool(actual_hf_tokenizer_object),
+                model_config_vocab_size=cfg_vocab_size, # From model's config
+                model_config_eos_token_id=cfg_eos,      # From model's config
+                model_config_pad_token_id=cfg_pad,      # From model's config
+                model_config_unk_token_id=cfg_unk,      # From model's config
+                model_config_bos_token_id=cfg_bos       # From model's config
+            )
+            if data_cfg.get("val_data_path"):
+                val_ds = ApertisFineTuneDataset(
+                    data_path=data_cfg.get("val_data_path"), tokenizer=dataset_tokenizer_arg,
+                    max_length=data_cfg.get("max_length", 512),
+                    prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
+                    is_hf_tokenizer=bool(actual_hf_tokenizer_object),
+                    model_config_vocab_size=cfg_vocab_size,
+                    model_config_eos_token_id=cfg_eos, model_config_pad_token_id=cfg_pad,
+                    model_config_unk_token_id=cfg_unk,
+                    model_config_bos_token_id=cfg_bos   # From model's config
+                )
+        else: # Pre-training
+            if manual_vocab_dict_loaded is None or cfg_vocab_size == 0:
+                 logger.error("Manual vocabulary must be provided and valid for pre-training.")
+                 return
+            train_ds = ApertisPretrainDataset(
+                data_path=data_cfg.get("train_data_path"), vocab_dict=manual_vocab_dict_loaded,
+                model_config_vocab_size=cfg_vocab_size, # From model's config
+                max_length=data_cfg.get("max_length",512), multimodal=model_for_trainer.config.multimodal,
+                image_dir=data_cfg.get("image_dir"), image_size=model_for_trainer.config.image_size,
+                pad_token_id_from_config=cfg_pad,    # From model's config
+                unk_token_id_from_config=cfg_unk,    # From model's config
+                bos_token_id_from_config=cfg_bos,    # From model's config
+                eos_token_id_from_config=cfg_eos     # From model's config
+            )
+            if data_cfg.get("val_data_path"):
+                val_ds = ApertisPretrainDataset(
+                    data_cfg.get("val_data_path"), manual_vocab_dict_loaded,
+                    cfg_vocab_size, # From model's config
+                    data_cfg.get("max_length",512), model_for_trainer.config.multimodal,
+                    data_cfg.get("image_dir"), model_for_trainer.config.image_size,
+                    pad_token_id_from_config=cfg_pad,   # From model's config
+                    unk_token_id_from_config=cfg_unk,   # From model's config
+                    bos_token_id_from_config=cfg_bos,   # From model's config
+                    eos_token_id_from_config=cfg_eos    # From model's config
+                )
+        logger.info("Datasets initialized using special token IDs from the final model configuration.")
+    except Exception as e:
+        logger.error(f"Error creating datasets with model config tokens: {e}", exc_info=True); return
+        
     actual_stop_event = stop_event if stop_event is not None else threading.Event()
 
     try:

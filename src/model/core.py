@@ -1417,10 +1417,9 @@ class ApertisForCausalLM(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
+            # Standard practice is to use -100 as the ignore_index.
+            # Datasets should prepare labels accordingly (e.g., padding tokens set to -100).
             current_ignore_index = -100 
-            # Heuristic: if -100 is not used anywhere in labels, assume pad_token_id should be ignored.
-            if not (labels == -100).any():
-                current_ignore_index = self.config.pad_token_id
 
             # Ensure sequence lengths match for loss calculation after shifting
             if shift_logits.shape[1] != shift_labels.shape[1]:
@@ -2093,6 +2092,12 @@ def create_apertis_model(
 
     # Log the actual parameters of the configured model
     actual_params = estimate_model_parameters(config)
+    logger.info(
+        f"Final ApertisConfig values for model creation: "
+        f"vocab_size={config.vocab_size}, "
+        f"pad_token_id={config.pad_token_id}, bos_token_id={config.bos_token_id}, "
+        f"eos_token_id={config.eos_token_id}, unk_token_id={config.unk_token_id}"
+    )
     logger.info(f"Model configured with H={config.hidden_size}, L={config.num_hidden_layers}, A={config.num_attention_heads}, I={config.intermediate_size}, V={config.vocab_size}.")
     logger.info(f"Estimated actual parameters for this configuration: {actual_params/1e6:.2f}M. Target was ~{parse_param_count(target_param_count)/1e6:.2f}M.")
 
