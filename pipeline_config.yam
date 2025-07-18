@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------------------
+# Apertis Data Pipeline Configuration
+# This is a template file. Copy this to your own `pipeline_config.yaml`
+# and modify it for your specific needs.
+# ---------------------------------------------------------------------------
+
+spark:
+  # 'local[*]' uses all available cores on the machine. For a real cluster,
+  # this would be the address of your Spark master (e.g., 'spark://host:port', 'yarn').
+  master: "local[*]"
+  
+  # Adjust driver memory based on your machine's RAM.
+  # Should be less than your total system RAM.
+  driver_memory: "22g"
+  
+  # Memory per worker process. Only relevant in cluster mode.
+  executor_memory: "8g"
+  num_executors: null
+  executor_cores: 4
+  
+  extra_configs:
+    # Directory for Spark's temporary "shuffle" files.
+    # IMPORTANT: Change this to a path on a drive with lots of free space for large runs.
+    # Use forward slashes, e.g., "D:/spark-temp"
+    spark.local.dir: "/tmp/spark-temp"
+    
+    # Required for GraphFrames (if you switch back to it). Harmless to keep.
+    # spark.jars.packages: "com.github.brkyvz:graphframes:0.8.3-spark3.4-s_2.13"
+
+    # Safety limit for data collected to the driver.
+    spark.driver.maxResultSize: "4g"
+
+    # Performance optimizations
+    spark.sql.execution.arrow.pyspark.enabled: "true"
+    spark.serializer: "org.apache.spark.serializer.KryoSerializer"
+    spark.kryoserializer.buffer.max: "2047m"
+    spark.sql.shuffle.partitions: "200"
+
+download:
+  source: "common_crawl"
+  warc_paths_url: "https://data.commoncrawl.org/crawl-data/CC-MAIN-2023-50/warc.paths.gz"
+  
+  # Number of raw data files to download and process.
+  # Set to a small number (e.g., 2) for testing, or a large number for a real run.
+  num_warc_files: 1000
+  
+  output_dir: "data/pipeline/raw_warc"
+  num_partitions: 200
+
+clean:
+  input_dir: "data/pipeline/raw_warc"
+  output_dir: "data/pipeline/cleaned_text"
+  min_text_length: 256
+  max_text_length: 100000
+  
+  # Path to the downloaded FastText language identification model.
+  fasttext_model_path: "models/lid.176.bin"
+  language_whitelist:
+  - en
+  num_partitions: 200
+
+deduplicate:
+  # For a real run, this should point to the output of the 'clean' stage.
+  input_dir: "data/pipeline/cleaned_text"
+  output_dir: "data/pipeline/deduplicated_text"
+  minhash_threshold: 0.8
+  num_minhash_permutations: 128
+  lsh_num_bands: 16
+  num_partitions: 200
+  connected_components_iterations: 10
+
+tokenize:
+  input_dir: "data/pipeline/deduplicated_text"
+  output_dir: "data/pipeline/tokenized"
+  
+  # Hugging Face tokenizer name or path to a local tokenizer directory.
+  tokenizer_path: "gpt2"
+  max_seq_length: 2048
+  output_format: "parquet"
+  num_partitions: 200
+
+# Defines which stages of the pipeline to run.
+# For a full run, all stages should be active.
+stages:
+- download
+- clean
+- deduplicate
+- tokenize

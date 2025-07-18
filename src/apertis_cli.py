@@ -192,6 +192,28 @@ def create_config_command(args):
     print(f"Sample training configuration created at: {args.output}")
     print("Edit this file to customize your training settings.")
 
+def data_pipeline_command(args):
+    """Handle the data-pipeline command."""
+    from src.data_pipeline.main import run_pipeline
+    from src.data_pipeline.config import DataPipelineConfig
+    
+    if not os.path.exists(args.config):
+        logger.error(f"Data pipeline configuration file not found: {args.config}")
+        sys.exit(1)
+        
+    logger.info(f"Loading data pipeline configuration from {args.config}")
+    config = DataPipelineConfig.from_yaml(args.config)
+    run_pipeline(config)
+
+def create_pipeline_config_command(args):
+    """Handle the create-pipeline-config command."""
+    from src.data_pipeline.config import create_sample_pipeline_config
+    
+    create_sample_pipeline_config(args.output)
+    logger.info(f"Sample data pipeline configuration created at {args.output}")
+    print(f"Sample data pipeline configuration created at: {args.output}")
+    print("Edit this file to configure your data processing stages.")
+
 def main():
     """Main entry point for the CLI."""
     # Ensure src module can be imported
@@ -204,7 +226,7 @@ def main():
     )
     
     # Create subparsers
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute", required=True)
     
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Chat with an Apertis model")
@@ -252,7 +274,15 @@ def main():
     # Create config command
     create_config_parser = subparsers.add_parser("create-config", help="Create a sample training configuration")
     create_config_parser.add_argument("--output", type=str, default="config.json", help="Output file path")
-    
+
+    # Data pipeline command
+    pipeline_parser = subparsers.add_parser("data-pipeline", help="Run the distributed data processing pipeline")
+    pipeline_parser.add_argument("--config", type=str, required=True, help="Path to the data pipeline YAML configuration file")
+
+    # Create pipeline config command
+    create_pipeline_config_parser = subparsers.add_parser("create-pipeline-config", help="Create a sample data pipeline configuration file")
+    create_pipeline_config_parser.add_argument("--output", type=str, default="pipeline_config.yaml", help="Output file path for the pipeline config")
+
     # Parse arguments
     args = parser.parse_args()
     
@@ -265,6 +295,10 @@ def main():
         create_model_command(args)
     elif args.command == "create-config":
         create_config_command(args)
+    elif args.command == "data-pipeline":
+        data_pipeline_command(args)
+    elif args.command == "create-pipeline-config":
+        create_pipeline_config_command(args)
     else:
         parser.print_help()
 
