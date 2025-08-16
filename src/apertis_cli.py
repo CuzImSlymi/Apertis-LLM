@@ -10,7 +10,7 @@ import json
 import torch
 from pathlib import Path
 import logging
-import time # <-- Make sure this import is present
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -57,8 +57,6 @@ def chat_command(args):
     )
     
     if args.web:
-        # THE CRITICAL FIX IS HERE:
-        # We must block the main thread to keep the script and the background Gradio server alive.
         print(f"\nApertis web interface is running. Access it at http://localhost:{args.port}")
         print("Press Ctrl+C in this terminal to stop the server.")
         try:
@@ -67,7 +65,6 @@ def chat_command(args):
         except KeyboardInterrupt:
             print("\nShutting down Apertis web interface...")
     else:
-        # This is the interactive CLI part, which already has a blocking loop.
         print("Apertis CLI Chat Interface")
         print("Type 'exit' to quit, 'reset' to reset chat history")
         
@@ -219,8 +216,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute", required=True)
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
     
+    # Chat command
     chat_parser = subparsers.add_parser("chat", help="Chat with an Apertis model")
     chat_parser.add_argument("--model-path", type=str, help="Path to the model file or directory")
     chat_parser.add_argument("--vocab-file", type=str, help="Path to the vocabulary file")
@@ -235,9 +233,11 @@ def main():
     chat_parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling parameter")
     chat_parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling parameter")
     
+    # Train command
     train_parser = subparsers.add_parser("train", help="Train an Apertis model")
     train_parser.add_argument("--config", type=str, required=True, help="Path to training configuration file")
     
+    # Create model command
     create_model_parser = subparsers.add_parser("create-model", help="Create a new Apertis model based on target parameter count")
     create_model_parser.add_argument("--target-params", type=str, default="125M", help="Target parameter count (e.g., 10M, 125M, 1.5B, 7B, 70B)")
     create_model_parser.add_argument("--vocab-size", type=int, help="Override default vocabulary size for the new model")
@@ -245,6 +245,7 @@ def main():
     create_model_parser.add_argument("--flash-attention", action="store_true", help="Use flash attention (if supported by attention type)")
     create_model_parser.add_argument("--output-dir", type=str, default="models/new_param_model", help="Output directory for model files")
 
+    # MoE specific arguments for create-model
     moe_group = create_model_parser.add_argument_group('MoE Configuration (used if --expert-system is specified)')
     moe_group.add_argument("--expert-system", action="store_true", help="Use adaptive expert system (MoE)")
     moe_group.add_argument("--num-experts", type=int, default=8, help="Number of experts")
@@ -260,17 +261,26 @@ def main():
     moe_group.add_argument("--use-router-z-loss", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable router z-loss (True/False)")
     moe_group.add_argument("--use-load-balancing-loss", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable load balancing loss (True/False)")
 
+    # Create config command
     create_config_parser = subparsers.add_parser("create-config", help="Create a sample training configuration")
     create_config_parser.add_argument("--output", type=str, default="config.json", help="Output file path")
 
+    # Data pipeline command
     pipeline_parser = subparsers.add_parser("data-pipeline", help="Run the distributed data processing pipeline")
     pipeline_parser.add_argument("--config", type=str, required=True, help="Path to the data pipeline YAML configuration file")
 
+    # Create pipeline config command
     create_pipeline_config_parser = subparsers.add_parser("create-pipeline-config", help="Create a sample data pipeline configuration file")
     create_pipeline_config_parser.add_argument("--output", type=str, default="pipeline_config.yaml", help="Output file path for the pipeline config")
 
+    # Parse arguments
     args = parser.parse_args()
     
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+    
+    # Execute command
     if args.command == "chat":
         chat_command(args)
     elif args.command == "train":
@@ -283,8 +293,6 @@ def main():
         data_pipeline_command(args)
     elif args.command == "create-pipeline-config":
         create_pipeline_config_command(args)
-    else:
-        parser.print_help()
 
 if __name__ == "__main__":
     main()
