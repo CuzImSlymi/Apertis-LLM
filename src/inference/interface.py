@@ -15,9 +15,11 @@ import threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model, estimate_model_parameters # Added estimate_model_parameters
+from src.model.core import ApertisConfig, ApertisForCausalLM, create_apertis_model, estimate_model_parameters
 from src.training.pipeline import get_available_gpus
-from src.training import train_from_config
+# CORRECTED IMPORT: Import directly from the specific modules to break the circular dependency
+from src.training.pipeline import train_from_config as standard_train_from_config
+from src.training.azr_pipeline import train_from_config as azr_train_from_config
 
 
 logging.basicConfig(
@@ -30,15 +32,15 @@ class ApertisInterface:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        vocab_file: Optional[str] = None, 
+        vocab_file: Optional[str] = None,
         multimodal: bool = False,
         device: Optional[str] = None,
         web: bool = False,
         port: int = 7860,
         share: bool = False,
     ):
-        self.model_path_arg = model_path 
-        self.vocab_file_fallback_arg = vocab_file 
+        self.model_path_arg = model_path
+        self.vocab_file_fallback_arg = vocab_file
         self.multimodal = multimodal
         self.web = web
         self.port = port
@@ -51,13 +53,13 @@ class ApertisInterface:
         logger.info(f"Using device: {self.device}")
 
         self.model: Optional[ApertisForCausalLM] = None
-        self.vocab: Optional[Dict[str, int]] = None 
-        self.reverse_vocab: Optional[Dict[int, str]] = None 
-        self.token_mapping: Optional[Dict[int, int]] = None 
+        self.vocab: Optional[Dict[str, int]] = None
+        self.reverse_vocab: Optional[Dict[int, str]] = None
+        self.token_mapping: Optional[Dict[int, int]] = None
 
         self.hf_tokenizer_chat = None
-        self.actual_model_path_loaded = None 
-        self.actual_tokenizer_path_loaded = None 
+        self.actual_model_path_loaded = None
+        self.actual_tokenizer_path_loaded = None
 
 
         if self.model_path_arg is not None:
@@ -109,12 +111,12 @@ class ApertisInterface:
                 logger.info(f"Successfully loaded Hugging Face tokenizer from directory: {path_to_check}")
                 self.actual_tokenizer_path_loaded = path_to_check
                 return True
-            
+
             if not os.path.isdir(path_to_check):
                 try:
                     self.hf_tokenizer_chat = AutoTokenizer.from_pretrained(path_to_check)
                     logger.info(f"Successfully loaded Hugging Face tokenizer from Hub ID/path: {path_to_check}")
-                    self.actual_tokenizer_path_loaded = path_to_check 
+                    self.actual_tokenizer_path_loaded = path_to_check
                     return True
                 except EnvironmentError:
                     logger.debug(f"'{path_to_check}' is not a local tokenizer directory and failed to load as Hub ID.")
@@ -131,24 +133,24 @@ class ApertisInterface:
         self.reverse_vocab = None
         self.token_mapping = None
         self.hf_tokenizer_chat = None
-        self.actual_model_path_loaded = model_path_or_name 
+        self.actual_model_path_loaded = model_path_or_name
         self.vocab_file_fallback_arg = vocab_file_override
 
         tokenizer_found_and_loaded = False
         potential_tokenizer_base_dir = model_path_or_name
         if os.path.isfile(model_path_or_name):
             potential_tokenizer_base_dir = os.path.dirname(model_path_or_name)
-        
+
         if os.path.isdir(potential_tokenizer_base_dir):
             logger.info(f"Checking for HF tokenizer in potential base directory: {potential_tokenizer_base_dir}")
             if self._attempt_load_hf_tokenizer(potential_tokenizer_base_dir):
                 tokenizer_found_and_loaded = True
-        
+
         if not tokenizer_found_and_loaded and model_path_or_name != potential_tokenizer_base_dir:
             logger.info(f"Base directory tokenizer check failed or paths differ. Checking original path '{model_path_or_name}' as HF tokenizer source.")
             if self._attempt_load_hf_tokenizer(model_path_or_name):
                 tokenizer_found_and_loaded = True
-        
+
         self.load_model(model_path_or_name)
 
         if self.model and not self.hf_tokenizer_chat:
@@ -157,7 +159,7 @@ class ApertisInterface:
                 manual_vocab_path_to_try = vocab_file_override
             elif os.path.isdir(potential_tokenizer_base_dir):
                 manual_vocab_path_to_try = os.path.join(potential_tokenizer_base_dir, "vocab.json")
-            
+
             if manual_vocab_path_to_try and os.path.exists(manual_vocab_path_to_try):
                 logger.info(f"HF tokenizer not found/loaded. Attempting to load manual vocab from: {manual_vocab_path_to_try}")
                 self.load_manual_vocabulary(manual_vocab_path_to_try)
@@ -165,7 +167,7 @@ class ApertisInterface:
                 logger.warning("No Hugging Face tokenizer found/loaded, and no fallback manual vocab.json could be automatically determined or provided. Chat may not work correctly.")
                 self._create_fallback_vocab()
                 self.actual_tokenizer_path_loaded = "Fallback minimal vocab for chat"
-        
+
         elif self.model and self.hf_tokenizer_chat:
             if hasattr(self.model.config, "vocab_size") and self.model.config.vocab_size != self.hf_tokenizer_chat.vocab_size:
                 logger.error(
@@ -187,11 +189,11 @@ class ApertisInterface:
         try:
             logger.info(f"Loading model. Input path/name: {model_weights_path_input}")
             config_for_model_instantiation: Optional[ApertisConfig] = None
-            
+
             model_config_base_dir = model_weights_path_input
             if os.path.isfile(model_weights_path_input):
                 model_config_base_dir = os.path.dirname(model_weights_path_input)
-            
+
             config_json_path = os.path.join(model_config_base_dir, "config.json")
             if os.path.exists(config_json_path):
                 config_for_model_instantiation = ApertisConfig.from_pretrained(config_json_path)
@@ -207,7 +209,7 @@ class ApertisInterface:
                 if self.hf_tokenizer_chat.eos_token_id is not None: config_for_model_instantiation.eos_token_id = self.hf_tokenizer_chat.eos_token_id
                 if self.hf_tokenizer_chat.unk_token_id is not None: config_for_model_instantiation.unk_token_id = self.hf_tokenizer_chat.unk_token_id
                 logger.info(f"Model config aligned with HF tokenizer. New vocab_size: {config_for_model_instantiation.vocab_size}")
-            
+
             state_dict_path_final = None
             if os.path.isdir(model_weights_path_input):
                 bin_path = os.path.join(model_weights_path_input, "pytorch_model.bin")
@@ -217,7 +219,7 @@ class ApertisInterface:
             elif os.path.isfile(model_weights_path_input) and \
                  (model_weights_path_input.endswith(".pt") or model_weights_path_input.endswith(".bin")):
                 state_dict_path_final = model_weights_path_input
-            
+
             if not config_for_model_instantiation and state_dict_path_final:
                 logger.info(f"No config.json. Attempting to infer config from state_dict: {state_dict_path_final}")
                 config_for_model_instantiation = self._infer_config_from_state_dict(state_dict_path_final)
@@ -231,7 +233,7 @@ class ApertisInterface:
                 self.model = ApertisForCausalLM(config_for_model_instantiation)
                 if state_dict_path_final and os.path.exists(state_dict_path_final):
                     loaded_state_dict = torch.load(state_dict_path_final, map_location=self.device, weights_only=True)
-                    
+
                     emb_weights_key = "model.token_embeddings.weight"
                     lm_head_weights_key = "lm_head.weight"
                     sd_vocab_size = -1
@@ -239,7 +241,7 @@ class ApertisInterface:
                         sd_vocab_size = loaded_state_dict[emb_weights_key].shape[0]
                     elif lm_head_weights_key in loaded_state_dict and self.model.config.tie_word_embeddings:
                          sd_vocab_size = loaded_state_dict[lm_head_weights_key].shape[0]
-                    
+
                     if sd_vocab_size != -1 and self.model.config.vocab_size != sd_vocab_size:
                         logger.warning(
                             f"Model instance's config vocab_size ({self.model.config.vocab_size}) "
@@ -249,7 +251,7 @@ class ApertisInterface:
                         )
                         self.model.resize_token_embeddings(sd_vocab_size)
                         logger.info(f"Model resized to vocab_size {sd_vocab_size} to match state_dict.")
-                    
+
                     load_result = self.model.load_state_dict(loaded_state_dict, strict=False)
                     logger.info(f"Loaded model weights from {state_dict_path_final}. Final model config vocab_size: {self.model.config.vocab_size}")
                     if load_result.missing_keys: logger.warning(f"Missing keys during load: {load_result.missing_keys}")
@@ -281,7 +283,7 @@ class ApertisInterface:
         logger.info(f"Attempting to infer model config from state_dict file: {pt_path}")
         try:
             state_dict = torch.load(pt_path, map_location="cpu", weights_only=True)
-            
+
             vocab_size = 0
             if "model.token_embeddings.weight" in state_dict:
                 vocab_size = state_dict["model.token_embeddings.weight"].shape[0]
@@ -289,7 +291,7 @@ class ApertisInterface:
                 vocab_size = state_dict["lm_head.weight"].shape[0]
             else:
                 vocab_size = self.hf_tokenizer_chat.vocab_size if self.hf_tokenizer_chat else 32000
-            
+
             hidden_size = 0
             if "model.token_embeddings.weight" in state_dict:
                 hidden_size = state_dict["model.token_embeddings.weight"].shape[1]
@@ -303,7 +305,7 @@ class ApertisInterface:
             layer_count = 0; layer_prefixes = set()
             for k in state_dict.keys():
                 if k.startswith("model.layers."):
-                    parts = k.split('.'); 
+                    parts = k.split('.');
                     if len(parts) > 2 and parts[2].isdigit(): layer_prefixes.add(parts[2])
             layer_count = len(layer_prefixes) if layer_prefixes else 12
 
@@ -312,7 +314,7 @@ class ApertisInterface:
                  for i in range(num_attn_heads, 0, -1):
                     if hidden_size % i == 0: num_attn_heads = i; break
                  if hidden_size % num_attn_heads != 0: num_attn_heads = 1
-            
+
             intermediate_size = hidden_size * 4 if hidden_size > 0 else 3072
             use_expert_system = any("experts" in k for k in state_dict.keys())
             multimodal_inferred = any("multimodal_encoder" in k or "vision_projection" in k for k in state_dict.keys())
@@ -326,16 +328,16 @@ class ApertisInterface:
             }
             if not multimodal_inferred and hasattr(self, 'multimodal'):
                 conf_params["multimodal"] = self.multimodal
-            
+
             conf = ApertisConfig(**conf_params)
-            
+
             if self.hf_tokenizer_chat:
                 if self.hf_tokenizer_chat.pad_token_id is not None: conf.pad_token_id = self.hf_tokenizer_chat.pad_token_id
                 if self.hf_tokenizer_chat.bos_token_id is not None: conf.bos_token_id = self.hf_tokenizer_chat.bos_token_id
                 if self.hf_tokenizer_chat.eos_token_id is not None: conf.eos_token_id = self.hf_tokenizer_chat.eos_token_id
                 if self.hf_tokenizer_chat.unk_token_id is not None: conf.unk_token_id = self.hf_tokenizer_chat.unk_token_id
             return conf
-            
+
         except Exception as e:
             logger.error(f"Error inferring config from {pt_path}: {e}", exc_info=True)
             return None
@@ -345,7 +347,7 @@ class ApertisInterface:
             logger.info(f"Loading manual vocabulary from {vocab_file}")
             with open(vocab_file, "r", encoding="utf-8") as f:
                 vocab_data = json.load(f)
-            
+
             loaded_vocab_dict = {}
             if isinstance(vocab_data, dict):
                 if "tokens" in vocab_data and isinstance(vocab_data["tokens"], list):
@@ -366,11 +368,11 @@ class ApertisInterface:
 
             if self.model and hasattr(self.model.config, "vocab_size"):
                 model_cfg_vocab_size = self.model.config.vocab_size
-                
+
                 max_id_in_loaded_vocab = 0
                 if self.vocab: max_id_in_loaded_vocab = max(self.vocab.values() or [-1])
                 effective_loaded_vocab_size = max_id_in_loaded_vocab + 1
-                
+
                 if model_cfg_vocab_size != effective_loaded_vocab_size :
                     logger.warning(
                         f"Model config vocab_size ({model_cfg_vocab_size}) != "
@@ -381,8 +383,8 @@ class ApertisInterface:
                     self.token_mapping = None
                 else:
                     logger.info(f"Model config vocab_size matches manual vocab effective size: {model_cfg_vocab_size}")
-                    self.token_mapping = None 
-            else: 
+                    self.token_mapping = None
+            else:
                 self.token_mapping = None
         except Exception as e:
             logger.error(f"Error loading manual vocabulary from {vocab_file}: {e}", exc_info=True)
@@ -400,7 +402,7 @@ class ApertisInterface:
         if not self.model:
             logger.error("Model not loaded. Cannot tokenize.")
             return []
-        
+
         if self.hf_tokenizer_chat:
             return self.hf_tokenizer_chat.encode(text, add_special_tokens=False)
 
@@ -413,7 +415,7 @@ class ApertisInterface:
         raw_token_ids_from_vocab_file = [
             self.vocab.get(word, self.vocab.get("<unk>", model_config.unk_token_id)) for word in text.split()
         ]
-        
+
         final_token_ids = []
         for tid in raw_token_ids_from_vocab_file:
             if tid >= model_config.vocab_size:
@@ -439,13 +441,13 @@ class ApertisInterface:
             unk_id_in_vocab_file = self.vocab["<unk>"]
             if unk_id_in_vocab_file in self.reverse_vocab:
                 default_unk_str = self.reverse_vocab[unk_id_in_vocab_file]
-        
+
         for model_token_id in token_ids:
             if model_token_id == model_config.pad_token_id or \
                model_token_id == model_config.bos_token_id or \
                model_token_id == model_config.eos_token_id:
                 continue
-            
+
             word = self.reverse_vocab.get(model_token_id)
             if word is not None:
                 words.append(word)
@@ -501,11 +503,11 @@ class ApertisInterface:
 
             eos_token_id_for_gen = self.model.config.eos_token_id
             pad_token_id_for_gen = self.model.config.pad_token_id
-            
+
             if self.hf_tokenizer_chat:
                 if self.hf_tokenizer_chat.eos_token_id is not None: eos_token_id_for_gen = self.hf_tokenizer_chat.eos_token_id
                 if self.hf_tokenizer_chat.pad_token_id is not None: pad_token_id_for_gen = self.hf_tokenizer_chat.pad_token_id
-            
+
             output_ids = self.model.generate(
                 input_ids=input_t, attention_mask=attention_mask_t, pixel_values=pixel_values_t,
                 max_new_tokens=max_length, do_sample=temperature > 0.001,
@@ -516,9 +518,9 @@ class ApertisInterface:
                 eos_token_id=eos_token_id_for_gen,
                 pad_token_id=pad_token_id_for_gen
             )
-            
+
             generated_part_ids = output_ids[0, input_t.shape[1]:].tolist()
-            
+
             if self.hf_tokenizer_chat:
                 return self.hf_tokenizer_chat.decode(generated_part_ids, skip_special_tokens=True)
             else:
@@ -532,19 +534,9 @@ class ApertisInterface:
         self, message: str, image_path: Optional[str] = None, max_length: int = 100,
         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9,
     ) -> str:
-
-        full_prompt_parts = []
-        for entry in self.chat_history:
-            full_prompt_parts.append(f"{entry['role'].capitalize()}: {entry['content']}")
-        full_prompt_parts.append(f"User: {message}")
-        full_prompt_parts.append("Assistant:")
-
-        prompt_text_for_model = "\n".join(full_prompt_parts)
-
-        response = self.generate_response(prompt_text_for_model, image_path, max_length, temperature, top_k, top_p)
-
-        self.chat_history.append({"role": "user", "content": message})
-        self.chat_history.append({"role": "assistant", "content": response})
+        # This method is now stateless regarding history.
+        # It takes the full prompt from the UI handler.
+        response = self.generate_response(message, image_path, max_length, temperature, top_k, top_p)
         return response
 
     def reset_chat(self) -> None: self.chat_history = []
@@ -574,7 +566,6 @@ class ApertisInterface:
                     with gr.Row():
                         with gr.Column(scale=1):
                             gr.Markdown("## Model Config")
-                            # model_size_train_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
                             model_param_count_train_tb = gr.Textbox(value="125M", label="Target Parameter Count (e.g., 7B, 350M, 125000000)")
                             attn_type_train_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             flash_attn_train_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True)
@@ -605,11 +596,24 @@ class ApertisInterface:
                             expert_sys_train_cb.change(lambda x: gr.update(visible=x), inputs=[expert_sys_train_cb], outputs=[train_moe_options_group])
 
                             gr.Markdown("## Data (Pre-training)")
-                            train_file_up = gr.File(label="Train Data (JSONL, field: 'text')", file_types=[".jsonl"])
-                            val_file_up = gr.File(label="Val Data (JSONL, optional)", file_types=[".jsonl"])
-                            vocab_file_up_std_train = gr.File(label="Vocab File (.json, e.g. {'<pad>':0,...} or {'tokens':['<pad>',...]} )", file_types=[".json"])
+                            streaming_dataset_cb = gr.Checkbox(label="Use Streaming Dataset (for large-scale pre-training from Parquet)", value=False)
+                            
+                            train_file_up_single = gr.File(label="Train Data (JSONL)", file_count="single", file_types=[".jsonl"], visible=True)
+                            train_file_up_dir = gr.File(label="Train Data Directory (containing .parquet files)", file_count="directory", visible=False)
+                            val_file_up_single = gr.File(label="Val Data (JSONL, optional)", file_count="single", file_types=[".jsonl"], visible=True)
+                            val_file_up_dir = gr.File(label="Val Data Directory (Parquet, optional)", file_count="directory", visible=False)
+
+                            vocab_file_up_std_train = gr.File(label="Vocab File (.json, required for non-streaming)", file_types=[".json"], visible=True)
                             img_dir_train_tb = gr.Textbox(label="Image Dir (for multimodal)", placeholder="/path/to/images", visible=False)
                             multimodal_train_cb.change(lambda x: gr.update(visible=x), inputs=[multimodal_train_cb], outputs=[img_dir_train_tb])
+                            steps_per_epoch_num = gr.Number(label="Steps Per Epoch (Required for streaming)", value=0, precision=0, visible=False)
+
+                            def toggle_streaming_options(use_streaming):
+                                return gr.update(visible=not use_streaming), gr.update(visible=use_streaming), \
+                                       gr.update(visible=not use_streaming), gr.update(visible=use_streaming), \
+                                       gr.update(visible=not use_streaming), gr.update(visible=use_streaming)
+                            streaming_dataset_cb.change(toggle_streaming_options, inputs=[streaming_dataset_cb], outputs=[train_file_up_single, train_file_up_dir, val_file_up_single, val_file_up_dir, vocab_file_up_std_train, steps_per_epoch_num])
+
 
                         with gr.Column(scale=1):
                             gr.Markdown("## Pre-training Params")
@@ -696,7 +700,6 @@ class ApertisInterface:
                         with gr.Column(scale=1):
                             gr.Markdown("## 1. AZR Model & Data")
                             with gr.Accordion("Model Config (for AZR internal model)", open=True):
-                                # azr_model_size_dd = gr.Dropdown(["small", "base", "large"], value="base", label="Base Model Size")
                                 azr_param_count_tb = gr.Textbox(value="125M", label="Target Parameter Count (AZR Model, e.g., 1B, 250M)")
                                 azr_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                                 azr_flash_attn_cb = gr.Checkbox(label="Use FlashAttention (for Standard MHA)", value=False, visible=True)
@@ -755,9 +758,9 @@ class ApertisInterface:
                                 azr_wandb_cb = gr.Checkbox(label="Log to W&B")
                                 azr_wandb_proj_tb = gr.Textbox("apertis-azr", label="W&B Project", visible=False)
                                 azr_wandb_cb.change(lambda x: gr.update(visible=x), inputs=[azr_wandb_cb], outputs=[azr_wandb_proj_tb])
-                            
+
                             azr_output_dir_tb = gr.Textbox("output_azr", label="Output Directory")
-                            
+
                             with gr.Row():
                                 azr_start_btn = gr.Button("Start AZR Training", variant="primary")
                                 azr_stop_btn = gr.Button("Stop AZR Training")
@@ -773,13 +776,11 @@ class ApertisInterface:
                             model_info_load_tb = gr.Textbox(label="Loaded Model Info", interactive=False, lines=10, autoscroll=True)
                         with gr.Column(scale=1):
                             gr.Markdown("## Create New Model (for Pre-training)")
-                            # new_model_size_dd = gr.Dropdown(["small","base","large"], value="base", label="Model Size")
                             new_model_param_count_tb = gr.Textbox(value="125M", label="Target Parameter Count (e.g., 1.5B, 500M)")
                             new_attn_type_dd = gr.Dropdown(["selective_ssm", "standard_mha"], value="standard_mha", label="Attention Type")
                             new_multimodal_cb = gr.Checkbox(label="Multimodal")
                             new_expert_cb = gr.Checkbox(label="Use Expert System")
 
-                            # MoE specific parameters for "Create New Model" tab
                             with gr.Group(visible=False) as new_moe_options_group:
                                 gr.Markdown("### MoE Configuration")
                                 new_num_experts_sl = gr.Number(value=8, minimum=1, maximum=64, precision=0, label="Number of Experts")
@@ -812,39 +813,34 @@ class ApertisInterface:
                 outputs=[new_flash_attn_cb]
             )
 
-            # Visibility for MoE options group in "Create New Model" tab
             new_expert_cb.change(lambda x: gr.update(visible=x), inputs=[new_expert_cb], outputs=[new_moe_options_group])
 
 
-            def ui_chat_handler(msg, img, max_new, temp, tk, tp, hist):
+            def ui_chat_handler(msg, img, hist, max_new, temp, tk, tp):
                 if not self.model:
                     gr.Warning("No model loaded. Please load a model from the 'Models' tab.")
                     return hist, ""
-                if not msg.strip() and not img: 
+                if not msg.strip() and not img:
                     gr.Info("Please provide a message or an image.")
                     return hist, ""
                 
-                response_from_model = self.chat(msg, img, max_new, temp, tk, tp)
+                # Use a local copy for history manipulation to avoid state issues
+                local_history = hist + [{"role": "user", "content": msg}]
                 
-                gradio_display_history = []
-                temp_internal_history_for_display = self.chat_history.copy()
+                # Create the prompt from the entire history
+                full_prompt_for_gen = "\n".join([f"{entry['role'].capitalize()}: {entry['content']}" for entry in local_history]) + "\nAssistant:"
+
+                response_from_model = self.generate_response(full_prompt_for_gen, img, max_new, temp, tk, tp)
                 
-                user_turn_text_for_display = None
-                for entry_idx in range(len(temp_internal_history_for_display)):
-                    if temp_internal_history_for_display[entry_idx]["role"] == "user":
-                        user_turn_text_for_display = temp_internal_history_for_display[entry_idx]["content"]
-                    elif temp_internal_history_for_display[entry_idx]["role"] == "assistant" and user_turn_text_for_display is not None:
-                        gradio_display_history.append( (user_turn_text_for_display, temp_internal_history_for_display[entry_idx]["content"]) )
-                        user_turn_text_for_display = None
+                # Append the assistant's response to the history
+                local_history.append({"role": "assistant", "content": response_from_model})
+                
+                return local_history, ""
 
-                return gradio_display_history, ""
-
-
-            submit_btn_chat.click(ui_chat_handler, [msg_textbox, img_input_chat, max_new_tokens_slider, temp_slider_chat, top_k_slider_chat, top_p_slider_chat, chatbot_ui], [chatbot_ui, msg_textbox])
-            msg_textbox.submit(ui_chat_handler, [msg_textbox, img_input_chat, max_new_tokens_slider, temp_slider_chat, top_k_slider_chat, top_p_slider_chat, chatbot_ui], [chatbot_ui, msg_textbox])
+            submit_btn_chat.click(ui_chat_handler, [msg_textbox, img_input_chat, chatbot_ui, max_new_tokens_slider, temp_slider_chat, top_k_slider_chat, top_p_slider_chat], [chatbot_ui, msg_textbox])
+            msg_textbox.submit(ui_chat_handler, [msg_textbox, img_input_chat, chatbot_ui, max_new_tokens_slider, temp_slider_chat, top_k_slider_chat, top_p_slider_chat], [chatbot_ui, msg_textbox])
 
             def ui_clear_chat_handler():
-                self.reset_chat()
                 return [], "", None
             clear_btn_chat.click(ui_clear_chat_handler, outputs=[chatbot_ui, msg_textbox, img_input_chat])
 
@@ -853,10 +849,10 @@ class ApertisInterface:
                 if not m_path_ui:
                     return "Please provide a model path or name."
                 self.load_model_and_tokenizer_from_path(m_path_ui, v_path_override_ui if v_path_override_ui else None)
-                
+
                 info_parts = [f"Attempted to load model using input path/name: {m_path_ui}"]
                 info_parts.append(f"  Actual model resource path: {self.actual_model_path_loaded or 'N/A'}")
-                
+
                 if self.model and hasattr(self.model.config, 'to_dict'):
                     cfg_dict = self.model.config.to_dict()
                     brief_cfg = {
@@ -867,7 +863,6 @@ class ApertisInterface:
                         "use_expert_system": cfg_dict.get("use_expert_system"),
                         "num_experts": cfg_dict.get("num_experts"),
                         "experts_per_token": cfg_dict.get("experts_per_token"),
-                        # Add other MoE params if desired for display
                         "pad_token_id":cfg_dict.get("pad_token_id"), "bos_token_id":cfg_dict.get("bos_token_id"),
                         "eos_token_id":cfg_dict.get("eos_token_id"), "unk_token_id":cfg_dict.get("unk_token_id"),
                     }
@@ -993,97 +988,6 @@ class ApertisInterface:
                 [create_model_status_tb]
             )
 
-            def ui_start_training_handler( # This is the old one, will be replaced by _updated version logic
-                m_s, attn_t, m_m, exp_s, tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
-                c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
-                
-                current_status = ""
-                if not tr_f_obj: current_status += "Training data file is required.\n"
-                if not voc_f_std_obj: current_status += "Vocabulary file (.json) is required for pre-training.\n"
-                if m_m and not img_d: current_status += "Image directory is required for multimodal pre-training.\n"
-                if not out_d: current_status += "Output directory is required.\n"
-                if current_status: return current_status.strip()
-
-                if self.standard_training_thread and self.standard_training_thread.is_alive():
-                    return "Pre-training is already in progress."
-
-                self.standard_training_stop_event.clear()
-                tmp_dir = tempfile.mkdtemp()
-                try:
-                    train_p = os.path.join(tmp_dir, "train.jsonl"); shutil.copy(tr_f_obj.name, train_p)
-                    vocab_p_std = os.path.join(tmp_dir, "vocab.json"); shutil.copy(voc_f_std_obj.name, vocab_p_std)
-                    val_p = None
-                    if v_f_obj: val_p = os.path.join(tmp_dir, "val.jsonl"); shutil.copy(v_f_obj.name, val_p)
-
-                    sel_gpus = [int(gid) for gid in g_sel] if g_sel else None
-                    dist_training_eff = d_train if sel_gpus and len(sel_gpus) > 1 else False
-
-                    cfg = {
-                        "data_config": {"train_data_path":train_p, "tokenizer_path":vocab_p_std, "val_data_path":val_p,
-                                        "max_length":512, "multimodal":m_m, "image_dir":img_d if m_m else None,
-                                        "image_size": 224},
-                        "model_config": {
-                            "model_size":m_s, "attention_type": attn_t, "multimodal":m_m, "use_expert_system":exp_s
-                        },
-                        "training_config": {
-                            "task_type": "pretrain",
-                            "output_dir":out_d, "batch_size":b_s, "learning_rate":learn_r, "num_epochs":eps,
-                            "warmup_steps":0, "gradient_accumulation_steps":4, "max_grad_norm": 1.0,
-                            "eval_every_n_epochs":eval_ep, "use_wandb":use_wb, "wandb_project":wb_p if use_wb else None,
-                            "wandb_run_name": None, "fp16":True, "device":None,
-                            "gpu_memory_fraction":g_mem_f,
-                            "use_gradient_checkpointing":True, "dynamic_batch_sizing":True,
-                            "checkpoint_steps":c_steps, "iteration_checkpoint_steps":iter_c_steps,
-                            "gpu_ids":sel_gpus, "distributed_training":dist_training_eff, "local_rank": -1
-                        }
-                    }
-                    
-                    cfg_path = os.path.join(tmp_dir, "run_cfg_pretrain.json");
-                    with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
-                    
-                    os.makedirs(out_d, exist_ok=True)
-                    final_cfg_path_in_output = os.path.join(out_d, "run_cfg_pretrain_used.json")
-                    shutil.copy(cfg_path, final_cfg_path_in_output)
-
-
-                    def _thread_train_job(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
-                        try:
-                            status_box_arg.value = f"Pre-training started. Output: {out_d}. Config: {final_cfg_path_in_output}\nFollow logs in console/wandb."
-                            train_from_config(c_p_arg, stop_event_arg)
-                            if stop_event_arg.is_set():
-                                status_box_arg.value += "\nPre-training stopped by user."
-                            else:
-                                status_box_arg.value += "\nPre-training completed."
-                        except Exception as e_thread:
-                             logger.error(f"Error in Pre-training thread: {e_thread}", exc_info=True)
-                             status_box_arg.value += f"\nError in Pre-training thread: {e_thread}"
-                        finally:
-                            shutil.rmtree(t_d_arg)
-                            self.standard_training_thread = None
-                    
-                    train_status_tb.value = "Initializing pre-training..."
-                    self.standard_training_thread = threading.Thread(target=_thread_train_job, args=(cfg_path, tmp_dir, self.standard_training_stop_event, train_status_tb), daemon=True)
-                    self.standard_training_thread.start()
-                    return f"Pre-training initiated. Output will be in '{out_d}'. Monitor console/W&B for progress. Copied config to '{final_cfg_path_in_output}'."
-                except Exception as e_start:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    logger.error(f"Failed to start pre-training: {e_start}", exc_info=True)
-                    return f"Failed to start pre-training: {e_start}"
-
-
-            def ui_stop_training_handler():
-                if self.standard_training_thread and self.standard_training_thread.is_alive():
-                    self.standard_training_stop_event.set()
-                    return "Stop request sent to Pre-training. Please wait for current step/epoch to finish."
-                return "No Pre-training in progress or thread already completed."
-
-            # Removed the first start_train_btn.click call that used ui_start_training_handler
-            # It is now superseded by the call below using ui_start_training_handler_updated
-            stop_train_btn.click(ui_stop_training_handler, outputs=[train_status_tb])
-
-            # Update the signature and logic for ui_start_training_handler
-            # The old handler ui_start_training_handler and its .click() registration were removed.
-            # This is the new handler.
             def ui_start_training_handler_updated(
                 param_count_str, attn_t, flash_attn_t_cb_val,
                 m_m, exp_s,
@@ -1093,13 +997,19 @@ class ApertisInterface:
                 router_z_loss_coef_train_val, use_noisy_top_k_routing_train_val,
                 use_expert_capacity_limit_train_val, use_expert_dropout_train_val,
                 use_router_z_loss_train_val, use_load_balancing_loss_train_val,
-                tr_f_obj, v_f_obj, voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
+                is_streaming, steps_per_epoch_val,
+                tr_f_obj_single, tr_f_obj_dir, v_f_obj_single, v_f_obj_dir,
+                voc_f_std_obj, img_d, b_s, learn_r, eps, eval_ep,
                 c_steps, iter_c_steps, g_sel, d_train, g_mem_f, out_d, use_wb, wb_p):
 
+                tr_f_obj = tr_f_obj_dir if is_streaming else tr_f_obj_single
+                v_f_obj = v_f_obj_dir if is_streaming else v_f_obj_single
+                
                 current_status = ""
                 if not param_count_str: current_status += "Target parameter count is required.\n"
-                if not tr_f_obj: current_status += "Training data file is required.\n"
-                if not voc_f_std_obj: current_status += "Vocabulary file (.json) is required for pre-training.\n"
+                if not tr_f_obj: current_status += "Training data path is required.\n"
+                if not is_streaming and not voc_f_std_obj: current_status += "Vocabulary file (.json) is required for non-streaming pre-training.\n"
+                if is_streaming and (not steps_per_epoch_val or steps_per_epoch_val <= 0): current_status += "`Steps Per Epoch` must be a positive number for streaming datasets.\n"
                 if m_m and not img_d: current_status += "Image directory is required for multimodal pre-training.\n"
                 if not out_d: current_status += "Output directory is required.\n"
                 if current_status: return current_status.strip()
@@ -1108,46 +1018,48 @@ class ApertisInterface:
                     return "Pre-training is already in progress."
 
                 self.standard_training_stop_event.clear()
-                tmp_dir = tempfile.mkdtemp()
+                
                 try:
-                    train_p = os.path.join(tmp_dir, "train.jsonl"); shutil.copy(tr_f_obj.name, train_p)
-                    vocab_p_std = os.path.join(tmp_dir, "vocab.json"); shutil.copy(voc_f_std_obj.name, vocab_p_std)
-                    val_p = None
-                    if v_f_obj: val_p = os.path.join(tmp_dir, "val.jsonl"); shutil.copy(v_f_obj.name, val_p)
+                    train_p = tr_f_obj.name
+                    vocab_p_std = voc_f_std_obj.name if voc_f_std_obj else None
+                    val_p = v_f_obj.name if v_f_obj else None
 
                     sel_gpus = [int(gid) for gid in g_sel] if g_sel else None
                     dist_training_eff = d_train if sel_gpus and len(sel_gpus) > 1 else False
-
                     effective_flash_attn_train = flash_attn_t_cb_val if attn_t == "standard_mha" else False
 
                     cfg = {
-                        "data_config": {"train_data_path":train_p, "tokenizer_path":vocab_p_std, "val_data_path":val_p,
-                                        "max_length":512, "multimodal":m_m, "image_dir":img_d if m_m else None,
-                                        "image_size": 224},
+                        "data_config": {
+                            "train_data_path": train_p,
+                            "val_data_path": val_p,
+                            "tokenizer_path": vocab_p_std,
+                            "streaming_dataset": is_streaming,
+                            "max_length": 512, "multimodal": m_m, "image_dir": img_d if m_m else None,
+                            "image_size": 224
+                        },
                         "model_config": {
                             "target_param_count": param_count_str, "attention_type": attn_t,
                             "use_flash_attention": effective_flash_attn_train,
-                            "multimodal":m_m, "use_expert_system":exp_s,
-                            # Add num_experts if expert system is enabled
+                            "multimodal": m_m, "use_expert_system": exp_s,
                         },
                         "training_config": {
                             "task_type": "pretrain",
-                            "output_dir":out_d, "batch_size":b_s, "learning_rate":learn_r, "num_epochs":eps,
-                            "warmup_steps":0, "gradient_accumulation_steps":4, "max_grad_norm": 1.0,
-                            "eval_every_n_epochs":eval_ep, "use_wandb":use_wb, "wandb_project":wb_p if use_wb else None,
-                            "wandb_run_name": None, "fp16":True, "device":None,
-                            "gpu_memory_fraction":g_mem_f,
-                            "use_gradient_checkpointing":True, "dynamic_batch_sizing":True,
-                            "checkpoint_steps":c_steps, "iteration_checkpoint_steps":iter_c_steps,
-                            "gpu_ids":sel_gpus, "distributed_training":dist_training_eff, "local_rank": -1
+                            "steps_per_epoch": int(steps_per_epoch_val) if is_streaming else None,
+                            "output_dir": out_d, "batch_size": b_s, "learning_rate": learn_r, "num_epochs": eps,
+                            "warmup_steps": 0, "gradient_accumulation_steps": 4, "max_grad_norm": 1.0,
+                            "eval_every_n_epochs": eval_ep, "use_wandb": use_wb, "wandb_project": wb_p if use_wb else None,
+                            "wandb_run_name": None, "fp16": True, "device": None,
+                            "gpu_memory_fraction": g_mem_f,
+                            "use_gradient_checkpointing": True, "dynamic_batch_sizing": True,
+                            "checkpoint_steps": c_steps, "iteration_checkpoint_steps": iter_c_steps,
+                            "gpu_ids": sel_gpus, "distributed_training": dist_training_eff, "local_rank": -1
                         }
                     }
                     
-                    if exp_s: # If expert system is enabled, add num_experts to model_config
+                    if exp_s:
                         num_experts_to_pass = int(num_experts_train_val) if num_experts_train_val is not None else 8
                         if not (1 <= num_experts_to_pass <= 64):
-                            shutil.rmtree(tmp_dir)
-                            return "Number of experts must be between 1 and 64 for pre-training."
+                            return "Number of experts must be between 1 and 64."
                         cfg["model_config"]["num_experts"] = num_experts_to_pass
                         cfg["model_config"]["experts_per_token"] = int(experts_per_token_train_val)
                         cfg["model_config"]["load_balancing_loss_coef"] = float(load_balancing_loss_coef_train_val)
@@ -1161,7 +1073,8 @@ class ApertisInterface:
                         cfg["model_config"]["use_router_z_loss"] = bool(use_router_z_loss_train_val)
                         cfg["model_config"]["use_load_balancing_loss"] = bool(use_load_balancing_loss_train_val)
 
-                    cfg_path = os.path.join(tmp_dir, "run_cfg_pretrain.json");
+                    tmp_dir_for_cfg = tempfile.mkdtemp()
+                    cfg_path = os.path.join(tmp_dir_for_cfg, "run_cfg_pretrain.json");
                     with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
 
                     os.makedirs(out_d, exist_ok=True)
@@ -1169,10 +1082,10 @@ class ApertisInterface:
                     shutil.copy(cfg_path, final_cfg_path_in_output)
 
 
-                    def _thread_train_job(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
+                    def _thread_train_job(c_p_arg, stop_event_arg, status_box_arg):
                         try:
                             status_box_arg.value = f"Pre-training started. Output: {out_d}. Config: {final_cfg_path_in_output}\nFollow logs in console/wandb."
-                            train_from_config(c_p_arg, stop_event_arg)
+                            standard_train_from_config(c_p_arg, stop_event_arg) # Use direct import
                             if stop_event_arg.is_set():
                                 status_box_arg.value += "\nPre-training stopped by user."
                             else:
@@ -1181,19 +1094,22 @@ class ApertisInterface:
                              logger.error(f"Error in Pre-training thread: {e_thread}", exc_info=True)
                              status_box_arg.value += f"\nError in Pre-training thread: {e_thread}"
                         finally:
-                            shutil.rmtree(t_d_arg)
+                            shutil.rmtree(tmp_dir_for_cfg, ignore_errors=True)
                             self.standard_training_thread = None
 
                     train_status_tb.value = "Initializing pre-training..."
-                    self.standard_training_thread = threading.Thread(target=_thread_train_job, args=(cfg_path, tmp_dir, self.standard_training_stop_event, train_status_tb), daemon=True)
+                    self.standard_training_thread = threading.Thread(target=_thread_train_job, args=(cfg_path, self.standard_training_stop_event, train_status_tb), daemon=True)
                     self.standard_training_thread.start()
-                    return f"Pre-training initiated. Output will be in '{out_d}'. Monitor console/W&B for progress. Copied config to '{final_cfg_path_in_output}'."
+                    return f"Pre-training initiated. Output will be in '{out_d}'. Monitor console/W&B. Copied config to '{final_cfg_path_in_output}'."
                 except Exception as e_start:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
                     logger.error(f"Failed to start pre-training: {e_start}", exc_info=True)
                     return f"Failed to start pre-training: {e_start}"
+            def ui_stop_training_handler():
+                if self.standard_training_thread and self.standard_training_thread.is_alive():
+                    self.standard_training_stop_event.set()
+                    return "Stop request sent to Pre-training. Please wait for current step/epoch to finish."
+                return "No Pre-training in progress or thread already completed."
 
-            # Update the click handler to use the new function and pass the new checkbox value
             start_train_btn.click(
                 ui_start_training_handler_updated,
                 [
@@ -1205,13 +1121,16 @@ class ApertisInterface:
                     router_z_loss_coef_train_sl, use_noisy_top_k_routing_train_cb,
                     use_expert_capacity_limit_train_cb, use_expert_dropout_train_cb,
                     use_router_z_loss_train_cb, use_load_balancing_loss_train_cb,
-                    train_file_up, val_file_up, vocab_file_up_std_train, img_dir_train_tb,
+                    streaming_dataset_cb, steps_per_epoch_num,
+                    train_file_up_single, train_file_up_dir, val_file_up_single, val_file_up_dir,
+                    vocab_file_up_std_train, img_dir_train_tb,
                     batch_size_train_sl, lr_train_sl, epochs_train_sl, eval_epochs_train_sl,
                     chkpt_steps_sl, iter_chkpt_steps_sl, gpu_select_train_cbg, dist_train_cb,
                     gpu_mem_frac_sl, output_dir_train_tb, wandb_train_cb, wandb_proj_train_tb
                 ],
                 [train_status_tb]
             )
+            stop_train_btn.click(ui_stop_training_handler, outputs=[train_status_tb])
 
 
             def ui_start_finetuning_handler(
@@ -1235,11 +1154,10 @@ class ApertisInterface:
                     return "Fine-tuning is already in progress."
 
                 self.finetune_training_stop_event.clear()
-                tmp_dir = tempfile.mkdtemp()
+                tmp_dir_for_cfg = tempfile.mkdtemp()
                 try:
-                    ft_train_p = os.path.join(tmp_dir, "ft_train.jsonl"); shutil.copy(ft_data_f_obj.name, ft_train_p)
-                    ft_val_p = None
-                    if ft_val_f_obj: ft_val_p = os.path.join(tmp_dir, "ft_val.jsonl"); shutil.copy(ft_val_f_obj.name, ft_val_p)
+                    ft_train_p = ft_data_f_obj.name
+                    ft_val_p = ft_val_f_obj.name if ft_val_f_obj else None
 
                     tokenizer_path_for_config_ft = ""
                     use_hf_for_ft_config = False
@@ -1247,8 +1165,7 @@ class ApertisInterface:
                         tokenizer_path_for_config_ft = hf_tokenizer_name_ui
                         use_hf_for_ft_config = True
                     elif ft_manual_vocab_path_obj :
-                        tokenizer_path_for_config_ft = os.path.join(tmp_dir, "ft_manual_vocab.json")
-                        shutil.copy(ft_manual_vocab_path_obj.name, tokenizer_path_for_config_ft)
+                        tokenizer_path_for_config_ft = ft_manual_vocab_path_obj.name
                     else:
                         return "Tokenizer configuration error for fine-tuning."
 
@@ -1276,32 +1193,31 @@ class ApertisInterface:
                         }
                     }
 
-                    cfg_path = os.path.join(tmp_dir, "run_cfg_finetune.json")
+                    cfg_path = os.path.join(tmp_dir_for_cfg, "run_cfg_finetune.json")
                     with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
                     os.makedirs(out_d_ui, exist_ok=True)
                     final_cfg_path_in_output_ft = os.path.join(out_d_ui, "run_cfg_finetune_used.json")
                     shutil.copy(cfg_path, final_cfg_path_in_output_ft)
 
 
-                    def _thread_finetune_job(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
+                    def _thread_finetune_job(c_p_arg, stop_event_arg, status_box_arg):
                         try:
                             status_box_arg.value = f"Fine-tuning started. Output: {out_d_ui}. Config: {final_cfg_path_in_output_ft}\nFollow logs."
-                            train_from_config(c_p_arg, stop_event_arg)
+                            standard_train_from_config(c_p_arg, stop_event_arg) # Use direct import
                             if stop_event_arg.is_set(): status_box_arg.value += "\nFine-tuning stopped by user."
                             else: status_box_arg.value += "\nFine-tuning completed."
                         except Exception as e_thread_ft:
                              logger.error(f"Error in Fine-tuning thread: {e_thread_ft}", exc_info=True)
                              status_box_arg.value += f"\nError in Fine-tuning thread: {e_thread_ft}"
                         finally:
-                            shutil.rmtree(t_d_arg)
+                            shutil.rmtree(tmp_dir_for_cfg, ignore_errors=True)
                             self.finetune_training_thread = None
-                    
+
                     ft_status_tb.value = "Initializing fine-tuning..."
-                    self.finetune_training_thread = threading.Thread(target=_thread_finetune_job, args=(cfg_path, tmp_dir, self.finetune_training_stop_event, ft_status_tb), daemon=True)
+                    self.finetune_training_thread = threading.Thread(target=_thread_finetune_job, args=(cfg_path, self.finetune_training_stop_event, ft_status_tb), daemon=True)
                     self.finetune_training_thread.start()
                     return f"Fine-tuning initiated. Output will be in '{out_d_ui}'. Monitor console/W&B. Copied config to '{final_cfg_path_in_output_ft}'."
                 except Exception as e_start_ft:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
                     logger.error(f"Failed to start fine-tuning: {e_start_ft}", exc_info=True)
                     return f"Failed to start fine-tuning: {e_start_ft}"
 
@@ -1321,8 +1237,9 @@ class ApertisInterface:
                 [ft_status_tb])
             stop_ft_btn.click(ui_stop_finetuning_handler, outputs=[ft_status_tb])
 
-            def ui_start_azr_training_handler(
-                m_s, attn_t, tokenizer_name_hf, seed_f_obj,
+            def ui_start_azr_training_handler_updated(
+                param_count_str_azr, attn_t, flash_attn_azr_cb_val,
+                tokenizer_name_hf, seed_f_obj,
                 iterations, tasks_per_iter, checkpoint_interval,
                 task_types_list, abduction_w, deduction_w, induction_w,
                 max_attempts, temperature, top_p_gen, seed_prob,
@@ -1337,30 +1254,40 @@ class ApertisInterface:
                 if not task_types_list: current_status += "At least one AZR Task Type must be selected.\n"
                 if not out_d: current_status += "Output directory is required.\n"
                 if current_status: return current_status.strip()
-                
+
                 if self.azr_training_thread and self.azr_training_thread.is_alive():
                     return "AZR training is already in progress."
 
                 self.azr_training_stop_event.clear()
-                tmp_dir = tempfile.mkdtemp()
+                tmp_dir_for_cfg = tempfile.mkdtemp()
                 try:
                     seed_p = None
                     if seed_f_obj:
-                        seed_p = os.path.join(tmp_dir, "seed_tasks.jsonl")
-                        shutil.copy(seed_f_obj.name, seed_p)
+                        seed_p = seed_f_obj.name
 
                     task_dist_map = {"abduction": abduction_w, "deduction": deduction_w, "induction": induction_w}
                     final_task_types = [tt for tt in task_types_list if tt in task_dist_map]
                     final_task_dist_weights = [task_dist_map[tt] for tt in final_task_types]
-                    
+
                     sum_weights = sum(final_task_dist_weights)
                     if sum_weights > 0:
                         final_task_dist_weights = [w / sum_weights for w in final_task_dist_weights]
                     elif final_task_types:
                         equal_w = 1.0 / len(final_task_types)
                         final_task_dist_weights = [equal_w] * len(final_task_types)
-                    
-                    azr_model_cfg_base = create_apertis_model(model_size=m_s, attention_type_override=attn_t).config.to_dict()
+
+                    effective_flash_attn_azr = flash_attn_azr_cb_val if attn_t == "standard_mha" else False
+                    if not param_count_str_azr:
+                        current_status += "Target Parameter Count for AZR model is required.\n"
+                    if current_status: return current_status.strip()
+
+                    temp_model_for_config = create_apertis_model(
+                        target_param_count=param_count_str_azr,
+                        attention_type_override=attn_t,
+                        use_flash_attention=effective_flash_attn_azr
+                    )
+                    azr_model_cfg_base = temp_model_for_config.config.to_dict()
+
 
                     cfg = {
                         "data": {"tokenizer_name": tokenizer_name_hf.strip()},
@@ -1391,164 +1318,41 @@ class ApertisInterface:
                     }
 
                     os.makedirs(out_d, exist_ok=True)
-                    cfg_path = os.path.join(tmp_dir, "azr_config.json")
+                    cfg_path = os.path.join(tmp_dir_for_cfg, "azr_config.json")
                     with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
                     final_cfg_path_in_output_azr = os.path.join(out_d, "azr_config_used.json")
                     shutil.copy(cfg_path, final_cfg_path_in_output_azr)
 
-                    def _thread_azr_train(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
+                    def _thread_azr_train(c_p_arg, stop_event_arg, status_box_arg):
                         try:
                             status_box_arg.value = f"AZR Training started. Output: {out_d}. Config: {final_cfg_path_in_output_azr}\nFollow logs."
-                            train_from_config(c_p_arg, stop_event_arg)
+                            azr_train_from_config(c_p_arg, stop_event_arg) # Use direct import
                             if stop_event_arg.is_set(): status_box_arg.value += "\nAZR Training stopped by user."
                             else: status_box_arg.value += "\nAZR Training completed."
                         except Exception as e_thread_azr:
                             logger.error(f"Error in AZR training thread: {e_thread_azr}", exc_info=True)
                             status_box_arg.value += f"\nError in AZR training thread: {e_thread_azr}"
                         finally:
-                            shutil.rmtree(t_d_arg, ignore_errors=True)
+                            shutil.rmtree(tmp_dir_for_cfg, ignore_errors=True)
                             self.azr_training_thread = None
-                    
+
                     azr_status_tb.value = "Initializing AZR training..."
-                    self.azr_training_thread = threading.Thread(target=_thread_azr_train, args=(cfg_path, tmp_dir, self.azr_training_stop_event, azr_status_tb), daemon=True)
+                    self.azr_training_thread = threading.Thread(target=_thread_azr_train, args=(cfg_path, self.azr_training_stop_event, azr_status_tb), daemon=True)
                     self.azr_training_thread.start()
                     return f"AZR Training initiated. Output will be in '{out_d}'. Monitor console/W&B. Copied config to '{final_cfg_path_in_output_azr}'."
                 except Exception as e_start_azr:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
                     logger.error(f"Failed to start AZR training: {e_start_azr}", exc_info=True)
                     return f"Failed to start AZR training: {e_start_azr}"
-
-
             def ui_stop_azr_training_handler():
                 if self.azr_training_thread and self.azr_training_thread.is_alive():
                     self.azr_training_stop_event.set()
                     return "Stop request sent to AZR Training. Please wait for current iteration to finish."
                 return "No AZR Training in progress or thread already completed."
 
-            # Removed the first azr_start_btn.click call that used ui_start_azr_training_handler
-            # It is now superseded by the call below using ui_start_azr_training_handler_updated
-            azr_stop_btn.click(ui_stop_azr_training_handler, outputs=[azr_status_tb])
-
-
-            # Update ui_start_azr_training_handler signature and logic
-            def ui_start_azr_training_handler_updated(
-                param_count_str_azr, attn_t, flash_attn_azr_cb_val, # Changed m_s to param_count_str_azr
-                tokenizer_name_hf, seed_f_obj,
-                iterations, tasks_per_iter, checkpoint_interval,
-                task_types_list, abduction_w, deduction_w, induction_w,
-                max_attempts, temperature, top_p_gen, seed_prob,
-                timeout_exec, max_output_exec,
-                clarity_w, complex_w, div_w,
-                acc_w, coherence_w, relevance_w, structure_w,
-                target_complex, tolerance, acc_power,
-                azr_device_select_ui, log_level_ui, use_wb, wb_p, out_d
-            ):
-                current_status = ""
-                if not tokenizer_name_hf.strip(): current_status += "Hugging Face Tokenizer Name is required for AZR.\n"
-                if not task_types_list: current_status += "At least one AZR Task Type must be selected.\n"
-                if not out_d: current_status += "Output directory is required.\n"
-                if current_status: return current_status.strip()
-
-                if self.azr_training_thread and self.azr_training_thread.is_alive():
-                    return "AZR training is already in progress."
-
-                self.azr_training_stop_event.clear()
-                tmp_dir = tempfile.mkdtemp()
-                try:
-                    seed_p = None
-                    if seed_f_obj:
-                        seed_p = os.path.join(tmp_dir, "seed_tasks.jsonl")
-                        shutil.copy(seed_f_obj.name, seed_p)
-
-                    task_dist_map = {"abduction": abduction_w, "deduction": deduction_w, "induction": induction_w}
-                    final_task_types = [tt for tt in task_types_list if tt in task_dist_map]
-                    final_task_dist_weights = [task_dist_map[tt] for tt in final_task_types]
-
-                    sum_weights = sum(final_task_dist_weights)
-                    if sum_weights > 0:
-                        final_task_dist_weights = [w / sum_weights for w in final_task_dist_weights]
-                    elif final_task_types:
-                        equal_w = 1.0 / len(final_task_types)
-                        final_task_dist_weights = [equal_w] * len(final_task_types)
-
-                    effective_flash_attn_azr = flash_attn_azr_cb_val if attn_t == "standard_mha" else False
-                    # Create a base config for the AZR model, then convert to dict
-                    # This ensures that if create_apertis_model has defaults, they are picked up.
-                    if not param_count_str_azr: # Add check for empty param count for AZR
-                        current_status += "Target Parameter Count for AZR model is required.\n"
-                    if current_status: return current_status.strip()
-
-                    temp_model_for_config = create_apertis_model(
-                        target_param_count=param_count_str_azr, # Changed model_size to target_param_count
-                        attention_type_override=attn_t,
-                        use_flash_attention=effective_flash_attn_azr
-                    )
-                    azr_model_cfg_base = temp_model_for_config.config.to_dict()
-
-
-                    cfg = {
-                        "data": {"tokenizer_name": tokenizer_name_hf.strip()},
-                        "model": azr_model_cfg_base, # Use the generated dict
-                        "training": {"method": "azr", "output_dir": out_d, "device": azr_device_select_ui},
-                        "azr": {
-                            "num_iterations": iterations, "tasks_per_iteration": tasks_per_iter,
-                            "checkpoint_interval": checkpoint_interval,
-                            "log_level": log_level_ui, "log_file": "azr_training.log",
-                            "python_executor": {"timeout": timeout_exec, "max_output_size": max_output_exec},
-                            "task_generator": {
-                                "task_types": final_task_types, "task_distribution": final_task_dist_weights,
-                                "max_attempts": max_attempts, "seed_tasks_path": seed_p,
-                                "seed_task_probability": seed_prob, "max_new_tokens": 100,
-                                "temperature": temperature, "top_p": top_p_gen
-                            },
-                            "solution_generator": {"max_new_tokens": 1024, "temperature": temperature, "top_p": top_p_gen},
-                            "rewards": {
-                                "clarity": {"weight": clarity_w},
-                                "complexity": {"weight": complex_w, "target_complexity": target_complex, "tolerance": tolerance},
-                                "diversity": {"weight": div_w},
-                                "accuracy": {"weight": acc_w, "partial_credit_power": acc_power},
-                                "coherence": {"weight": coherence_w},
-                                "relevance": {"weight": relevance_w},
-                                "structure": {"weight": structure_w},
-                            },
-                        }
-                    }
-
-                    os.makedirs(out_d, exist_ok=True)
-                    cfg_path = os.path.join(tmp_dir, "azr_config.json")
-                    with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
-                    final_cfg_path_in_output_azr = os.path.join(out_d, "azr_config_used.json")
-                    shutil.copy(cfg_path, final_cfg_path_in_output_azr)
-
-                    def _thread_azr_train(c_p_arg, t_d_arg, stop_event_arg, status_box_arg):
-                        try:
-                            status_box_arg.value = f"AZR Training started. Output: {out_d}. Config: {final_cfg_path_in_output_azr}\nFollow logs."
-                            # Assuming azr_pipeline's train_from_config handles this structure
-                            from src.training.azr_pipeline import train_from_config as azr_train_from_config
-                            azr_train_from_config(c_p_arg, stop_event_arg)
-                            if stop_event_arg.is_set(): status_box_arg.value += "\nAZR Training stopped by user."
-                            else: status_box_arg.value += "\nAZR Training completed."
-                        except Exception as e_thread_azr:
-                            logger.error(f"Error in AZR training thread: {e_thread_azr}", exc_info=True)
-                            status_box_arg.value += f"\nError in AZR training thread: {e_thread_azr}"
-                        finally:
-                            shutil.rmtree(t_d_arg, ignore_errors=True)
-                            self.azr_training_thread = None
-
-                    azr_status_tb.value = "Initializing AZR training..."
-                    self.azr_training_thread = threading.Thread(target=_thread_azr_train, args=(cfg_path, tmp_dir, self.azr_training_stop_event, azr_status_tb), daemon=True)
-                    self.azr_training_thread.start()
-                    return f"AZR Training initiated. Output will be in '{out_d}'. Monitor console/W&B. Copied config to '{final_cfg_path_in_output_azr}'."
-                except Exception as e_start_azr:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    logger.error(f"Failed to start AZR training: {e_start_azr}", exc_info=True)
-                    return f"Failed to start AZR training: {e_start_azr}"
-
-            # Update the click handler to use the new function and pass the new checkbox value
             azr_start_btn.click(
-                ui_start_azr_training_handler_updated, # use updated handler
+                ui_start_azr_training_handler_updated,
                 [
-                    azr_param_count_tb, azr_attn_type_dd, azr_flash_attn_cb, # Changed azr_model_size_dd
+                    azr_param_count_tb, azr_attn_type_dd, azr_flash_attn_cb,
                     azr_tokenizer_name_tb, azr_seed_tasks_up,
                     azr_iterations_sl, azr_tasks_per_iter_sl, azr_checkpoint_interval_sl,
                     azr_task_types_cbg, azr_task_dist_abduction_sl, azr_task_dist_deduction_sl, azr_task_dist_induction_sl,
@@ -1561,6 +1365,7 @@ class ApertisInterface:
                 ],
                 [azr_status_tb]
             )
+            azr_stop_btn.click(ui_stop_azr_training_handler, outputs=[azr_status_tb])
 
 
         try:

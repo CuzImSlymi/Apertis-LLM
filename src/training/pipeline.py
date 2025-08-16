@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -10,6 +10,9 @@ import wandb
 from typing import Dict, List, Optional, Tuple, Union, Any
 from PIL import Image
 import torchvision.transforms as transforms
+import pyarrow.parquet as pq
+import glob
+import random
 
 import sys
 import os
@@ -201,6 +204,118 @@ class ApertisPretrainDataset(Dataset):
              output["pixel_values"] = self._load_image(item["image"])
         return output
 
+class IterableApertisPretrainDataset(IterableDataset):
+    def __init__(
+        self,
+        data_path: str,
+        max_length: int = 512,
+        pad_token_id_from_config: int = 0,
+        multimodal: bool = False,
+        image_dir: Optional[str] = None,
+        image_size: int = 224,
+        seed: int = 42,
+        shuffle_buffer_size: int = 10000,
+    ):
+        self.data_path = data_path
+        self.max_length = max_length
+        self.pad_token_id_for_data = pad_token_id_from_config
+        self.multimodal = multimodal
+        self.image_dir = image_dir
+        self.image_size = image_size
+        self.seed = seed
+        self.shuffle_buffer_size = shuffle_buffer_size
+
+        if self.multimodal and not self.image_dir:
+            logger.warning("Multimodal is enabled, but no `image_dir` is provided. Image paths in data must be absolute.")
+
+        if self.multimodal:
+            self.image_transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+
+        self.files = glob.glob(os.path.join(self.data_path, "**", "*.parquet"), recursive=True)
+        if not self.files:
+            raise ValueError(f"No parquet files found in {self.data_path}")
+        logger.info(f"Found {len(self.files)} Parquet files for streaming.")
+
+    def _load_image(self, image_path: str) -> torch.Tensor:
+        full_path = os.path.join(self.image_dir, image_path) if self.image_dir and not os.path.isabs(image_path) else image_path
+        try:
+            image = Image.open(full_path).convert('RGB')
+            return self.image_transform(image)
+        except FileNotFoundError:
+            logger.warning(f"Image not found at {full_path}, returning blank image.")
+            return torch.zeros(3, self.image_size, self.image_size)
+        except Exception as e:
+            logger.warning(f"Error loading image {full_path}: {e}. Returning blank image.")
+            return torch.zeros(3, self.image_size, self.image_size)
+
+    def _parse_and_yield_from_file(self, file_path):
+        parquet_file = pq.ParquetFile(file_path)
+        buffer = []
+        for batch in parquet_file.iter_batches(batch_size=self.shuffle_buffer_size):
+            df = batch.to_pandas()
+            for record in df.to_dict('records'):
+                # Assumes parquet file from Spark pipeline has 'input_ids' column
+                input_ids = record['input_ids']
+
+                pad_id_to_use = self.pad_token_id_for_data
+                
+                seq_len = len(input_ids)
+                if seq_len > self.max_length:
+                    input_ids = input_ids[:self.max_length]
+                elif seq_len < self.max_length:
+                    input_ids.extend([pad_id_to_use] * (self.max_length - seq_len))
+
+                input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+                attention_mask = (input_ids_tensor != pad_id_to_use).long()
+                labels = input_ids_tensor.clone()
+                labels[labels == pad_id_to_use] = -100
+
+                output = {"input_ids": input_ids_tensor, "attention_mask": attention_mask, "labels": labels}
+
+                if self.multimodal:
+                    if 'image' in record and record['image']:
+                        output["pixel_values"] = self._load_image(record["image"])
+                    else:
+                        # If multimodal, every sample must have an image or a placeholder.
+                        output["pixel_values"] = torch.zeros(3, self.image_size, self.image_size)
+                
+                if len(buffer) < self.shuffle_buffer_size:
+                    buffer.append(output)
+                else:
+                    random.shuffle(buffer)
+                    for item in buffer:
+                        yield item
+                    buffer = [output]
+        
+        if buffer:
+            random.shuffle(buffer)
+            for item in buffer:
+                yield item
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        
+        if worker_info is None:
+            files_to_process = self.files
+            worker_id = 0
+        else:
+            worker_id = worker_info.id
+            files_to_process = self.files[worker_id::worker_info.num_workers]
+
+        rng = random.Random(self.seed + worker_id)
+        rng.shuffle(files_to_process)
+
+        for file_path in files_to_process:
+            try:
+                yield from self._parse_and_yield_from_file(file_path)
+            except Exception as e:
+                logger.error(f"Error processing file {file_path} in worker {worker_id}: {e}", exc_info=True)
+                continue
+
 class ApertisFineTuneDataset(Dataset):
     def __init__(
         self,
@@ -386,8 +501,8 @@ class ApertisFineTuneDataset(Dataset):
 
 class ApertisTrainer:
     def __init__(
-        self, model: ApertisForCausalLM, train_dataset: Union[ApertisPretrainDataset, ApertisFineTuneDataset],
-        val_dataset: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset]] = None,
+        self, model: ApertisForCausalLM, train_dataset: Union[ApertisPretrainDataset, ApertisFineTuneDataset, IterableApertisPretrainDataset],
+        val_dataset: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset, IterableApertisPretrainDataset]] = None,
         output_dir: str = "output", batch_size: int = 4, learning_rate: float = 5e-5, weight_decay: float = 0.01,
         num_epochs: int = 3, warmup_steps: int = 0, gradient_accumulation_steps: int = 4, max_grad_norm: float = 1.0,
         use_wandb: bool = False, wandb_project: str = "apertis", wandb_run_name: Optional[str] = None,
@@ -396,7 +511,8 @@ class ApertisTrainer:
         dynamic_batch_sizing: bool = True, gpu_ids: Optional[List[int]] = None, distributed_training: bool = False, local_rank: int = -1,
         stop_event: Optional[threading.Event] = None, is_fine_tuning: bool = False,
         original_tokenizer_path_for_ft_hf: Optional[str] = None, # Path to HF tokenizer if used for FT
-        original_manual_vocab_path_for_ft: Optional[str] = None # Path to manual vocab.json if used for FT
+        original_manual_vocab_path_for_ft: Optional[str] = None, # Path to manual vocab.json if used for FT
+        steps_per_epoch: Optional[int] = None,
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -426,7 +542,7 @@ class ApertisTrainer:
         self.is_fine_tuning = is_fine_tuning
         self.original_tokenizer_path_for_ft_hf = original_tokenizer_path_for_ft_hf
         self.original_manual_vocab_path_for_ft = original_manual_vocab_path_for_ft
-
+        self.steps_per_epoch = steps_per_epoch
 
         os.makedirs(output_dir, exist_ok=True)
         self.world_size = 1
@@ -472,12 +588,17 @@ class ApertisTrainer:
                       {'params': [p for n,p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
         self.optimizer = optim.AdamW(opt_groups, lr=self.learning_rate)
 
-        if len(self.train_dataloader) > 0 and self.gradient_accumulation_steps > 0:
+        is_iterable_dataset = isinstance(self.train_dataset, IterableDataset)
+        if is_iterable_dataset:
+            if not self.steps_per_epoch:
+                raise ValueError("`steps_per_epoch` must be provided to ApertisTrainer when using an IterableDataset.")
+            num_optimizer_steps_per_epoch = math.ceil(self.steps_per_epoch / self.gradient_accumulation_steps)
+        elif len(self.train_dataloader) > 0 and self.gradient_accumulation_steps > 0:
             num_optimizer_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.gradient_accumulation_steps)
-            num_training_steps = num_optimizer_steps_per_epoch * self.num_epochs
         else:
-            num_training_steps = 1 # Avoid division by zero
+            num_optimizer_steps_per_epoch = 1
 
+        num_training_steps = num_optimizer_steps_per_epoch * self.num_epochs
         self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.learning_rate, total_steps=num_training_steps, pct_start=0.1, anneal_strategy='cos', div_factor=25.0, final_div_factor=10000.0)
         self.scaler = torch.amp.GradScaler(enabled=self.fp16)
 
@@ -488,7 +609,9 @@ class ApertisTrainer:
                 "max_grad_norm": self.max_grad_norm, "fp16": self.fp16, "device": str(self.device),
                 "distributed_training": self.distributed_training, "world_size": self.world_size, "gpu_ids": self.gpu_ids,
                 "eval_every_n_epochs": self.eval_every_n_epochs,
-                "is_fine_tuning": self.is_fine_tuning
+                "is_fine_tuning": self.is_fine_tuning,
+                "is_iterable_dataset": is_iterable_dataset,
+                "steps_per_epoch": self.steps_per_epoch,
             }
             model_config_for_wandb = {}
             model_to_get_config_from = self.model.module if isinstance(self.model, (nn.DataParallel, DDP)) else self.model
@@ -498,17 +621,45 @@ class ApertisTrainer:
             wandb.init(project=self.wandb_project, name=self.wandb_run_name, config=wandb_config)
 
     def _create_dataloaders(self):
-        train_sampler = DistributedSampler(self.train_dataset, num_replicas=self.world_size, rank=self.local_rank, shuffle=True) if self.distributed_training else None
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=4, pin_memory=True, drop_last=self.distributed_training)
+        is_iterable_dataset = isinstance(self.train_dataset, IterableDataset)
+        
+        train_sampler = None
+        if not is_iterable_dataset and self.distributed_training:
+            train_sampler = DistributedSampler(self.train_dataset, num_replicas=self.world_size, rank=self.local_rank, shuffle=True)
+        
+        self.train_dataloader = DataLoader(
+            self.train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=(not is_iterable_dataset and train_sampler is None), 
+            sampler=train_sampler, 
+            num_workers=4, 
+            pin_memory=True, 
+            drop_last=self.distributed_training
+        )
+        
         if self.val_dataset:
-            val_sampler = DistributedSampler(self.val_dataset, num_replicas=self.world_size, rank=self.local_rank, shuffle=False) if self.distributed_training else None
-            self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, sampler=val_sampler, num_workers=4, pin_memory=True, drop_last=False)
+            is_val_iterable = isinstance(self.val_dataset, IterableDataset)
+            val_sampler = None
+            if not is_val_iterable and self.distributed_training:
+                val_sampler = DistributedSampler(self.val_dataset, num_replicas=self.world_size, rank=self.local_rank, shuffle=False)
+            
+            self.val_dataloader = DataLoader(
+                self.val_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, # val dataset is never shuffled
+                sampler=val_sampler, 
+                num_workers=4, 
+                pin_memory=True, 
+                drop_last=False
+            )
         else: self.val_dataloader = None
 
     def train(self):
         logger.info(f"Starting {'fine-tuning' if self.is_fine_tuning else 'pre-training'}")
         best_val_loss = float('inf')
         global_step = 0
+        is_iterable_dataset = isinstance(self.train_dataset, IterableDataset)
+
         for epoch in range(self.num_epochs):
             if self.stop_event.is_set():
                 logger.info(f"Stop event received. Halting training at epoch {epoch+1}.")
@@ -522,8 +673,13 @@ class ApertisTrainer:
                 logger.warning(f"Skipping epoch {epoch+1} as train_dataloader is empty.")
                 continue
 
-            progress_bar = tqdm(total=len(self.train_dataloader), desc=f"Epoch {epoch+1}/{self.num_epochs}", disable=not self.is_main_process)
+            total_steps_for_pbar = self.steps_per_epoch if is_iterable_dataset else len(self.train_dataloader)
+            progress_bar = tqdm(total=total_steps_for_pbar, desc=f"Epoch {epoch+1}/{self.num_epochs}", disable=not self.is_main_process)
+            
             for step, batch in enumerate(self.train_dataloader):
+                if is_iterable_dataset and step >= self.steps_per_epoch:
+                    break
+
                 if self.stop_event.is_set():
                     logger.info(f"Stop event received during epoch {epoch+1}, step {step+1}. Halting training.")
                     progress_bar.close()
@@ -542,7 +698,7 @@ class ApertisTrainer:
                     epoch_loss_accumulator += loss.item()
                     batches_accumulated +=1
 
-                    if (step + 1) % self.gradient_accumulation_steps == 0 or (step + 1) == len(self.train_dataloader):
+                    if (step + 1) % self.gradient_accumulation_steps == 0 or (step + 1) == total_steps_for_pbar:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.scaler.step(self.optimizer)
@@ -555,7 +711,7 @@ class ApertisTrainer:
                         progress_bar.set_postfix({"loss": f"{current_avg_loss_for_step:.4f}"})
 
                         if self.use_wandb and self.is_main_process:
-                            log_data = {"train/loss": current_avg_loss_for_step, "train/learning_rate": self.scheduler.get_last_lr()[0], "train/epoch_progress": epoch + (step + 1) / len(self.train_dataloader)}
+                            log_data = {"train/loss": current_avg_loss_for_step, "train/learning_rate": self.scheduler.get_last_lr()[0], "train/epoch_progress": epoch + (step + 1) / total_steps_for_pbar}
                             if torch.cuda.is_available():
                                 log_data["train/gpu_mem_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
                                 log_data["train/gpu_mem_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
@@ -574,12 +730,12 @@ class ApertisTrainer:
                         torch.cuda.empty_cache()
                         self._create_dataloaders()
                         progress_bar.close()
-                        break # Break from inner loop to restart epoch with new batch size
+                        break
                     else: raise e
                 progress_bar.update(1)
 
             if self.stop_event.is_set():
-                break # Break from outer epoch loop if stopped
+                break
 
             progress_bar.close()
             logger.info(f"Epoch {epoch+1}/{self.num_epochs} completed.")
@@ -611,7 +767,13 @@ class ApertisTrainer:
         self.model.eval()
         total_val_loss = 0.0
         num_val_batches = 0
-        progress_bar = tqdm(total=len(self.val_dataloader), desc="Validation", disable=not self.is_main_process)
+        is_iterable_val = isinstance(self.val_dataset, IterableDataset)
+        
+        # For iterable validation sets, we can't know the length. We can iterate for a fixed number of steps
+        # or until the iterator is exhausted. For now, we iterate until exhaustion.
+        pbar_total = None if is_iterable_val else len(self.val_dataloader)
+        progress_bar = tqdm(total=pbar_total, desc="Validation", disable=not self.is_main_process)
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
                 if self.stop_event.is_set():
@@ -643,7 +805,6 @@ class ApertisTrainer:
         
         model_to_save = self.model.module if isinstance(self.model, (nn.DataParallel, DDP)) else self.model
 
-        # Save model weights
         model_save_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
         try:
             torch.save(model_to_save.state_dict(), model_save_path)
@@ -652,7 +813,6 @@ class ApertisTrainer:
             logger.error(f"Error saving model state_dict: {e}")
             return
 
-        # Save model config (reflecting current state, e.g., resized vocab)
         if hasattr(model_to_save, 'config') and hasattr(model_to_save.config, 'save_pretrained'):
             try:
                 model_to_save.config.save_pretrained(checkpoint_dir)
@@ -662,41 +822,25 @@ class ApertisTrainer:
         else:
             logger.warning("Model or its config does not have save_pretrained method. Config not saved with checkpoint.")
         
-        # Save tokenizer
+        tokenizer_source_to_save = None
         if self.is_fine_tuning:
-            if hasattr(self.train_dataset, 'is_hf_tokenizer') and self.train_dataset.is_hf_tokenizer and \
-               hasattr(self.train_dataset.tokenizer, 'save_pretrained'):
-                try:
-                    self.train_dataset.tokenizer.save_pretrained(checkpoint_dir)
-                    logger.info(f"Hugging Face tokenizer saved to {checkpoint_dir}")
-                except Exception as e:
-                    logger.error(f"Error saving Hugging Face tokenizer for fine-tuned model: {e}")
-            elif self.original_manual_vocab_path_for_ft and os.path.exists(self.original_manual_vocab_path_for_ft):
-                 # If fine-tuning was done with a manual vocab, copy that vocab.json
-                try:
-                    shutil.copy(self.original_manual_vocab_path_for_ft, os.path.join(checkpoint_dir, "vocab.json"))
-                    logger.info(f"Manual vocab.json (from {self.original_manual_vocab_path_for_ft}) copied to {checkpoint_dir}")
-                except Exception as e:
-                    logger.error(f"Error copying manual vocab.json for fine-tuned model: {e}")
-            else:
-                logger.warning("Fine-tuning tokenizer/vocab source not clearly identified or available for saving with checkpoint.")
-        else: # Pre-training (assumes manual vocab was used, from data_cfg.tokenizer_path)
-            original_vocab_path = self.train_dataset.data_path # This is wrong. Need the actual vocab path used for pretrain_dataset
-            # The pretrain_dataset itself doesn't store the original path of the vocab_dict it got.
-            # This information should be passed from train_from_config if we want to copy it.
-            # For now, assume pre-training checkpoints won't automatically save vocab.json unless explicitly managed.
-            # A better approach: train_from_config should handle copying the vocab.json to the output_dir/initial_checkpoint.
-            # Or, if dataset was initialized with a path, it should store it.
-            # Let's assume for now `self.original_manual_vocab_path_for_ft` could also be set for pretrain if appropriate
-            if self.original_manual_vocab_path_for_ft and os.path.exists(self.original_manual_vocab_path_for_ft):
-                try:
-                    shutil.copy(self.original_manual_vocab_path_for_ft, os.path.join(checkpoint_dir, "vocab.json"))
-                    logger.info(f"Manual vocab.json (from {self.original_manual_vocab_path_for_ft}) copied to {checkpoint_dir} for pre-trained model.")
-                except Exception as e:
-                    logger.error(f"Error copying manual vocab.json for pre-trained model: {e}")
-            else:
-                 logger.info("Pre-training: vocab.json not automatically saved with this checkpoint. Ensure it's managed separately if it was a manual vocab.")
-
+            if self.original_tokenizer_path_for_ft_hf:
+                tokenizer_source_to_save = self.original_tokenizer_path_for_ft_hf
+            elif self.original_manual_vocab_path_for_ft:
+                tokenizer_source_to_save = self.original_manual_vocab_path_for_ft
+        elif self.original_manual_vocab_path_for_ft: # Pre-training with manual vocab
+             tokenizer_source_to_save = self.original_manual_vocab_path_for_ft
+        
+        if tokenizer_source_to_save:
+            try:
+                if os.path.isdir(tokenizer_source_to_save): # Assumes it's an HF tokenizer dir
+                    shutil.copytree(tokenizer_source_to_save, checkpoint_dir, dirs_exist_ok=True)
+                    logger.info(f"Copied tokenizer files from {tokenizer_source_to_save} to {checkpoint_dir}")
+                elif os.path.isfile(tokenizer_source_to_save) and tokenizer_source_to_save.endswith(".json"): # Assumes manual vocab
+                    shutil.copy(tokenizer_source_to_save, os.path.join(checkpoint_dir, "vocab.json"))
+                    logger.info(f"Copied manual vocab.json from {tokenizer_source_to_save} to {checkpoint_dir}")
+            except Exception as e:
+                logger.error(f"Error saving tokenizer from source {tokenizer_source_to_save}: {e}")
 
 def get_available_gpus() -> List[Dict[str, Any]]:
     gpu_info = []
@@ -714,23 +858,20 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
         return
 
     data_cfg = config_data.get("data_config",{})
-    model_cfg_from_file = config_data.get("model_config",{}) # Config for a *new* model or *base* for FT
+    model_cfg_from_file = config_data.get("model_config",{}) 
     train_cfg = config_data.get("training_config",{})
 
     is_fine_tuning_mode = train_cfg.get("task_type", "pretrain") == "finetune"
+    is_streaming_dataset = data_cfg.get("streaming_dataset", False)
     
-    # --- Tokenizer and Vocab Size Determination ---
-    # tokenizer_path_in_config: Path to manual vocab.json OR HF tokenizer name/path
     tokenizer_path_in_config = data_cfg.get("tokenizer_path") 
     use_hf_tokenizer_for_ft = data_cfg.get("use_hf_tokenizer_for_finetune", False)
 
     actual_hf_tokenizer_object = None
     manual_vocab_dict_loaded = None
-    # These variables will store the "source of truth" special token IDs from the tokenizer
     source_vocab_size = 0
-    source_pad_id, source_bos_id, source_eos_id, source_unk_id = 0, 1, 2, 3 # Start with ApertisConfig defaults
+    source_pad_id, source_bos_id, source_eos_id, source_unk_id = 0, 1, 2, 3
 
-    # Path to the tokenizer/vocab that will be saved with the model checkpoint
     path_to_tokenizer_to_save_with_model_checkpoint: Optional[str] = None
 
     if is_fine_tuning_mode and use_hf_tokenizer_for_ft:
@@ -741,23 +882,18 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             from transformers import AutoTokenizer
             actual_hf_tokenizer_object = AutoTokenizer.from_pretrained(tokenizer_path_in_config)
             source_vocab_size = actual_hf_tokenizer_object.vocab_size
-            
-            # Use tokenizer's special tokens if available, otherwise keep ApertisConfig defaults
-            # These are now the "source" values from the tokenizer
             if actual_hf_tokenizer_object.pad_token_id is not None: source_pad_id = actual_hf_tokenizer_object.pad_token_id
             if actual_hf_tokenizer_object.bos_token_id is not None: source_bos_id = actual_hf_tokenizer_object.bos_token_id
             if actual_hf_tokenizer_object.eos_token_id is not None: source_eos_id = actual_hf_tokenizer_object.eos_token_id
             if actual_hf_tokenizer_object.unk_token_id is not None: source_unk_id = actual_hf_tokenizer_object.unk_token_id
-            
             path_to_tokenizer_to_save_with_model_checkpoint = tokenizer_path_in_config
             logger.info(f"Using HF Tokenizer '{tokenizer_path_in_config}' for fine-tuning. Extracted vocab_size: {source_vocab_size}, pad_id: {source_pad_id}, bos_id: {source_bos_id}, eos_id: {source_eos_id}, unk_id: {source_unk_id}")
         except Exception as e:
             logger.error(f"Failed to load HF tokenizer '{tokenizer_path_in_config}' for fine-tuning: {e}. Ensure it's a valid path/name.")
             return
-    elif tokenizer_path_in_config: # Pre-training with manual vocab OR Fine-tuning with manual vocab
+    elif tokenizer_path_in_config:
         try:
             manual_vocab_dict_loaded, source_vocab_size = _load_vocabulary_and_get_size(tokenizer_path_in_config)
-            # For manual vocab, use its own special tokens if defined, otherwise ApertisConfig defaults.
             if "<pad>" in manual_vocab_dict_loaded: source_pad_id = manual_vocab_dict_loaded["<pad>"]
             if "<bos>" in manual_vocab_dict_loaded: source_bos_id = manual_vocab_dict_loaded["<bos>"]
             if "<eos>" in manual_vocab_dict_loaded: source_eos_id = manual_vocab_dict_loaded["<eos>"]
@@ -768,10 +904,9 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             logger.error(f"Failed to load manual vocab from '{tokenizer_path_in_config}': {e}")
             return
     else:
-        logger.error("tokenizer_path (for manual vocab, or as HF name if use_hf_tokenizer_for_finetune=True) is missing in data_config.")
+        logger.error("tokenizer_path is missing in data_config.")
         return
 
-    # --- Model Initialization ---
     model_for_trainer: ApertisForCausalLM
     try:
         if is_fine_tuning_mode and train_cfg.get("pretrained_model_path_for_finetune"):
@@ -784,19 +919,16 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             base_model_config = ApertisConfig.from_pretrained(config_dir_for_base_model)
             original_vocab_size_from_base_model_config = base_model_config.vocab_size
             
-            # Update base model config with tokenizer's reality BEFORE creating model instance
             base_model_config.vocab_size = source_vocab_size
             base_model_config.pad_token_id = source_pad_id
             base_model_config.bos_token_id = source_bos_id
             base_model_config.eos_token_id = source_eos_id
             base_model_config.unk_token_id = source_unk_id
             
-            # model_cfg_from_file can contain overrides for the base model structure
             merged_config_for_ft_model_dict = base_model_config.to_dict()
-            if model_cfg_from_file: # Apply overrides from config file if any
+            if model_cfg_from_file:
                 merged_config_for_ft_model_dict.update(model_cfg_from_file) 
             
-            # CRITICAL: Ensure tokenizer-derived special tokens and vocab_size are final, overriding any from model_cfg_from_file
             merged_config_for_ft_model_dict["vocab_size"] = source_vocab_size
             merged_config_for_ft_model_dict["pad_token_id"] = source_pad_id
             merged_config_for_ft_model_dict["bos_token_id"] = source_bos_id
@@ -805,7 +937,7 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
 
             final_config_for_ft_model_instance = ApertisConfig.from_dict(merged_config_for_ft_model_dict)
             model_for_trainer = ApertisForCausalLM(final_config_for_ft_model_instance)
-            logger.info(f"Fine-tuning: Instantiated ApertisForCausalLM with config derived from base, updated with tokenizer and overrides. Effective vocab: {model_for_trainer.config.vocab_size}, Pad: {model_for_trainer.config.pad_token_id}, BOS: {model_for_trainer.config.bos_token_id}, EOS: {model_for_trainer.config.eos_token_id}, UNK: {model_for_trainer.config.unk_token_id}")
+            logger.info(f"Fine-tuning: Instantiated ApertisForCausalLM with config. Effective vocab: {model_for_trainer.config.vocab_size}")
 
             actual_weights_file = pretrained_model_weights_path
             if os.path.isdir(pretrained_model_weights_path):
@@ -819,87 +951,39 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             state_dict_from_checkpoint = torch.load(actual_weights_file, map_location="cpu", weights_only=True)
 
             if original_vocab_size_from_base_model_config != source_vocab_size:
-                logger.info(f"Resizing token embeddings from base model vocab {original_vocab_size_from_base_model_config} to new fine-tuning tokenizer vocab {source_vocab_size}")
-                
-                temp_base_config_for_load = ApertisConfig.from_dict(base_model_config.to_dict()) 
-                temp_base_config_for_load.vocab_size = original_vocab_size_from_base_model_config 
-                # Restore original special tokens for the temp model if they were different, to match checkpoint
-                # This is complex if base checkpoint had different special tokens. Assuming they were default or compatible.
-                # For simplicity, we assume the base model's special token IDs are not needed for the weight loading logic itself,
-                # only its vocab_size for embedding shape.
-                temp_model_for_load = ApertisForCausalLM(temp_base_config_for_load)
-                temp_load_result = temp_model_for_load.load_state_dict(state_dict_from_checkpoint, strict=False)
-                if temp_load_result.missing_keys or temp_load_result.unexpected_keys:
-                     logger.warning(f"Loading into temp model for resizing had issues: missing={temp_load_result.missing_keys}, unexpected={temp_load_result.unexpected_keys}")
+                logger.info(f"Resizing token embeddings from {original_vocab_size_from_base_model_config} to {source_vocab_size}")
+                model_for_trainer.resize_token_embeddings(source_vocab_size)
 
-                num_tokens_to_copy = min(original_vocab_size_from_base_model_config, source_vocab_size)
-                model_for_trainer.model.token_embeddings.weight.data[:num_tokens_to_copy, :] = \
-                    temp_model_for_load.model.token_embeddings.weight.data[:num_tokens_to_copy, :]
-                if not model_for_trainer.config.tie_word_embeddings:
-                    model_for_trainer.lm_head.weight.data[:num_tokens_to_copy, :] = \
-                        temp_model_for_load.lm_head.weight.data[:num_tokens_to_copy, :]
-                elif model_for_trainer.config.tie_word_embeddings:
-                    model_for_trainer.lm_head.weight = model_for_trainer.model.token_embeddings.weight
-                
-                keys_to_delete = []
-                if 'model.token_embeddings.weight' in state_dict_from_checkpoint: keys_to_delete.append('model.token_embeddings.weight')
-                if 'lm_head.weight' in state_dict_from_checkpoint: keys_to_delete.append('lm_head.weight')
-                for key_del in keys_to_delete:
-                    if key_del in state_dict_from_checkpoint: del state_dict_from_checkpoint[key_del]
-                load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=False)
-            else: 
-                load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=True)
-            
-            logger.info(f"Base model state_dict loaded for fine-tuning. Load result: missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
-            if load_result.missing_keys: logger.warning(f"Missing keys during FT base model load: {load_result.missing_keys}")
-            if load_result.unexpected_keys: logger.warning(f"Unexpected keys during FT base model load: {load_result.unexpected_keys}")
+            load_result = model_for_trainer.load_state_dict(state_dict_from_checkpoint, strict=False)
+            logger.info(f"Base model state_dict loaded. Missing: {len(load_result.missing_keys)}, Unexpected: {len(load_result.unexpected_keys)}")
+            if load_result.missing_keys: logger.warning(f"Missing keys: {load_result.missing_keys}")
+            if load_result.unexpected_keys: logger.warning(f"Unexpected keys: {load_result.unexpected_keys}")
 
-        else: # Pre-training or fine-tuning from scratch
+        else: 
             logger.info(f"Initializing a new model for {'pre-training' if not is_fine_tuning_mode else 'fine-tuning from scratch'}.")
             target_param_count_from_config = model_cfg_from_file.get("target_param_count", "125M")
-            
-            # Prepare config_overrides for create_apertis_model
-            # These will be merged with calculated dimensions inside create_apertis_model
-            # Crucially, pass the tokenizer-derived special token IDs here.
-            config_overrides_for_create = model_cfg_from_file.get("config_overrides", {}).copy()
+            config_overrides_for_create = model_cfg_from_file.copy()
             config_overrides_for_create.update({
-                "pad_token_id": source_pad_id,
-                "bos_token_id": source_bos_id,
-                "eos_token_id": source_eos_id,
-                "unk_token_id": source_unk_id
+                "pad_token_id": source_pad_id, "bos_token_id": source_bos_id,
+                "eos_token_id": source_eos_id, "unk_token_id": source_unk_id
             })
-            # Other model_cfg_from_file items (like attention_type, multimodal etc.) are passed directly to create_apertis_model params.
+            if "target_param_count" in config_overrides_for_create:
+                del config_overrides_for_create["target_param_count"]
 
             model_for_trainer = create_apertis_model(
                 target_param_count=target_param_count_from_config,
-                vocab_size_override=source_vocab_size, # This is the vocab size from tokenizer
-                attention_type_override=model_cfg_from_file.get("attention_type"),
-                multimodal=model_cfg_from_file.get("multimodal", False),
-                use_expert_system=model_cfg_from_file.get("use_expert_system", False),
-                num_experts_target_override=model_cfg_from_file.get("num_experts"),
-                experts_per_token_target_override=model_cfg_from_file.get("experts_per_token"),
-                use_flash_attention=model_cfg_from_file.get("use_flash_attention", False),
-                ssm_d_inner=model_cfg_from_file.get("ssm_d_inner"),
-                ssm_d_state=model_cfg_from_file.get("ssm_d_state", 16),
-                ssm_dt_rank=model_cfg_from_file.get("ssm_dt_rank", "auto"),
-                ssm_conv_kernel=model_cfg_from_file.get("ssm_conv_kernel", 4),
-                config_overrides=config_overrides_for_create # Pass the dict with special tokens
+                vocab_size_override=source_vocab_size,
+                config_overrides=config_overrides_for_create
             )
-            # The explicit setting of model_for_trainer.config.pad_token_id = final_pad_id etc. after create_apertis_model is now removed
-            # as create_apertis_model itself handles this via config_overrides.
-            logger.info(f"Initialized NEW ApertisForCausalLM. Config used by model: vocab_size={model_for_trainer.config.vocab_size}, pad_token_id={model_for_trainer.config.pad_token_id}, bos_token_id={model_for_trainer.config.bos_token_id}, eos_token_id={model_for_trainer.config.eos_token_id}, unk_token_id={model_for_trainer.config.unk_token_id}")
-        
-        # logger.info(f"Final model object for trainer has config: {model_for_trainer.config.to_dict()}") # Already logged by create_apertis_model or above
+            logger.info(f"Initialized NEW ApertisForCausalLM. Vocab: {model_for_trainer.config.vocab_size}, Pad: {model_for_trainer.config.pad_token_id}")
     except Exception as e:
         logger.error(f"Error creating model for training: {e}", exc_info=True); return
 
-    # --- Dataset Initialization (now uses model_for_trainer.config for special tokens) ---
-    train_ds: Union[ApertisPretrainDataset, ApertisFineTuneDataset]
-    val_ds: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset]] = None
+    train_ds: Union[ApertisPretrainDataset, ApertisFineTuneDataset, IterableApertisPretrainDataset]
+    val_ds: Optional[Union[ApertisPretrainDataset, ApertisFineTuneDataset, IterableApertisPretrainDataset]] = None
     try:
-        # Get special token IDs from the *actual model configuration* that was just finalized
         cfg_pad = model_for_trainer.config.pad_token_id
-        cfg_bos = model_for_trainer.config.bos_token_id # Will be used in ApertisPretrainDataset
+        cfg_bos = model_for_trainer.config.bos_token_id
         cfg_eos = model_for_trainer.config.eos_token_id
         cfg_unk = model_for_trainer.config.unk_token_id
         cfg_vocab_size = model_for_trainer.config.vocab_size
@@ -911,11 +995,9 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
                 max_length=data_cfg.get("max_length", 512),
                 prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
                 is_hf_tokenizer=bool(actual_hf_tokenizer_object),
-                model_config_vocab_size=cfg_vocab_size, # From model's config
-                model_config_eos_token_id=cfg_eos,      # From model's config
-                model_config_pad_token_id=cfg_pad,      # From model's config
-                model_config_unk_token_id=cfg_unk,      # From model's config
-                model_config_bos_token_id=cfg_bos       # From model's config
+                model_config_vocab_size=cfg_vocab_size, model_config_eos_token_id=cfg_eos,
+                model_config_pad_token_id=cfg_pad, model_config_unk_token_id=cfg_unk,
+                model_config_bos_token_id=cfg_bos
             )
             if data_cfg.get("val_data_path"):
                 val_ds = ApertisFineTuneDataset(
@@ -923,39 +1005,56 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
                     max_length=data_cfg.get("max_length", 512),
                     prompt_template=data_cfg.get("prompt_template", "User: {instruction}\nAssistant: {output}"),
                     is_hf_tokenizer=bool(actual_hf_tokenizer_object),
-                    model_config_vocab_size=cfg_vocab_size,
-                    model_config_eos_token_id=cfg_eos, model_config_pad_token_id=cfg_pad,
-                    model_config_unk_token_id=cfg_unk,
-                    model_config_bos_token_id=cfg_bos   # From model's config
+                    model_config_vocab_size=cfg_vocab_size, model_config_eos_token_id=cfg_eos,
+                    model_config_pad_token_id=cfg_pad, model_config_unk_token_id=cfg_unk,
+                    model_config_bos_token_id=cfg_bos
                 )
-        else: # Pre-training
-            if manual_vocab_dict_loaded is None or cfg_vocab_size == 0:
-                 logger.error("Manual vocabulary must be provided and valid for pre-training.")
-                 return
+        elif is_streaming_dataset:
+            if not os.path.isdir(data_cfg.get("train_data_path")):
+                logger.error("For streaming dataset, `train_data_path` must be a directory of Parquet files.")
+                return
+            train_ds = IterableApertisPretrainDataset(
+                data_path=data_cfg.get("train_data_path"),
+                max_length=data_cfg.get("max_length", 512),
+                pad_token_id_from_config=cfg_pad,
+                multimodal=model_for_trainer.config.multimodal,
+                image_dir=data_cfg.get("image_dir"),
+                image_size=model_for_trainer.config.image_size,
+                shuffle_buffer_size=data_cfg.get("shuffle_buffer_size", 10000),
+                seed=train_cfg.get("seed", 42)
+            )
+            if data_cfg.get("val_data_path"):
+                val_ds = IterableApertisPretrainDataset(
+                    data_path=data_cfg.get("val_data_path"),
+                    max_length=data_cfg.get("max_length", 512),
+                    pad_token_id_from_config=cfg_pad,
+                    multimodal=model_for_trainer.config.multimodal,
+                    image_dir=data_cfg.get("image_dir"),
+                    image_size=model_for_trainer.config.image_size,
+                    shuffle_buffer_size=data_cfg.get("shuffle_buffer_size", 10000),
+                    seed=train_cfg.get("seed", 42)
+                )
+        else: # Map-style pre-training
+            if manual_vocab_dict_loaded is None: logger.error("Manual vocab required for map-style pre-training."); return
             train_ds = ApertisPretrainDataset(
                 data_path=data_cfg.get("train_data_path"), vocab_dict=manual_vocab_dict_loaded,
-                model_config_vocab_size=cfg_vocab_size, # From model's config
-                max_length=data_cfg.get("max_length",512), multimodal=model_for_trainer.config.multimodal,
-                image_dir=data_cfg.get("image_dir"), image_size=model_for_trainer.config.image_size,
-                pad_token_id_from_config=cfg_pad,    # From model's config
-                unk_token_id_from_config=cfg_unk,    # From model's config
-                bos_token_id_from_config=cfg_bos,    # From model's config
-                eos_token_id_from_config=cfg_eos     # From model's config
+                model_config_vocab_size=cfg_vocab_size, max_length=data_cfg.get("max_length",512),
+                multimodal=model_for_trainer.config.multimodal, image_dir=data_cfg.get("image_dir"),
+                image_size=model_for_trainer.config.image_size, pad_token_id_from_config=cfg_pad,
+                unk_token_id_from_config=cfg_unk, bos_token_id_from_config=cfg_bos,
+                eos_token_id_from_config=cfg_eos
             )
             if data_cfg.get("val_data_path"):
                 val_ds = ApertisPretrainDataset(
-                    data_cfg.get("val_data_path"), manual_vocab_dict_loaded,
-                    cfg_vocab_size, # From model's config
+                    data_cfg.get("val_data_path"), manual_vocab_dict_loaded, cfg_vocab_size,
                     data_cfg.get("max_length",512), model_for_trainer.config.multimodal,
                     data_cfg.get("image_dir"), model_for_trainer.config.image_size,
-                    pad_token_id_from_config=cfg_pad,   # From model's config
-                    unk_token_id_from_config=cfg_unk,   # From model's config
-                    bos_token_id_from_config=cfg_bos,   # From model's config
-                    eos_token_id_from_config=cfg_eos    # From model's config
+                    pad_token_id_from_config=cfg_pad, unk_token_id_from_config=cfg_unk,
+                    bos_token_id_from_config=cfg_bos, eos_token_id_from_config=cfg_eos
                 )
-        logger.info("Datasets initialized using special token IDs from the final model configuration.")
+        logger.info("Datasets initialized.")
     except Exception as e:
-        logger.error(f"Error creating datasets with model config tokens: {e}", exc_info=True); return
+        logger.error(f"Error creating datasets: {e}", exc_info=True); return
         
     actual_stop_event = stop_event if stop_event is not None else threading.Event()
 
@@ -971,10 +1070,10 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             train_cfg.get("use_gradient_checkpointing",True), train_cfg.get("eval_every_n_epochs",1),
             train_cfg.get("dynamic_batch_sizing",True), train_cfg.get("gpu_ids"),
             train_cfg.get("distributed_training",False), train_cfg.get("local_rank",-1),
-            stop_event=actual_stop_event,
-            is_fine_tuning=is_fine_tuning_mode,
-            original_tokenizer_path_for_ft_hf=tokenizer_path_in_config if is_fine_tuning_mode and actual_hf_tokenizer_object else None,
-            original_manual_vocab_path_for_ft=tokenizer_path_in_config if (is_fine_tuning_mode and manual_vocab_dict_loaded) or (not is_fine_tuning_mode and manual_vocab_dict_loaded) else None
+            stop_event=actual_stop_event, is_fine_tuning=is_fine_tuning_mode,
+            original_tokenizer_path_for_ft_hf=path_to_tokenizer_to_save_with_model_checkpoint if is_fine_tuning_mode and use_hf_tokenizer_for_ft else None,
+            original_manual_vocab_path_for_ft=path_to_tokenizer_to_save_with_model_checkpoint if not (is_fine_tuning_mode and use_hf_tokenizer_for_ft) else None,
+            steps_per_epoch=train_cfg.get("steps_per_epoch")
         )
     except Exception as e:
         logger.error(f"Error initializing ApertisTrainer: {e}", exc_info=True); return
@@ -988,9 +1087,8 @@ def train_from_config(config_path: str, stop_event: Optional[threading.Event] = 
             logger.info(f"Finished training for {config_path}")
     except Exception as e:
         logger.error(f"Error during training: {e}", exc_info=True)
-        pass # Allow flow to continue if thread was daemonized
 
-class YoloStyleTrainingPipeline: # Kept for compatibility if used elsewhere directly
+class YoloStyleTrainingPipeline:
     def __init__(self, config_path: str, stop_event: Optional[threading.Event] = None):
         self.config_path = config_path
         self.stop_event = stop_event if stop_event is not None else threading.Event()
@@ -998,70 +1096,54 @@ class YoloStyleTrainingPipeline: # Kept for compatibility if used elsewhere dire
         train_from_config(self.config_path, self.stop_event)
 
 def create_sample_config(output_path: str):
-    """Creates a sample training configuration file."""
     sample_config = {
         "data_config": {
-            "train_data_path": "path/to/train.jsonl",
-            "val_data_path": "path/to/val.jsonl", # Optional
-            "tokenizer_path": "path/to/vocab.json", # Or HF tokenizer name if use_hf_tokenizer_for_finetune=True
-            "use_hf_tokenizer_for_finetune": False, # Set true if tokenizer_path is HF name for fine-tuning
+            "train_data_path": "path/to/train_data_dir_or_file", # For streaming, path to dir of .parquet files
+            "val_data_path": "path/to/val.jsonl",
+            "tokenizer_path": "path/to/vocab.json",
+            "streaming_dataset": False, # Set true to use IterableDataset for large pre-training from Parquet files
+            "shuffle_buffer_size": 10000, # Buffer size for shuffling in streaming dataset
+            "use_hf_tokenizer_for_finetune": False,
             "max_length": 512,
-            "prompt_template": "User: {instruction}\nAssistant: {output}", # For fine-tuning
-            "image_dir": None, # For multimodal pre-training
-            "image_size": 224 # For multimodal pre-training
+            "prompt_template": "User: {instruction}\nAssistant: {output}",
+            "image_dir": None,
+            "image_size": 224
         },
-        "model_config": { # These are for NEW models (pre-training) OR OVERRIDES for fine-tuning base
-            "target_param_count": "125M", # Target parameter count (e.g., "10M", "1.5B"). Ignored if fine-tuning from pretrained_model_path.
-            "attention_type": "standard_mha", # Options: "standard_mha", "selective_ssm"
-            "use_flash_attention": False, # Set to true to try using FlashAttention for "standard_mha"
+        "model_config": {
+            "target_param_count": "125M",
+            "attention_type": "standard_mha",
+            "use_flash_attention": False,
             "multimodal": False,
-            # MoE specific configurations
-            "use_expert_system": False, # Master switch for MoE
+            "use_expert_system": False,
             "num_experts": 8,
             "experts_per_token": 2,
-            "load_balancing_loss_coef": 0.01,
-            "expert_capacity_factor": 1.25,
-            "noisy_routing_alpha": 0.1,
-            "expert_dropout_prob": 0.1, # For dropping entire experts
-            "router_z_loss_coef": 0.001,
-            "use_noisy_top_k_routing": True,
-            "use_expert_capacity_limit": True,
-            "use_expert_dropout": True, # For dropping entire experts
-            "use_router_z_loss": True,
-            "use_load_balancing_loss": True,
-            # "config_overrides": { # Optional: Directly override specific ApertisConfig values AFTER parameter-based calculation
-            #    "hidden_size": 768,
-            #    "num_hidden_layers": 12,
-            #    "intermediate_size": 3072, # Can be overridden for experts if not using global FFN intermediate
-            # }
-            # Other ApertisConfig params can be added here to override defaults for new models
-            # e.g., "vocab_size", "max_position_embeddings"
         },
         "training_config": {
-            "task_type": "pretrain", # "pretrain" or "finetune"
-            "pretrained_model_path_for_finetune": None, # Path to base model dir for fine-tuning
+            "task_type": "pretrain",
+            "pretrained_model_path_for_finetune": None,
             "output_dir": "output/my_apertis_model",
             "batch_size": 4,
             "learning_rate": 5e-5,
             "weight_decay": 0.01,
             "num_epochs": 3,
-            "warmup_steps": 0, # Calculated automatically if 0 based on total_steps * 0.1
+            "steps_per_epoch": None, # MUST be set if using streaming_dataset (e.g., total_samples / batch_size)
+            "warmup_steps": 0,
             "gradient_accumulation_steps": 4,
             "max_grad_norm": 1.0,
             "eval_every_n_epochs": 1,
-            "checkpoint_steps": 1000, # Save every N global steps (optimizer steps)
-            "iteration_checkpoint_steps": 0, # Save every N iterations (batches) within an epoch
+            "checkpoint_steps": 1000,
+            "iteration_checkpoint_steps": 0,
             "use_wandb": False,
             "wandb_project": "apertis",
-            "wandb_run_name": None, # Auto-generated if None
+            "wandb_run_name": None,
             "fp16": True,
-            "device": None, # Auto-detects CUDA, or set "cpu"
+            "device": None,
             "gpu_memory_fraction": 0.7,
             "use_gradient_checkpointing": True,
             "dynamic_batch_sizing": True,
-            "gpu_ids": None, # e.g., [0, 1] or None for all available/auto
-            "distributed_training": False, # Auto-true if len(gpu_ids) > 1
-            "local_rank": -1 # For DDP, usually set by launcher
+            "gpu_ids": None,
+            "distributed_training": False,
+            "local_rank": -1
         }
     }
     try:
